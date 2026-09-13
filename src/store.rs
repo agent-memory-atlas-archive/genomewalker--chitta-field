@@ -8835,6 +8835,7 @@ impl ChittaField {
             recall_provenance,
             cw_refresh_ts,
             utility_posteriors,
+            ledger_session_events: self.msg_registry.read().ledger_session_events(),
         };
         let path = self
             .data_dir

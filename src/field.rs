@@ -715,6 +715,22 @@ impl ChittaField {
                         }
                     }
                     snap.triplet_store.load_supersession_sidecar(&candidate.with_extension("sup.json"));
+                    for ev in snap.ledger_session_events {
+                        if ev.domain == "session" {
+                            match ev.kind.as_str() {
+                                "register" => {
+                                    let kind = serde_json::from_str::<serde_json::Value>(&ev.payload_json)
+                                        .ok().and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+                                        .unwrap_or_default();
+                                    session_registry.register(ev.target.clone(), kind, ev.realm.clone(), ev.ts_ms);
+                                }
+                                "heartbeat" => session_registry.heartbeat(&ev.target, ev.ts_ms),
+                                "deregister" => session_registry.deregister(&ev.target),
+                                _ => {}
+                            }
+                        }
+                        msg_registry.insert(ev);
+                    }
                     payloads = snap.payloads;
                     // Stage B: load retrieval surfaces alongside content. Absent on
                     // pre-Stage-B families → empty map → embed falls back to content.

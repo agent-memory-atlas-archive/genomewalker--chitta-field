@@ -796,6 +796,9 @@ pub struct FullSnapshot {
     /// is frozen; hydrated into states on load. A missing section leaves every
     /// posterior at the (1, 1) prior.
     pub utility_posteriors: HashMap<MemoryId, (f32, f32)>,
+    /// V23 optional section: ledger transactions and native session lifecycle.
+    /// MsgEvent/SessionEvent WAL opcodes and old positional formats stay frozen.
+    pub ledger_session_events: Vec<crate::organ::msg::MsgEvent>,
 }
 
 /// V22 snapshot layout, frozen: the last monolithic-bincode format. Positional
@@ -858,6 +861,7 @@ impl LegacyFullSnapshotV22 {
             cw_refresh_ts:      self.cw_refresh_ts,
             recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
         }
     }
 }
@@ -1238,6 +1242,7 @@ impl FullSnapshot {
             cw_refresh_ts:      HashMap::new(),
             recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
         }
     }
 
@@ -1275,6 +1280,7 @@ impl FullSnapshot {
             write_section(&mut w, "cw_refresh_ts",      &self.cw_refresh_ts)?;
             write_section(&mut w, "recall_provenance",  &self.recall_provenance)?;
             write_section(&mut w, "utility_posteriors", &self.utility_posteriors)?;
+            write_section(&mut w, "ledger_session_events", &self.ledger_session_events)?;
             w.flush()?;
             // fsync data+magic to disk before the rename commits the file, so a crash
             // can't leave a renamed-but-truncated snapshot whose magic still reads valid.
@@ -1492,6 +1498,7 @@ impl FullSnapshot {
                     "cw_refresh_ts"      => snap.cw_refresh_ts      = read_section(&mut body, n)?,
                     "recall_provenance"  => snap.recall_provenance  = read_section(&mut body, n)?,
                     "utility_posteriors" => snap.utility_posteriors = read_section(&mut body, n)?,
+                    "ledger_session_events" => snap.ledger_session_events = read_section(&mut body, n)?,
                     _ => {
                         eprintln!(
                             "[chitta-field] skipping unknown snapshot section '{}' ({} bytes)",
@@ -1551,6 +1558,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -1588,6 +1596,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -1625,6 +1634,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -1675,6 +1685,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -1710,6 +1721,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1747,6 +1759,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1784,6 +1797,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1821,6 +1835,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1858,6 +1873,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1896,6 +1912,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             };
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
@@ -1945,6 +1962,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -1985,6 +2003,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -2022,6 +2041,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -2059,6 +2079,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -2096,6 +2117,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -2133,6 +2155,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 
@@ -2174,6 +2197,7 @@ impl FullSnapshot {
                 cw_refresh_ts:      HashMap::new(),
                 recall_provenance:  HashMap::new(),
             utility_posteriors: HashMap::new(),
+            ledger_session_events: Vec::new(),
             });
         }
 

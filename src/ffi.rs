@@ -7302,6 +7302,38 @@ mod tests {
     }
 
     #[test]
+    fn test_ledger_session_snapshot_and_wal_suffix() {
+        unsafe {
+            let (h, tmp) = open_tmp();
+            let timestamp = 1779913619.9907227_f64;
+            let parsed: serde_json::Value = serde_json::from_str("1779913619.9907227").unwrap();
+            assert_eq!(parsed.as_f64().unwrap(), timestamp, "ledger timestamps require exact JSON parsing");
+            let emit = |h, domain: &str, kind: &str, target: &str, payload: &[u8]| {
+                let mut id = 0;
+                assert_eq!(cf_emit_event(h, CString::new(domain).unwrap().as_ptr(),
+                    CString::new(kind).unwrap().as_ptr(), CString::new(target).unwrap().as_ptr(),
+                    payload.as_ptr(), payload.len(), std::ptr::null(), 0, &mut id), 0);
+            };
+            emit(h, "ledger", "task_records", "task-ledger", br#"{"revision":1,"changes":[]}"#);
+            emit(h, "session", "register", "owner", br#"{"kind":"codex"}"#);
+            assert!(cf_save_full_snapshot(h));
+            emit(h, "ledger", "task_records", "task-ledger", br#"{"revision":2,"changes":[]}"#);
+            emit(h, "session", "deregister", "owner", b"{}");
+            let data_dir = (*h).field.data_dir.clone();
+            cf_close(h);
+            let field = crate::field::ChittaField::open(data_dir).unwrap();
+            let registry = field.msg_registry.read();
+            let events = registry.get_events_by_domain_kind("ledger", "task_records", 100);
+            assert_eq!(events.len(), 2, "snapshot prefix and WAL suffix each restored once");
+            assert!(events.iter().any(|e| e.payload_json.contains("\"revision\":1")));
+            assert!(events.iter().any(|e| e.payload_json.contains("\"revision\":2")));
+            assert_eq!(registry.get_events_by_domain_kind("session", "register", 100).len(), 1);
+            assert_eq!(field.session_registry.read().list_active().len(), 0);
+            drop(tmp);
+        }
+    }
+
+    #[test]
     fn test_ffi_emit_event_rejects_user_model_domain() {
         unsafe {
             let (h, _tmp) = open_tmp();

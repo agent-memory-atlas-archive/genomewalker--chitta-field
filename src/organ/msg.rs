@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 /// A single message event stored in the registry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MsgEvent {
     pub event_id: u64,
     pub domain: String,
@@ -23,6 +23,15 @@ pub struct MsgRegistry {
 impl MsgRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Durable task ledger and native session history, in per-target causal order.
+    pub fn ledger_session_events(&self) -> Vec<MsgEvent> {
+        let mut events: Vec<_> = self.by_target.values().flat_map(|v| v.iter())
+            .filter(|e| e.domain == "session" || (e.domain == "ledger" && e.kind == "task_records"))
+            .cloned().collect();
+        events.sort_by_key(|e| e.ts_ms); // stable: preserve same-target timestamp ties
+        events
     }
 
     pub fn insert(&mut self, event: MsgEvent) {
