@@ -26,10 +26,23 @@ impl MsgRegistry {
     }
 
     /// Durable task ledger and native session history, in per-target causal order.
+    /// Session history is compacted: a deregistered session contributes nothing,
+    /// a live one only its latest register and latest heartbeat. Every prompt
+    /// emits a heartbeat, so the raw stream would grow without bound.
     pub fn ledger_session_events(&self) -> Vec<MsgEvent> {
-        let mut events: Vec<_> = self.by_target.values().flat_map(|v| v.iter())
-            .filter(|e| e.domain == "session" || (e.domain == "ledger" && e.kind == "task_records"))
-            .cloned().collect();
+        let mut events: Vec<MsgEvent> = Vec::new();
+        for evs in self.by_target.values() {
+            events.extend(evs.iter().filter(|e| e.domain == "ledger" && e.kind == "task_records").cloned());
+            let session: Vec<&MsgEvent> = evs.iter().filter(|e| e.domain == "session").collect();
+            if session.is_empty() || session.iter().any(|e| e.kind == "deregister") {
+                continue;
+            }
+            for kind in ["register", "heartbeat"] {
+                if let Some(e) = session.iter().filter(|e| e.kind == kind).max_by_key(|e| e.ts_ms) {
+                    events.push((*e).clone());
+                }
+            }
+        }
         events.sort_by_key(|e| e.ts_ms); // stable: preserve same-target timestamp ties
         events
     }
