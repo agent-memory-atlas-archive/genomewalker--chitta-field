@@ -46,7 +46,9 @@ impl TripletStore {
         max_hops: usize,
         max_results: usize,
         direction: Direction,
+        max_edges: usize,
     ) -> Vec<TraversalHit> {
+        if max_results == 0 || max_edges == 0 { return Vec::new(); }
         let ts = now_ms();
         let mut results: Vec<TraversalHit> = Vec::new();
         let mut visited: HashSet<String> = HashSet::new();
@@ -55,8 +57,9 @@ impl TripletStore {
 
         visited.insert(start.to_string());
         queue.push_back((start.to_string(), 0, 1.0, Vec::new()));
+        let mut edges_inspected = 0usize;
 
-        while let Some((node, hops, weight, path)) = queue.pop_front() {
+        'traversal: while let Some((node, hops, weight, path)) = queue.pop_front() {
             if hops > 0 {
                 results.push(TraversalHit {
                     node: node.clone(),
@@ -76,6 +79,8 @@ impl TripletStore {
             if matches!(direction, Direction::Outgoing | Direction::Both) {
                 if let Some(ids) = self.subject_ids(&node) {
                     for &id in ids {
+                        if edges_inspected >= max_edges { break 'traversal; }
+                        edges_inspected += 1;
                         if let Some(e) = self.entry_by_id_crate(id) {
                             if e.valid_to_ms != 0 && ts >= e.valid_to_ms { continue; }
                             if self.is_superseded_crate(id) { continue; }
@@ -93,6 +98,8 @@ impl TripletStore {
             if matches!(direction, Direction::Incoming | Direction::Both) {
                 if let Some(ids) = self.object_ids(&node) {
                     for &id in ids {
+                        if edges_inspected >= max_edges { break 'traversal; }
+                        edges_inspected += 1;
                         if let Some(e) = self.entry_by_id_crate(id) {
                             if e.valid_to_ms != 0 && ts >= e.valid_to_ms { continue; }
                             if self.is_superseded_crate(id) { continue; }
@@ -122,25 +129,33 @@ impl TripletStore {
         damping: f32,
         iterations: u8,
         top_k: usize,
+        max_nodes: usize,
+        max_edges: usize,
     ) -> Vec<(String, f32)> {
         let ts = now_ms();
-        if seeds.is_empty() {
+        if seeds.is_empty() || top_k == 0 || max_nodes == 0 || max_edges == 0 {
             return Vec::new();
         }
-        let seed_boost = (1.0 - damping) / seeds.len() as f32;
+        let bounded_seeds: Vec<&str> = seeds.iter().copied().take(max_nodes).collect();
+        let seed_boost = (1.0 - damping) / bounded_seeds.len() as f32;
         let mut scores: HashMap<String, f32> = HashMap::new();
-        for s in seeds {
+        for s in &bounded_seeds {
             scores.insert(s.to_string(), seed_boost);
         }
+        let mut edges_inspected = 0usize;
 
         for _ in 0..iterations {
             let mut next: HashMap<String, f32> = HashMap::new();
-            for s in seeds {
+            for s in &bounded_seeds {
                 *next.entry(s.to_string()).or_insert(0.0) += seed_boost;
             }
             for (node, &score) in &scores {
+                if edges_inspected >= max_edges { break; }
                 if let Some(ids) = self.subject_ids(node) {
-                    let edges: Vec<_> = ids.iter()
+                    let remaining = max_edges - edges_inspected;
+                    let inspected_here = ids.len().min(remaining);
+                    edges_inspected += inspected_here;
+                    let edges: Vec<_> = ids.iter().take(inspected_here)
                         .filter_map(|&id| self.entry_by_id_crate(id))
                         .filter(|e| {
                             (e.valid_to_ms == 0 || ts < e.valid_to_ms)
@@ -151,13 +166,17 @@ impl TripletStore {
                     let total: f32 = edges.iter().map(|e| e.weight).sum();
                     if total <= 0.0 { continue; }
                     for e in edges {
-                        *next.entry(e.object.clone()).or_insert(0.0) += damping * score * (e.weight / total);
+                        if next.contains_key(&e.object) || next.len() < max_nodes {
+                            *next.entry(e.object.clone()).or_insert(0.0) +=
+                                damping * score * (e.weight / total);
+                        }
                     }
                 }
             }
             let sum: f32 = next.values().sum();
             if sum > 0.0 { for v in next.values_mut() { *v /= sum; } }
             scores = next;
+            if edges_inspected >= max_edges { break; }
         }
 
         let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();

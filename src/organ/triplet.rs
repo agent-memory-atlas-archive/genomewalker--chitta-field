@@ -339,8 +339,22 @@ impl TripletStore {
 
     /// Query all valid triplets where subject OR object matches the given string.
     pub fn query_entity(&self, entity: &str, at_ms: i64) -> Vec<&TripletEntry> {
+        self.query_entity_limited(entity, at_ms, usize::MAX)
+    }
+
+    /// Query valid triplets touching `entity`, stopping before allocating more
+    /// than `max_results` references. This is the serving-path variant used by
+    /// spreading activation; slicing query_entity() after collection is too late.
+    pub fn query_entity_limited(
+        &self,
+        entity: &str,
+        at_ms: i64,
+        max_results: usize,
+    ) -> Vec<&TripletEntry> {
+        if max_results == 0 { return Vec::new(); }
         let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(max_results.min(64));
+        let mut inspected = 0usize;
 
         let subject_ids = self
             .by_subject
@@ -354,10 +368,15 @@ impl TripletStore {
             .unwrap_or(&[]);
 
         for &id in subject_ids.iter().chain(object_ids.iter()) {
+            if inspected >= max_results { break; }
+            inspected += 1;
             if seen.insert(id) {
                 if let Some(entry) = self.entry_by_id(id) {
                     if Self::is_valid(entry, at_ms) {
                         result.push(entry);
+                        if result.len() >= max_results {
+                            break;
+                        }
                     }
                 }
             }
@@ -426,6 +445,22 @@ impl TripletStore {
         self.entries.len()
     }
 
+    /// Copy at most `max_facts` live facts for analogy indexing without first
+    /// cloning the entire subject vocabulary.
+    pub fn analogy_facts(&self, at_ms: i64, max_facts: usize) -> Vec<crate::analogy::Fact> {
+        self.entries
+            .iter()
+            .take(max_facts)
+            .filter(|entry| Self::is_valid(entry, at_ms))
+            .map(|entry| crate::analogy::Fact {
+                subject: entry.subject.clone(),
+                predicate: entry.predicate.clone(),
+                object: entry.object.clone(),
+                memory_id: entry.source_memory_id,
+            })
+            .collect()
+    }
+
     /// BFS spreading activation from seed entities. Returns memory_id → max activation score.
     /// depth=2, decay=0.6 gives two hops with diminishing strength.
     pub fn spreading_activation(
@@ -434,27 +469,27 @@ impl TripletStore {
         depth: u8,
         decay: f32,
         at_ms: i64,
+        max_nodes: usize,
+        max_entries_per_entity: usize,
     ) -> HashMap<MemoryId, f32> {
         use std::collections::HashSet;
-        const MAX_LAYER: usize = 100;
-        const MAX_ENTRIES_PER_ENTITY: usize = 50;
+        if max_nodes == 0 || max_entries_per_entity == 0 {
+            return HashMap::new();
+        }
         let mut memory_scores: HashMap<MemoryId, f32> = HashMap::new();
-        let mut visited: HashSet<String> = seeds.iter().cloned().collect();
+        let mut visited: HashSet<String> = seeds.iter().take(max_nodes).cloned().collect();
         let mut current_layer: Vec<(String, f32)> =
-            seeds.iter().map(|s| (s.clone(), 1.0f32)).collect();
+            seeds.iter().take(max_nodes).map(|s| (s.clone(), 1.0f32)).collect();
         for d in 0u8..=depth {
             let mut next_layer: Vec<(String, f32)> = Vec::new();
             for (entity, activation) in &current_layer {
-                let raw_entries = self.query_entity(entity, at_ms);
-                let entries_slice = if raw_entries.len() > MAX_ENTRIES_PER_ENTITY {
-                    &raw_entries[..MAX_ENTRIES_PER_ENTITY]
-                } else {
-                    &raw_entries[..]
-                };
-                for &entry in entries_slice {
+                let entries = self.query_entity_limited(entity, at_ms, max_entries_per_entity);
+                for entry in entries {
                     if let Some(mid) = entry.source_memory_id {
-                        let s = memory_scores.entry(mid).or_insert(0.0);
-                        if *activation > *s { *s = *activation; }
+                        if memory_scores.contains_key(&mid) || memory_scores.len() < max_nodes {
+                            let s = memory_scores.entry(mid).or_insert(0.0);
+                            if *activation > *s { *s = *activation; }
+                        }
                     }
                     if d >= depth { continue; }
                     let (neighbor, w) = if entry.subject == *entity {
@@ -469,9 +504,9 @@ impl TripletStore {
                     }
                 }
             }
-            if next_layer.len() > MAX_LAYER {
+            if next_layer.len() > max_nodes {
                 next_layer.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                next_layer.truncate(MAX_LAYER);
+                next_layer.truncate(max_nodes);
             }
             current_layer = next_layer;
         }

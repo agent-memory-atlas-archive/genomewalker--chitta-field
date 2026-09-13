@@ -9233,6 +9233,9 @@ pub extern "C" fn cf_recall_spreading(
     query: *const c_char,
     k:     usize,
     realm: *const c_char,
+    max_nodes: usize,
+    max_entries_per_entity: usize,
+    depth: u8,
     out_json: *mut c_char,
     out_json_len: usize,
 ) -> c_int {
@@ -9249,8 +9252,11 @@ pub extern "C" fn cf_recall_spreading(
     };
     let results = h.field.recall_spreading(
         &query_str,
-        k,
+        k.clamp(1, 100),
         realm_opt.as_deref(),
+        max_nodes.clamp(1, 512),
+        max_entries_per_entity.clamp(1, 256),
+        depth.min(4),
     );
     let arr: Vec<serde_json::Value> = results.iter().map(|r| serde_json::json!({
         "memory_id": r.memory_id,
@@ -9698,6 +9704,7 @@ pub extern "C" fn cf_graph_traverse(
     max_hops: usize,
     max_results: usize,
     direction: *const c_char,
+    max_edges: usize,
 ) -> *mut c_char {
     if h.is_null() || start.is_null() { return json_null("cf_graph_traverse: null argument"); }
     let handle = unsafe { &*h };
@@ -9726,7 +9733,9 @@ pub extern "C" fn cf_graph_traverse(
                 .unwrap_or(crate::graph::Direction::Outgoing)
         }
     };
-    let hits = handle.field.graph_traverse(start_str, &edge_refs, max_hops, max_results, dir);
+    let hits = handle.field.graph_traverse(
+        start_str, &edge_refs, max_hops.min(4), max_results.clamp(1, 100), dir,
+        max_edges.clamp(1, 50_000));
     let json = serde_json::to_string(&hits).unwrap_or_else(|_| "[]".to_string());
     CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_graph_traverse: no data"))
 }
@@ -9741,6 +9750,8 @@ pub extern "C" fn cf_graph_pagerank(
     damping: f32,
     iterations: u8,
     top_k: usize,
+    max_nodes: usize,
+    max_edges: usize,
 ) -> *mut c_char {
     if h.is_null() || seeds_json.is_null() { return json_null("cf_graph_pagerank: null argument"); }
     let handle = unsafe { &*h };
@@ -9749,7 +9760,7 @@ pub extern "C" fn cf_graph_pagerank(
             .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
             .unwrap_or_default()
     };
-    let seed_refs: Vec<&str> = seeds_str.iter().map(|s| s.as_str()).collect();
+    let seed_refs: Vec<&str> = seeds_str.iter().take(32).map(|s| s.as_str()).collect();
     let edge_types_str: Vec<String> = if edge_types_json.is_null() {
         vec![]
     } else {
@@ -9760,7 +9771,9 @@ pub extern "C" fn cf_graph_pagerank(
         }
     };
     let edge_refs: Vec<&str> = edge_types_str.iter().map(|s| s.as_str()).collect();
-    let results = handle.field.graph_pagerank(&seed_refs, &edge_refs, damping, iterations, top_k);
+    let results = handle.field.graph_pagerank(
+        &seed_refs, &edge_refs, damping, iterations.min(100), top_k.clamp(1, 100),
+        max_nodes.clamp(1, 512), max_edges.clamp(1, 100_000));
     let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
     CString::new(json).map(|s| s.into_raw()).unwrap_or(json_null("cf_graph_pagerank: no data"))
 }
@@ -9970,11 +9983,12 @@ pub extern "C" fn cf_recall_analogy(h: *const CfHandle, json_in: *const c_char) 
     };
     let mode = args["mode"].as_str().unwrap_or("structural").to_string();
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 100) as usize;
+    let fact_limit = args["fact_limit"].as_u64().unwrap_or(10_000).clamp(1, 50_000) as usize;
 
     // Copy the lane out first: every hypervector op below runs off the store locks.
     // `meta` is id -> realm only; payload text is fetched per mode via
     // `analogy_texts` once the result set has been cut down to `limit`.
-    let (facts, meta, triplet_count) = handle.field.analogy_snapshot();
+    let (facts, meta, triplet_count) = handle.field.analogy_snapshot(fact_limit);
     let reply = |mode: &str, indexed: usize, results: Vec<serde_json::Value>| -> *mut c_char {
         let body = serde_json::json!({ "mode": mode, "indexed": indexed, "results": results });
         match CString::new(body.to_string()) {

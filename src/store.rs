@@ -2236,22 +2236,12 @@ impl ChittaField {
     /// all of it discarded except the handful of rows that survive ranking.
     pub fn analogy_snapshot(
         &self,
+        max_facts: usize,
     ) -> (Vec<crate::analogy::Fact>, std::collections::HashMap<MemoryId, String>, usize) {
         let now = now_ms();
         let (facts, count) = {
             let ts = self.triplet_store.read();
-            let mut facts = Vec::with_capacity(ts.triplet_count());
-            // Every triplet has a subject, so subject-keyed enumeration is complete.
-            for subject in ts.all_subjects() {
-                for e in ts.query_subject(&subject, now) {
-                    facts.push(crate::analogy::Fact {
-                        subject: e.subject.clone(),
-                        predicate: e.predicate.clone(),
-                        object: e.object.clone(),
-                        memory_id: e.source_memory_id,
-                    });
-                }
-            }
+            let facts = ts.analogy_facts(now, max_facts);
             (facts, ts.triplet_count())
         };
         let mut facts = facts;
@@ -5947,6 +5937,9 @@ impl ChittaField {
         query: &str,
         k: usize,
         realm: Option<&str>,
+        max_nodes: usize,
+        max_entries_per_entity: usize,
+        depth: u8,
     ) -> Vec<SpreadingRecallHit> {
         let seeds = Self::extract_seeds(query);
         if seeds.is_empty() { return Vec::new(); }
@@ -5957,7 +5950,8 @@ impl ChittaField {
             .as_millis() as i64;
 
         let memory_scores = match self.triplet_store.try_read_for(std::time::Duration::from_secs(5)) {
-            Some(ts) => ts.spreading_activation(&seeds, 2, 0.6, now_ms),
+            Some(ts) => ts.spreading_activation(
+                &seeds, depth, 0.6, now_ms, max_nodes, max_entries_per_entity),
             None => return Vec::new(),
         };
         if memory_scores.is_empty() { return Vec::new(); }
@@ -6571,8 +6565,10 @@ impl ChittaField {
         max_hops: usize,
         max_results: usize,
         direction: crate::graph::Direction,
+        max_edges: usize,
     ) -> Vec<crate::graph::TraversalHit> {
-        self.triplet_store.read().graph_traverse(start, edge_types, max_hops, max_results, direction)
+        self.triplet_store.read().graph_traverse(
+            start, edge_types, max_hops, max_results, direction, max_edges)
     }
 
     /// Personalized PageRank over the triplet graph.
@@ -6583,8 +6579,11 @@ impl ChittaField {
         damping: f32,
         iterations: u8,
         top_k: usize,
+        max_nodes: usize,
+        max_edges: usize,
     ) -> Vec<(String, f32)> {
-        self.triplet_store.read().graph_pagerank(seeds, edge_types, damping, iterations, top_k)
+        self.triplet_store.read().graph_pagerank(
+            seeds, edge_types, damping, iterations, top_k, max_nodes, max_edges)
     }
 
     /// Get memory IDs that contradict the given memory (bidirectional).
