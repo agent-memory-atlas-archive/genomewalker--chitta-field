@@ -9860,6 +9860,37 @@ mod tests {
         (field, tmp)
     }
 
+    // Direct tag selection is global. Callers must scope the selected payloads,
+    // using the same exact-realm rule as semantic and keyword recall.
+    #[test]
+    fn test_tag_selection_realm_contract() {
+        let (field, _tmp) = open_test_field();
+        let emb = vec![0.1f32; crate::ops::EMBED_DIM];
+        let mut ids = Vec::new();
+        for realm in ["project:a", "project:b", "brahman"] {
+            let (id, _) = field.put_memory("wisdom", realm,
+                b"tagrealmcanary shared fact", &emb, 1.0, 0.001, 0,
+                vec![], None, None).unwrap();
+            field.add_triplet(id.to_string(), "tagged".into(), "shared-tag".into(),
+                1.0, None, None).unwrap();
+            ids.push(id);
+        }
+        let tagged = field.query_object("shared-tag").unwrap();
+        assert_eq!(tagged.len(), 3);
+        for (realm, expected) in ["project:a", "project:b", "brahman"].iter().zip(ids) {
+            let selected: Vec<_> = tagged.iter().filter_map(|t| {
+                let id = t.subject.parse::<u64>().ok()?;
+                let payload = field.get_memory(id).ok()?;
+                (payload.realm == *realm).then_some(id)
+            }).collect();
+            assert_eq!(selected, vec![expected]);
+            let semantic = field.recall_semantic_measure(&emb, 10, Some(realm)).unwrap();
+            let keyword = field.recall_keyword_measure("tagrealmcanary", 10, Some(realm)).unwrap();
+            assert!(!semantic.is_empty() && !keyword.is_empty());
+            assert!(semantic.iter().chain(keyword.iter()).all(|h| h.realm == *realm));
+        }
+    }
+
     #[test]
     fn test_put_get_roundtrip() {
         let (field, _tmp) = open_test_field();
