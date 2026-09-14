@@ -5,7 +5,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use turbovec::TurboQuantIndex;
 use memmap2;
 use rayon::prelude::*;
@@ -508,15 +508,15 @@ impl DeltaBatchPlan {
     pub fn is_empty(&self) -> bool { self.plans.is_empty() && self.realm_plans.is_empty() }
 }
 
-/// Lazily-built 4-bit TurboQuant index over the normalized embedding matrix.
-/// Rebuilt from heap/mmap embeddings whenever `built_at_mutation` lags
-/// `SemanticIndex::mutations`. NOT serialized (rebuilt on demand at startup).
+/// Maintenance-built 4-bit TurboQuant index over normalized embeddings.
+/// NOT serialized; published in the background after startup.
 struct TurboState {
     index: TurboQuantIndex,
     /// turbovec row -> MemoryId (insertion order = add order).
     ids: Vec<MemoryId>,
     /// `mutations` value the index was built at; stale when it lags.
     built_at_mutation: u64,
+    built_at: std::time::Instant,
 }
 
 /// Approximate semantic index over normalized memory embeddings.
@@ -604,11 +604,15 @@ pub struct SemanticIndex {
     /// Byte offset of the f32×EMBED_DIM data for each memory in emb_mmap.
     #[serde(skip)]
     emb_offsets: HashMap<MemoryId, u64>,
-    /// Lazy 4-bit TurboQuant index for the flat-scan fallback path. Arc<Mutex>
-    /// so SemanticIndex stays Clone/Send/Sync and `&self` search can rebuild.
-    /// Never serialized; rebuilt on demand once total count >= HNSW_THRESHOLD.
+    /// Readers clone the current index under a brief read guard; builds run off-lock.
     #[serde(skip, default)]
-    turbo: Arc<Mutex<Option<TurboState>>>,
+    turbo: Arc<RwLock<Option<Arc<TurboState>>>>,
+    /// Embeddings changed after the published build are scored directly.
+    #[serde(skip, default)]
+    turbo_changed: HashMap<MemoryId, u64>,
+    #[serde(skip, default)]
+    turbo_epoch: Arc<std::sync::atomic::AtomicU64>,
+
 }
 
 impl SemanticIndex {
@@ -637,7 +641,9 @@ impl SemanticIndex {
             per_id_realm: HashMap::new(),
             emb_mmap: None,
             emb_offsets: HashMap::new(),
-            turbo: Arc::new(Mutex::new(None)),
+            turbo: Arc::new(RwLock::new(None)),
+            turbo_changed: HashMap::new(),
+            turbo_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1205,25 +1211,32 @@ impl SemanticIndex {
             .chain(self.emb_offsets.keys().copied())
     }
 
-    /// Ensure the lazy 4-bit TurboQuant index is current. Rebuilds from the
-    /// normalized embedding matrix when the cache is empty or its build
-    /// watermark lags `self.mutations`. No-op below HNSW_THRESHOLD or when the
-    /// embedding dim is incompatible with turbovec (dim % 8 != 0). Holds the
-    /// turbo Mutex only; safe under a shared `&self` borrow.
-    fn ensure_turbo(&self) {
-        if self.total_embedding_count() < HNSW_THRESHOLD {
-            return;
+    fn invalidate_turbo(&self) {
+        let mut guard = self.turbo.write();
+        self.turbo_epoch.fetch_add(1, Ordering::Relaxed);
+        *guard = None;
+    }
+
+    pub(crate) fn prune_turbo_changes(&mut self) {
+        let watermark = self.turbo.read().as_ref().map(|t| t.built_at_mutation);
+        if let Some(watermark) = watermark {
+            self.turbo_changed.retain(|_, mutation| *mutation > watermark);
         }
-        let mut guard = self.turbo.lock();
-        if guard.as_ref().map(|t| t.built_at_mutation == self.mutations).unwrap_or(false) {
-            return;
+    }
+
+    /// Maintenance-only: copy embeddings under the store read guard, then build
+    /// and publish after releasing it. Search never calls this function.
+    pub(crate) fn plan_turbo_rebuild(&self, min_mutations: u64) -> Option<TurboBuild> {
+        if self.total_embedding_count() < HNSW_THRESHOLD { return None; }
+        let current = self.turbo.read().clone();
+        if let Some(t) = current.as_ref() {
+            if self.mutations.saturating_sub(t.built_at_mutation) <= min_mutations
+                && t.built_at.elapsed() < std::time::Duration::from_secs(60) {
+                return None;
+            }
         }
-        let mut index = match TurboQuantIndex::new(EMBED_DIM, 4) {
-            Ok(i) => i,
-            Err(_) => { *guard = None; return; }
-        };
-        let mut flat: Vec<f32> = Vec::with_capacity(self.total_embedding_count() * EMBED_DIM);
-        let mut ids: Vec<MemoryId> = Vec::with_capacity(self.total_embedding_count());
+        let mut flat = Vec::with_capacity(self.total_embedding_count() * EMBED_DIM);
+        let mut ids = Vec::with_capacity(self.total_embedding_count());
         for id in self.all_ids() {
             if self.deleted.contains(&id) { continue; }
             let Some(emb) = self.get_embedding(id) else { continue; };
@@ -1232,10 +1245,8 @@ impl SemanticIndex {
             flat.extend_from_slice(&unit);
             ids.push(id);
         }
-        if ids.is_empty() { *guard = None; return; }
-        index.add(&flat);
-        index.prepare();
-        *guard = Some(TurboState { index, ids, built_at_mutation: self.mutations });
+        Some(TurboBuild { flat, ids, mutation: self.mutations, published: self.turbo.clone(),
+            epoch: self.turbo_epoch.load(Ordering::Relaxed), current_epoch: self.turbo_epoch.clone() })
     }
 
     /// Activate mmap mode: build offset index from .emb sidecar, then clear the heap HashMap.
@@ -1271,6 +1282,7 @@ impl SemanticIndex {
     fn upsert_meta(&mut self, memory_id: MemoryId, mut embedding: Vec<f32>, realm: Option<&str>) -> (bool, bool) {
         self.mutations += 1;
         self.remove(memory_id);
+        self.turbo_changed.insert(memory_id, self.mutations);
         normalize_in_place(&mut embedding);
         self.deleted.remove(&memory_id);
         let coarse_ids = self.assign_coarse(&embedding);
@@ -1444,6 +1456,7 @@ impl SemanticIndex {
     /// Mark a memory as deleted — excluded from future search results.
     pub fn remove(&mut self, memory_id: MemoryId) {
         self.mutations += 1;
+        self.turbo_changed.insert(memory_id, self.mutations);
         if let Some(realm) = self.per_id_realm.remove(&memory_id) {
             if let Some(graph) = self.per_realm_hnsw.get_mut(&realm) {
                 graph.remove(memory_id);
@@ -1569,10 +1582,10 @@ impl SemanticIndex {
             // post-hoc filtering still yields up to k survivors.
             if !center {
                 if let Some(q) = normalize(query) {
-                    self.ensure_turbo();
-                    let guard = self.turbo.lock();
+                    let guard = self.turbo.read().clone();
                     if let Some(ts) = guard.as_ref() {
-                        let fetch = if allowed.is_some() { k.saturating_mul(4).max(k) } else { k };
+                        let fetch = (if allowed.is_some() { k.saturating_mul(4).max(k) } else { k })
+                            .saturating_add(self.turbo_changed.len());
                         let res = ts.index.search(&q, fetch.min(ts.ids.len().max(1)));
                         let mut hits: Vec<SemanticHit> = Vec::with_capacity(k);
                         let idxs = res.indices_for_query(0);
@@ -1581,11 +1594,26 @@ impl SemanticIndex {
                             if *row < 0 { continue; }
                             let Some(&id) = ts.ids.get(*row as usize) else { continue; };
                             if self.deleted.contains(&id) { continue; }
+                            if self.turbo_changed.get(&id).is_some_and(|m| *m > ts.built_at_mutation) { continue; }
                             if let Some(a) = allowed { if !a.contains(&id) { continue; } }
                             if !sc.is_finite() { continue; }
                             hits.push(SemanticHit { memory_id: id, cosine_similarity: *sc });
                             if hits.len() >= k { break; }
                         }
+                        // A previous index can contain old vectors and omit newly
+                        // inserted ones. Replace affected scores from current embeddings.
+                        for (&id, &mutation) in &self.turbo_changed {
+                            if mutation <= ts.built_at_mutation { continue; }
+                            hits.retain(|h| h.memory_id != id);
+                            if self.deleted.contains(&id) { continue; }
+                            if let Some(a) = allowed { if !a.contains(&id) { continue; } }
+                            if let Some(emb) = self.get_embedding(id) {
+                                let sim = dot(&q, emb);
+                                if sim.is_finite() { hits.push(SemanticHit { memory_id: id, cosine_similarity: sim }); }
+                            }
+                        }
+                        hits.sort_unstable_by(|a, b| b.cosine_similarity.total_cmp(&a.cosine_similarity));
+                        hits.truncate(k);
                         return hits;
                     }
                 }
@@ -1827,6 +1855,7 @@ impl SemanticIndex {
             self.deleted.remove(&id);
         }
         if !bad.is_empty() {
+            self.invalidate_turbo();
             // Reset coarse/LSH/binary_vec — they are also wrong-dim.
             self.coarse_members.clear();
             self.lsh_buckets = vec![std::collections::HashMap::new(); LSH_TABLES];
@@ -1843,6 +1872,7 @@ impl SemanticIndex {
     /// Normalize embeddings loaded from older snapshots that stored raw vectors.
     pub fn normalize_all(&mut self) {
         self.mutations += 1;
+        self.invalidate_turbo();
         for embedding in self.embeddings.values_mut() {
             normalize_in_place(embedding);
         }
@@ -1911,6 +1941,7 @@ impl SemanticIndex {
     /// geometrically stale. This recomputes them from scratch.
     pub fn force_reindex(&mut self) {
         self.mutations += 1;
+        self.invalidate_turbo();
         for embedding in self.embeddings.values_mut() {
             normalize_in_place(embedding);
         }
@@ -2254,6 +2285,7 @@ impl SemanticIndex {
             }
             map.insert(id, emb);
         }
+        self.invalidate_turbo();
         self.embeddings = map;
         eprintln!("[hnsw] load_emb: loaded {} embeddings from sidecar", count);
         true
@@ -2995,5 +3027,91 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].memory_id, 1);
         assert!(hits[0].cosine_similarity > 0.99);
+    }
+}
+
+/// Owns all build inputs; no SemanticIndex/store lock is held during quantization.
+pub(crate) struct TurboBuild {
+    flat: Vec<f32>,
+    ids: Vec<MemoryId>,
+    mutation: u64,
+    published: Arc<RwLock<Option<Arc<TurboState>>>>,
+    epoch: u64,
+    current_epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TurboBuild {
+    pub(crate) fn build(self) {
+        let Ok(mut index) = TurboQuantIndex::new(EMBED_DIM, 4) else { return; };
+        if self.ids.is_empty() { return; }
+        index.add(&self.flat);
+        index.prepare();
+        let built = Arc::new(TurboState { index, ids: self.ids,
+            built_at_mutation: self.mutation, built_at: std::time::Instant::now() });
+        let mut guard = self.published.write();
+        // Protect against an older concurrent maintenance plan winning the swap.
+        if self.current_epoch.load(Ordering::Relaxed) == self.epoch
+            && guard.as_ref().is_none_or(|t| t.built_at_mutation <= self.mutation) {
+            *guard = Some(built);
+        }
+    }
+}
+
+#[cfg(test)]
+mod turbo_maintenance_tests {
+    use super::*;
+
+    fn index() -> SemanticIndex {
+        let mut idx = SemanticIndex::new();
+        let mut v = vec![0.0; EMBED_DIM]; v[0] = 1.0;
+        // Direct population avoids testing HNSW construction here.
+        for id in 1..=2001 { idx.embeddings.insert(id, v.clone()); }
+        idx
+    }
+
+    #[test]
+    fn search_never_builds_and_stale_index_keeps_new_updated_deleted_vectors_visible() {
+        let mut idx = index();
+        let mut q = vec![0.0; EMBED_DIM]; q[1] = 1.0;
+        assert!(!idx.search(&q, 3, None, None).is_empty());
+        assert!(idx.turbo.read().is_none(), "search must not build");
+        idx.plan_turbo_rebuild(64).unwrap().build();
+        let old = idx.turbo.read().clone().unwrap();
+        assert!(idx.plan_turbo_rebuild(64).is_none());
+        let mut original = vec![0.0; EMBED_DIM]; original[0] = 1.0;
+        let leading = idx.search(&original, 1, None, None)[0].memory_id;
+        let mut negative = original.clone(); negative[0] = -1.0;
+        idx.upsert_meta(leading, negative, None);
+        let replacements = idx.search(&original, 3, None, None);
+        assert_eq!(replacements.len(), 3);
+        assert!(!replacements.iter().any(|h| h.memory_id == leading));
+        idx.upsert_meta(3000, q.clone(), None);
+        assert_eq!(idx.search(&q, 1, None, None)[0].memory_id, 3000);
+        assert!(Arc::ptr_eq(idx.turbo.read().as_ref().unwrap(), &old));
+        let plan = idx.plan_turbo_rebuild(0).unwrap();
+        idx.upsert_meta(3001, q.clone(), None); // raced with the build snapshot
+        plan.build();
+        idx.prune_turbo_changes();
+        idx.remove(3000);
+        let hits = idx.search(&q, 3, None, None);
+        assert_eq!(hits[0].memory_id, 3001);
+        assert_eq!(hits.len(), 3);
+        assert!(!hits.iter().any(|h| h.memory_id == 3000));
+        let mut opposite = q.clone(); opposite[1] = -1.0;
+        idx.upsert_meta(3001, opposite, None);
+        assert_ne!(idx.search(&q, 1, None, None)[0].memory_id, 3001);
+    }
+
+    #[test]
+    fn maintenance_swap_keeps_prior_readers_alive_and_discards_invalidated_plans() {
+        let idx = index();
+        idx.plan_turbo_rebuild(64).unwrap().build();
+        let old = idx.turbo.read().clone().unwrap();
+        idx.invalidate_turbo();
+        let plan = idx.plan_turbo_rebuild(64).unwrap();
+        idx.invalidate_turbo();
+        plan.build();
+        assert!(idx.turbo.read().is_none());
+        assert_eq!(old.ids.len(), 2001, "existing readers still own their index");
     }
 }

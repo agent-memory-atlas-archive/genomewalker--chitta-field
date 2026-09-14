@@ -82,3 +82,6 @@ pub use store::FilterLevel;
 
 #[cfg(test)]
 mod turbovec_bench;
+
+#[cfg(test)]
+mod read_path_tests;

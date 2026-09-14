@@ -1,6 +1,6 @@
 # LOCKING — chitta-field lock hierarchy and the rules the post-mortems imply
 
-Status as of 2026-09-02.
+Status as of 2026-09-14: recall access is deferred; WAL group sync and Turbo rebuilds run on Rust maintenance workers.
 
 This is the doc-level companion to the in-code lock notes. The comments at the
 sites cited below are authoritative and stay where they are; this file states
@@ -146,3 +146,57 @@ Ask, in order:
 4. Does a read guard span a call whose cost depends on data size rather than on
    the item being handled? That is the convoy shape, and it is a bug on the
    recall path.
+
+
+## 4. Recall, maintenance, and durability (2026-09-14)
+
+`get_memory` (also used by `cf_get_content`) reads states/payloads and enqueues
+(id, timestamp) under `pending_touches`, a short mutex taken alone. It never
+writes a core store, plasticity learner, or WAL. `cf_get_memory_metadata` takes
+only payload/state read guards. `span_for_memory` already takes only a shared
+span-store guard on both hits and misses: links are populated on write/backfill,
+so it needs no read-side cache insertion or persistence.
+
+The FFI handle owns and joins two workers, independent of the C++ queue:
+
+- Touch/Turbo maintenance polls every 100 ms. Accesses drain every
+  `CHITTA_TOUCH_FLUSH_S` (default 5 seconds) into ONE `UpdateStateBatch` record.
+  Original timestamps and counts survive a drain, including equal-millisecond
+  accesses. A completed drain syncs its batch off the read path, bounding normal
+  crash loss to the accumulation interval: losing up to five seconds of pending
+  access bookkeeping is acceptable. Explicit strengthen semantics are unchanged.
+- WAL maintenance runs on its own timer (`CHITTA_WAL_SYNC_MS`, default 200 ms),
+  so quantization cannot postpone group commit. Appends flush to the OS and do
+  not fsync by count. The timer syncs only pending writes; remember's existing
+  explicit dispatcher sync, forget, segment rotation, snapshot boundaries, and
+  shutdown force durability. I/O errors are reported rather than silently
+  clearing the pending counter. Detailed daemon status exposes
+  `wal.pending_sync_count` and `wal.sync_data_count` (actual sync_data attempts).
+
+These are scheduling intervals, not real-time guarantees
+under stalled storage or process suspension. A crash may lose the unsynced tail;
+acknowledged explicit durable boundaries are outside that window. SIGKILL alone
+does not simulate power loss because the OS retains its page cache; the tests
+also truncate an unsynced final record, replay/repair, append, and replay again.
+
+`touch_drain` serializes drain/apply and snapshot coverage. Its order is before
+log and every store guard; recall never takes it. Swap pending accesses out
+under their mutex and release it before learner, log, or state access. WAL
+append precedes state application. Full and cortical snapshots drain first;
+full snapshots hold the drain gate through coverage capture/publication. Close
+joins workers, drains, and syncs. The V23 snapshot layout is unchanged; the new
+WAL operation has tag 70 and uses the existing record CRC and prev_hash chain.
+Batches use per-writer WAL coverage for replay deduplication, independent of the
+explicit-state timestamp fence. Older binaries cannot replay the new operation;
+a reviewed compatible snapshot/rollback procedure is required before downgrading.
+
+Turbo rebuild planning copies embeddings under a shared semantic-index guard;
+quantization/preparation holds no store or publication lock. A rebuild is due
+when mutations advance by more than `CHITTA_TURBO_REBUILD_MIN` (default 64),
+60 seconds pass since publication, or no index exists. Publication swaps an
+Arc under a brief write guard. Searches clone that Arc and run without the
+publication lock, using the previous index during a build, or existing flat/
+HNSW paths before the first publication. Changed/new embeddings are scored
+from current data and deleted results are filtered until the next publication.
+An epoch prevents a pre-invalidation plan from publishing into a replaced
+embedding space. None of these search paths builds an index inline.

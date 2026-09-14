@@ -31,7 +31,8 @@ thread_local! {
 /// interior mutability inside ChittaField (parking_lot RwLocks) protects the
 /// actual data.
 pub struct CfHandle {
-    field: ChittaField,
+    field: std::sync::Arc<ChittaField>,
+    maintenance: Vec<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
     /// Analogy lane index — derived from the triplet store, never persisted.
     /// Handle-scoped rather than a process global so two open fields (tests,
     /// migrations) cannot read each other's signatures.
@@ -117,7 +118,56 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
         }
     };
     match ChittaField::open(data_dir) {
-        Ok(field) => Box::into_raw(Box::new(CfHandle { field, analogy: Default::default() })),
+        Ok(field) => {
+            let field = std::sync::Arc::new(field);
+            let mut maintenance = Vec::new();
+            // WAL has its own timer: a long index build must not delay group commit.
+            for wal_only in [true, false] {
+                let field = field.clone();
+                let (stop, stopped) = std::sync::mpsc::channel();
+                let mut interval = if wal_only { field.log.read().sync_interval() }
+                    else { std::time::Duration::from_millis(100) };
+                let worker = std::thread::Builder::new()
+                    .name(if wal_only { "chitta-wal" } else { "chitta-maint" }.into())
+                    .spawn(move || {
+                        let touch_interval = std::time::Duration::from_secs(
+                            std::env::var("CHITTA_TOUCH_FLUSH_S").ok().and_then(|s| s.parse().ok()).unwrap_or(5).max(1));
+                        let min_mutations = std::env::var("CHITTA_TURBO_REBUILD_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+                        let mut last_touch = std::time::Instant::now();
+                        while matches!(stopped.recv_timeout(interval), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                            if wal_only {
+                                let mut log = field.log.write();
+                                if let Err(e) = log.sync_if_due() {
+                                    eprintln!("[field] WAL timer sync failed: {e}");
+                                }
+                                interval = log.next_sync_delay();
+                            } else {
+                                if last_touch.elapsed() >= touch_interval {
+                                    if let Err(e) = field.drain_pending_touches() {
+                                        eprintln!("[field] touch drain failed: {e}");
+                                    }
+                                    last_touch = std::time::Instant::now();
+                                }
+                                let plan = field.semantic_idx.read().plan_turbo_rebuild(min_mutations);
+                                if let Some(plan) = plan {
+                                    plan.build();
+                                    field.semantic_idx.write().prune_turbo_changes();
+                                }
+                            }
+                        }
+                    });
+                match worker {
+                    Ok(worker) => maintenance.push((stop, worker)),
+                    Err(e) => {
+                        for (stop, worker) in maintenance { let _ = stop.send(()); let _ = worker.join(); }
+                        let error = json_null(format!("cf_open maintenance: {e}"));
+                        if !error.is_null() { unsafe { drop(CString::from_raw(error)); } }
+                        return std::ptr::null_mut();
+                    }
+                }
+            }
+            Box::into_raw(Box::new(CfHandle { field, maintenance, analogy: Default::default() }))
+        },
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -125,7 +175,11 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
 #[no_mangle]
 pub extern "C" fn cf_close(h: *mut CfHandle) {
     if !h.is_null() {
-        let b = unsafe { Box::from_raw(h) };
+        let mut b = unsafe { Box::from_raw(h) };
+        for (stop, _) in &b.maintenance { let _ = stop.send(()); }
+        for (_, worker) in b.maintenance.drain(..) {
+            if worker.join().is_err() { eprintln!("[field] maintenance thread panicked"); }
+        }
         // Persist any span links deferred off the write hot path.
         b.field.span_flush();
         drop(b);
@@ -7319,7 +7373,7 @@ mod tests {
             assert!(cf_save_full_snapshot(h));
             emit(h, "ledger", "task_records", "task-ledger", br#"{"revision":2,"changes":[]}"#);
             emit(h, "session", "deregister", "owner", b"{}");
-            let data_dir = (*h).field.data_dir.clone();
+            let data_dir = (&*h).field.data_dir.clone();
             cf_close(h);
             let field = crate::field::ChittaField::open(data_dir).unwrap();
             let registry = field.msg_registry.read();
@@ -10309,4 +10363,50 @@ pub extern "C" fn cf_span_stats(h: *mut CfHandle) -> *mut c_char {
     let (unique, disk, redacted) = handle.field.span_stats();
     let s = format!("{{\"unique\":{unique},\"disk_bytes\":{disk},\"redacted_total\":{redacted}}}");
     match CString::new(s) { Ok(cs)=>cs.into_raw(), Err(e)=>json_null(format!("cf_span_stats: {e}")) }
+}
+
+/// Diagnostic WAL status; sync_count counts actual sync_data attempts.
+#[no_mangle]
+pub extern "C" fn cf_wal_status(h: *const CfHandle) -> *mut c_char {
+    if h.is_null() { return json_null("cf_wal_status: null argument"); }
+    let field = &unsafe { &*h }.field;
+    let log = field.log.read();
+    let value = serde_json::json!({
+        "pending_sync_count": log.pending_sync_count(),
+        "sync_data_count": log.sync_count(),
+    });
+    CString::new(value.to_string()).unwrap().into_raw()
+}
+
+#[cfg(test)]
+mod read_maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn ffi_worker_drains_touches_and_syncs_without_a_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let h = cf_open(path.as_ptr(), std::ptr::null());
+        assert!(!h.is_null());
+        let field = &unsafe { &*h }.field;
+        let id = field.put_memory("wisdom", "test", b"timer", &vec![0.1; crate::ops::EMBED_DIM],
+            1.0, 0.001, 0, vec![], None, None).unwrap().0;
+        field.sync_wal().unwrap();
+        let seq = field.log.read().last_seqno();
+        let syncs = field.log.read().sync_count();
+        let mut buf = [0u8; 8192]; let mut written = 0;
+        assert_eq!(cf_get_content(h, id, buf.as_mut_ptr(), buf.len(), &mut written), 0);
+        assert_eq!(cf_get_memory_metadata(h, id, buf.as_mut_ptr(), buf.len(), &mut written), 0);
+        assert_eq!(field.log.read().last_seqno(), seq);
+        assert_eq!(field.log.read().sync_count(), syncs, "no per-recall sync");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if field.get_state(id).unwrap().access_count == 1 && field.log.read().pending_sync_count() == 0 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(field.get_state(id).unwrap().access_count, 1);
+        assert_eq!(field.log.read().pending_sync_count(), 0);
+        assert_eq!(field.log.read().last_seqno(), seq + 1);
+        cf_close(h);
+    }
 }

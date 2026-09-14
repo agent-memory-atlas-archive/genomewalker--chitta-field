@@ -47,6 +47,16 @@ impl PlasticityLearner {
         self.recommended_decay_rate(memory_id)
     }
 
+    /// Snapshot only affected histories. Drain computes recommendations off-lock;
+    /// the live learner is updated only after its WAL append succeeds.
+    pub fn access_preview(&self, ids: impl Iterator<Item = MemoryId>) -> Self {
+        let mut stats = HashMap::new();
+        for id in ids {
+            if let Some(value) = self.stats.get(&id) { stats.insert(id, value.clone()); }
+        }
+        Self { stats, alpha: self.alpha }
+    }
+
     /// Update the cached surprise score for a memory.
     /// Called after encode_memory computes reconstruction error.
     pub fn update_surprise(&mut self, memory_id: MemoryId, surprise: f32) {

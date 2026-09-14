@@ -2054,56 +2054,53 @@ impl ChittaField {
             }
         }
 
-        let ts = now_ms();
+        let payload = self.payloads.read().get(&memory_id).cloned()
+            .ok_or(FieldError::NotFound(memory_id))?;
+        // No core write guard, learner guard, or WAL lock on the recall path.
+        self.pending_touches.lock().push((memory_id, now_ms()));
+        Ok(payload)
+    }
 
-        // Record access in plasticity learner and get recommended decay rate.
-        let recommended_decay = self
-            .learners
-            .write()
-            .plasticity
-            .record_access(memory_id, ts);
+    pub(crate) fn drain_pending_touches(&self) -> Result<()> {
+        let _drain = self.touch_drain.lock();
+        self.drain_pending_touches_locked()
+    }
 
-        // Check if current decay rate differs significantly; if so, update it.
-        let new_decay_rate = {
-            let states = self.states.read();
-            states.get(&memory_id).and_then(|state| {
-                let diff = (state.decay_rate - recommended_decay).abs();
-                if diff > 0.0001 {
-                    Some(recommended_decay)
-                } else {
-                    None
-                }
-            })
+    pub(crate) fn drain_pending_touches_locked(&self) -> Result<()> {
+        let mut touches = std::mem::take(&mut *self.pending_touches.lock());
+        if touches.is_empty() { return Ok(()); }
+        touches.sort_unstable_by_key(|&(_, ts)| ts);
+        let mut preview = self.learners.read().plasticity.access_preview(touches.iter().map(|&(id, _)| id));
+        let deltas: Vec<_> = {
+            touches.iter().map(|&(memory_id, ts)| StateDeltaOp {
+                memory_id,
+                strength_delta: None, confidence_delta: None,
+                decay_rate: Some(preview.record_access(memory_id, ts)),
+                touch: true, pin: None, op_ts_ms: ts,
+                status: None, epistemic_status: None, staged: None, invalidated_by: None,
+            }).collect()
         };
-
-        // Touch: append UpdateState op then apply to in-memory state.
-        let delta = StateDeltaOp {
-            memory_id,
-            strength_delta: None,
-            confidence_delta: None,
-            decay_rate: new_decay_rate,
-            touch: true,
-            pin: None,
-            op_ts_ms: ts,
-            status: None,
-            epistemic_status: None,
-            staged: None,
-            invalidated_by: None,
-        };
-        let _seqno = self.log.write().append(&Op::UpdateState(delta.clone()))?;
-
+        // WAL before apply, with no learner/state/pending guard held across I/O.
+        if let Err(e) = self.log.write().append(&Op::UpdateStateBatch(deltas.clone())) {
+            self.pending_touches.lock().extend(touches);
+            return Err(e);
+        }
         {
-            let mut states = self.states.write();
-            if let Some(state) = states.get_mut(&memory_id) {
-                state.apply_delta(&delta, ts);
+            let mut learners = self.learners.write();
+            for &(id, ts) in &touches { learners.plasticity.record_access(id, ts); }
+        }
+        let mut states = self.states.write();
+        for delta in &deltas {
+            if let Some(state) = states.get_mut(&delta.memory_id) {
+                crate::field::apply_access_delta(state, delta);
             }
         }
-
-        let payloads = self.payloads.read();
-        payloads
-            .get(&memory_id)
-            .cloned()
-            .ok_or(FieldError::NotFound(memory_id))
+        drop(states);
+        // A completed drain bounds crash loss to the accumulation interval,
+        // rather than adding another WAL timer interval to the access window.
+        let mut log = self.log.write();
+        if log.pending_sync_count() > 0 { log.sync()?; }
+        Ok(())
     }
 
     /// Return current mutable state for a memory.
@@ -2524,7 +2521,7 @@ impl ChittaField {
             deleted_at_ms: ts,
         });
         let _seqno = self.log.write().append(&op)?;
-        let _ = self.log.write().sync(); // forget is irreversible — sync immediately
+        self.log.write().sync()?; // forget is irreversible — propagate durability failures
 
         {
             let mut states = self.states.write();
@@ -7321,7 +7318,10 @@ impl ChittaField {
     /// After this, on next open the snapshot covers all UpdateSparseCode ops
     /// up to the current log position, so those ops can be skipped in replay.
     pub fn save_snapshot(&self) -> Result<()> {
+        let _touch_drain = self.touch_drain.lock();
+        self.drain_pending_touches_locked()?;
         self.drain_pending_recall_effects()?;
+        self.sync_wal()?;
         let seqno = self.log.read().last_seqno();
         let path = self
             .data_dir
@@ -8682,7 +8682,10 @@ impl ChittaField {
 
     pub fn save_full_snapshot(&self) -> Result<()> {
         use crate::snapshot::FullSnapshot;
+        let _touch_drain = self.touch_drain.lock();
+        self.drain_pending_touches_locked()?;
         self.drain_pending_recall_effects()?;
+        self.sync_wal()?;
         let seqno = self.log.read().last_seqno();
         // Compact the delta into the base under a BRIEF write so the snapshot clone below
         // is canonical (delta empty). Decoupled from the sidecar disk writes, which now run

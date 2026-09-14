@@ -169,6 +169,8 @@ pub struct ChittaField {
     /// Stable writer identity for this lineage; carried forward across opens.
     pub(crate) writer_uuid: u128,
     pub(crate) log: RwLock<OpLog>,
+    pub(crate) pending_touches: Mutex<Vec<(MemoryId, i64)>>,
+    pub(crate) touch_drain: Mutex<()>,
     pub(crate) id_alloc: Arc<MemoryIdAllocator>,
     pub(crate) artifact_id_alloc: Arc<ArtifactIdAllocator>,
     pub(crate) payloads: RwLock<HashMap<MemoryId, MemoryPayload>>,
@@ -364,13 +366,16 @@ pub struct ChittaField {
 
 impl Drop for ChittaField {
     fn drop(&mut self) {
-        let _ = self.flush();
+        if let Err(e) = self.flush().and_then(|_| self.sync_wal()) {
+            eprintln!("[field] shutdown flush failed: {e}");
+        }
     }
 }
 
 impl ChittaField {
     /// Flush the write buffer to the OS.
     pub fn flush(&self) -> Result<()> {
+        self.drain_pending_touches()?;
         self.drain_pending_recall_effects()?;
         self.log.write().flush_buf()
     }
@@ -935,6 +940,7 @@ impl ChittaField {
         // and retry once all creates are applied. Merge replay already yields
         // timestamp order, so collection order is application order.
         let mut orphan_deltas: Vec<crate::ops::StateDeltaOp> = Vec::new();
+        let mut orphan_accesses = Vec::new();
         let mut ctx = ApplyCtx {
             payloads: &mut payloads,
             states: &mut states,
@@ -1010,6 +1016,16 @@ impl ChittaField {
                     }
                 }
             }
+            if let Op::UpdateStateBatch(deltas) = &op {
+                for d in deltas {
+                    if let Some(state) = ctx.states.get_mut(&d.memory_id) {
+                        apply_access_delta(state, d);
+                    } else {
+                        orphan_accesses.push(d.clone());
+                    }
+                }
+                return Ok(());
+            }
             if let Op::UpdateState(d) = &op {
                 if !ctx.states.contains_key(&d.memory_id) {
                     orphan_deltas.push(d.clone());
@@ -1024,6 +1040,9 @@ impl ChittaField {
                 let replay_now = if d.op_ts_ms > 0 { d.op_ts_ms } else { state.created_at_ms };
                 state.apply_delta(&d, replay_now);
             }
+        }
+        for d in orphan_accesses {
+            if let Some(state) = states.get_mut(&d.memory_id) { apply_access_delta(state, &d); }
         }
         // State coverage = snapshot coverage ⊔ walked WAL maxima (per-writer
         // max). Carried on the field and written into the next manifest commit.
@@ -1368,6 +1387,8 @@ impl ChittaField {
             lineage_epoch,
             writer_uuid,
             log: RwLock::new(log),
+            pending_touches: Mutex::new(Vec::new()),
+            touch_drain: Mutex::new(()),
             id_alloc,
             artifact_id_alloc,
             payloads: RwLock::new(payloads),
@@ -2119,6 +2140,13 @@ pub(crate) fn apply_op(op: Op, ctx: ApplyCtx) {
                 }
             }
         }
+        Op::UpdateStateBatch(deltas) => {
+            for delta in deltas {
+                if let Some(state) = states.get_mut(&delta.memory_id) {
+                    apply_access_delta(state, &delta);
+                }
+            }
+        }
         Op::UpdateState(delta) => {
             let memory_id = delta.memory_id;
             if let Some(state) = states.get_mut(&memory_id) {
@@ -2494,4 +2522,20 @@ fn build_kind_members(
             .insert(memory_id);
     }
     kind_members
+}
+
+/// Access batches are additive, deduplicated by WAL coverage, not the explicit
+/// state-delta timestamp fence (many concurrent accesses share a millisecond).
+/// They never advance that fence or move a newer explicit access backwards.
+pub(crate) fn apply_access_delta(state: &mut MemoryState, delta: &crate::ops::StateDeltaOp) {
+    state.access_count = state.access_count.saturating_add(1);
+    if delta.op_ts_ms >= state.last_accessed_ms && delta.op_ts_ms >= state.last_state_op_ts_ms {
+        if let Some(rate) = delta.decay_rate { state.decay_rate = rate.max(0.0); }
+    }
+    state.last_accessed_ms = state.last_accessed_ms.max(delta.op_ts_ms);
+    state.access_timestamps.push(delta.op_ts_ms);
+    state.access_timestamps.sort_unstable();
+    if state.access_timestamps.len() > 16 {
+        state.access_timestamps.drain(..state.access_timestamps.len() - 16);
+    }
 }

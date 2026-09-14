@@ -14,6 +14,8 @@ include!(concat!(env!("OUT_DIR"), "/embed_config.rs"));
 pub enum Op {
     PutPayload(PutPayloadOp),
     UpdateState(StateDeltaOp),
+    /// One maintenance drain; preserves each access timestamp and count.
+    UpdateStateBatch(Vec<StateDeltaOp>),
     DeleteMemory(DeleteMemoryOp),
     AddAssocEdge(AddAssocEdgeOp),
     UpsertArtifact(UpsertArtifactOp),
@@ -140,6 +142,7 @@ pub const OP_UPDATE_MEMORY_KIND: u8 = 66;
 pub const OP_SYMBOL_EVENT: u8 = 67;
 pub const OP_SUPERSEDE_TRIPLET: u8 = 68;
 pub const OP_RECORD_OUTCOME: u8 = 69;
+pub const OP_UPDATE_STATE_BATCH: u8 = 70;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTripletOp {
@@ -952,6 +955,7 @@ pub fn op_timestamp(op: &Op) -> Option<i64> {
     match op {
         Op::PutPayload(o) => nz(o.created_at_ms),
         Op::UpdateState(o) => nz(o.op_ts_ms),
+        Op::UpdateStateBatch(v) => v.iter().map(|d| d.op_ts_ms).max().and_then(nz),
         Op::DeleteMemory(o) => nz(o.deleted_at_ms),
         Op::AddAssocEdge(_) => None,
         Op::UpsertArtifact(_) => None,

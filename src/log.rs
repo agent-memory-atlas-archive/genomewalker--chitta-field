@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const SEGMENT_MAGIC: &[u8; 8] = b"CFLOG001";
 pub const SEGMENT_MAGIC_V2: &[u8; 8] = b"CFLOG002";
@@ -77,6 +78,7 @@ fn op_type_byte(op: &Op) -> u8 {
     match op {
         Op::PutPayload(_) => OP_PUT_PAYLOAD,
         Op::UpdateState(_) => OP_UPDATE_STATE,
+        Op::UpdateStateBatch(_) => crate::ops::OP_UPDATE_STATE_BATCH,
         Op::DeleteMemory(_) => OP_DELETE_MEMORY,
         Op::AddAssocEdge(_) => OP_ADD_ASSOC_EDGE,
         Op::UpsertArtifact(_) => OP_UPSERT_ARTIFACT,
@@ -155,7 +157,10 @@ pub struct OpLog {
     current_segment_path: PathBuf,
     current_segment_size: u64,
     next_seqno: u64,
-    ops_since_sync: u32,  // for batch fsync: sync_data() every N appends
+    ops_since_sync: u64,
+    sync_count: u64,
+    last_sync: Instant,
+    sync_interval: Duration,
     /// Hash-chain tip: SHA256 of the most recent V2 record.
     /// Zero for genesis or when only V1 segments exist.
     chain_head: ChainHash,
@@ -206,6 +211,9 @@ impl OpLog {
                     current_segment_size: size,
                     next_seqno,
                     ops_since_sync: 0,
+            sync_count: 0,
+            last_sync: Instant::now(),
+            sync_interval: Duration::from_millis(std::env::var("CHITTA_WAL_SYNC_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(1)),
                     chain_head,
                     vector_space_id,
                 });
@@ -223,6 +231,9 @@ impl OpLog {
             current_segment_size: header_size,
             next_seqno,
             ops_since_sync: 0,
+            sync_count: 0,
+            last_sync: Instant::now(),
+            sync_interval: Duration::from_millis(std::env::var("CHITTA_WAL_SYNC_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(1)),
             chain_head,
             vector_space_id,
         })
@@ -263,12 +274,8 @@ impl OpLog {
         // Advance chain head
         self.chain_head = compute_record_hash(seqno, op_type, &prev_hash, &payload);
 
-        // Batch fsync: sync_data() every 32 appends (fdatasync, cheaper than sync_all)
+        // Appends flush to the OS; the maintenance timer owns group fsync.
         self.ops_since_sync += 1;
-        if self.ops_since_sync >= 32 {
-            let _ = self.current_segment.get_ref().sync_data();
-            self.ops_since_sync = 0;
-        }
 
         // V2 entry: 4 + 8 + 1 + 32 + payload_len + 4
         let entry_size = 4 + 8 + 1 + 32 + payload.len() as u64 + 4;
@@ -281,8 +288,25 @@ impl OpLog {
     /// Force fsync — call after critical mutations (put_memory, forget, etc.)
     pub fn sync(&mut self) -> Result<()> {
         self.current_segment.flush()?;
+        self.sync_count += 1;
         self.current_segment.get_ref().sync_data()?;
         self.ops_since_sync = 0;
+        self.last_sync = Instant::now();
+        Ok(())
+    }
+
+    pub fn pending_sync_count(&self) -> u64 { self.ops_since_sync }
+    pub fn sync_count(&self) -> u64 { self.sync_count }
+    pub fn sync_interval(&self) -> Duration { self.sync_interval }
+    pub fn next_sync_delay(&self) -> Duration {
+        if self.ops_since_sync == 0 { return self.sync_interval; }
+        self.sync_interval.saturating_sub(self.last_sync.elapsed()).max(Duration::from_millis(1))
+    }
+
+    pub fn sync_if_due(&mut self) -> Result<()> {
+        if self.ops_since_sync > 0 && self.last_sync.elapsed() >= self.sync_interval {
+            self.sync()?;
+        }
         Ok(())
     }
 
@@ -410,8 +434,7 @@ impl OpLog {
         if self.current_segment_size < MAX_SEGMENT_SIZE {
             return Ok(());
         }
-        self.current_segment.flush()?;
-        let _ = self.current_segment.get_ref().sync_data(); // ensure old segment is durable before rotation
+        self.sync()?; // propagate failure before rotating the hash chain
         let new_path = segment_path(&self.data_dir, self.instance_id, self.next_seqno);
         let f = create_segment_v3(&new_path, self.next_seqno, &self.chain_head, self.vector_space_id)?;
         self.current_segment = BufWriter::new(f);
@@ -1062,5 +1085,87 @@ mod tests {
         // Each instance is a separate chain; replay must cross the prefix
         // boundary without corrupting chain_head and without aborting.
         assert_eq!(seen, vec![1, 2, 3, 4]);
+    }
+}
+
+#[cfg(test)]
+mod group_commit_tests {
+    use super::*;
+
+    fn op(id: u64) -> Op {
+        Op::DeleteMemory(crate::ops::DeleteMemoryOp { memory_id: id, deleted_at_ms: id as i64 })
+    }
+
+    #[test]
+    fn append_count_never_triggers_sync_but_timer_and_boundary_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = OpLog::open(dir.path(), 42, 1).unwrap();
+        for id in 1..=100 { log.append(&op(id)).unwrap(); }
+        assert_eq!(log.pending_sync_count(), 100);
+        assert_eq!(log.sync_count(), 0);
+        log.last_sync = Instant::now() - log.sync_interval;
+        log.sync_if_due().unwrap();
+        assert_eq!(log.sync_count(), 1);
+        assert_eq!(log.pending_sync_count(), 0);
+        log.sync_if_due().unwrap();
+        assert_eq!(log.sync_count(), 1, "idle timer never fsyncs");
+        log.append(&op(101)).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.sync_count(), 2);
+        assert_eq!(log.pending_sync_count(), 0);
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture launched by kill9_replays_durable_prefix_and_unsynced_tail"]
+    fn crash_writer() {
+        let Some(path) = std::env::var_os("CHITTA_CRASH_TEST_DIR") else { return; };
+        let dir = PathBuf::from(path);
+        let mut log = OpLog::open(&dir, 42, 1).unwrap();
+        for id in 1..=8 { log.append(&op(id)).unwrap(); }
+        log.sync().unwrap();
+        for id in 9..=13 { log.append(&op(id)).unwrap(); }
+        fs::write(dir.join("ready"), log.current_segment_size.to_string()).unwrap();
+        loop { std::thread::park(); }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill9_replays_durable_prefix_and_unsynced_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "log::group_commit_tests::crash_writer", "--ignored"])
+            .env("CHITTA_CRASH_TEST_DIR", dir.path())
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+            .spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dir.path().join("ready").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap(); // SIGKILL on Unix, never a live daemon.
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+        assert!(dir.path().join("ready").exists());
+        let mut log = OpLog::open(dir.path(), 42, 1).unwrap();
+        let mut seen = Vec::new();
+        log.replay(0, |_, _, op| { if let Op::DeleteMemory(d) = op { seen.push(d.memory_id); } Ok(()) }).unwrap();
+        assert!(seen.len() >= 8 && seen.len() <= 13);
+        assert_eq!(seen, (1..=seen.len() as u64).collect::<Vec<_>>());
+        // SIGKILL does not evict the OS cache. Also model loss of part of the
+        // unsynced tail, verifying repair and subsequent hash-chain appends.
+        let path = log.current_segment_path.clone();
+        drop(log);
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 5).unwrap();
+        let mut log = OpLog::open(dir.path(), 42, 1).unwrap();
+        let mut seqs = Vec::new();
+        log.replay(0, |_, seq, _| { seqs.push(seq); Ok(()) }).unwrap();
+        assert_eq!(seqs, (1..=12).collect::<Vec<_>>());
+        log.set_next_seqno(13);
+        log.append(&op(14)).unwrap();
+        log.sync().unwrap();
+        let mut count = 0;
+        log.replay(0, |_, _, _| { count += 1; Ok(()) }).unwrap();
+        assert_eq!(count, 13);
     }
 }
