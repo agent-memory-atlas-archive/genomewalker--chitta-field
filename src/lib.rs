@@ -85,3 +85,5 @@ mod turbovec_bench;
 
 #[cfg(test)]
 mod read_path_tests;
+
+mod profile;

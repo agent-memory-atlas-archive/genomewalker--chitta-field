@@ -2916,6 +2916,7 @@ impl ChittaField {
         query_arousal: Option<f32>,
         strengthen: bool,
     ) -> Result<Vec<RecallHit>> {
+        let mut profile = crate::profile::RecallProfile::new("semantic_search");
         if query_embedding.len() != EMBED_DIM {
             return Err(FieldError::InvalidEmbedDim {
                 expected: EMBED_DIM,
@@ -2944,6 +2945,7 @@ impl ChittaField {
                 .search(query_embedding, result_limit, allowed, realm)
         };
 
+        profile.next("cw_refresh");
         // Refresh competitive_weight for each candidate using the *current* HNSW neighborhood.
         // The write-time value is stale for memories ingested when the store was sparse.
         // Two-phase to avoid holding states.write() during HNSW searches.
@@ -3000,23 +3002,29 @@ impl ChittaField {
                 })
                 .collect()
         };
-        // HNSW searches with only semantic_idx.read() — no states lock held.
-        let cw_updates: Vec<(MemoryId, f32)> = {
+        // Snapshot the prepared index under a brief read, then release the guard
+        // before the independent neighborhood probes. Scalar/HNSW/dirty cases
+        // retain the original path and its scoring semantics.
+        let refresh_plan = self.semantic_idx.read().plan_refresh_searches(&candidates, realm);
+        let neighborhoods = if let Some(plan) = refresh_plan {
+            plan.search_all(&candidates)
+        } else {
             let idx = self.semantic_idx.read();
-            candidates.iter().filter_map(|(memory_id, emb)| {
-                let neighbors = idx.search(emb, 9, None, realm);
+            candidates.iter().map(|(_, emb)| idx.search(emb, 9, None, realm)).collect()
+        };
+        let cw_updates: Vec<(MemoryId, f32)> = candidates.iter().zip(neighborhoods.iter())
+            .filter_map(|((memory_id, _), neighbors)| {
                 if neighbors.len() <= 1 { return None; }
                 let mut cos_sum = 0.0f32;
                 let mut n = 0u32;
-                for nb in &neighbors {
+                for nb in neighbors {
                     if nb.memory_id == *memory_id { continue; }
                     if nb.cosine_similarity >= dedup_upper { continue; }
                     cos_sum += nb.cosine_similarity;
                     n += 1;
                 }
                 if n > 0 { Some((*memory_id, cos_sum / n as f32)) } else { None }
-            }).collect()
-        };
+            }).collect();
         // Phase B — apply under brief states.write(), then release reservations.
         // Every searched candidate is marked refreshed even when its neighborhood
         // produced no update, so isolated memories aren't re-searched on every
@@ -3041,6 +3049,7 @@ impl ChittaField {
             }
         }
 
+        profile.next("semantic_score_format");
         let payloads = self.payloads.read();
         let states = self.states.read();
         let learners = self.learners.read();
@@ -8973,7 +8982,7 @@ impl ChittaField {
         }
         snap.semantic_idx.clear_embeddings();
         let _ = snap.triplet_store.save_supersession_sidecar(&sup_path);
-        snap.triplet_store.purge_invalidated();
+        snap.triplet_store.clean_for_load();
         snap.triplet_store.clear_indexes_for_save();
         // Diagnostic: per-field serialized sizes to identify snapshot bloat.
         {

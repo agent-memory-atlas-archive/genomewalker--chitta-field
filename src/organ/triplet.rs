@@ -11,6 +11,26 @@ pub enum CorrectionState {
     Verified,
 }
 
+/// Shared source path with exactly the historical String wire representation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TripletSource(std::sync::Arc<str>);
+impl TripletSource { pub fn as_str(&self) -> &str { &self.0 } }
+impl std::ops::Deref for TripletSource {
+    type Target = str;
+    fn deref(&self) -> &str { &self.0 }
+}
+impl PartialEq<str> for TripletSource { fn eq(&self, other: &str) -> bool { self.as_str() == other } }
+impl Serialize for TripletSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_str().serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for TripletSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(String::deserialize(deserializer)?.into()))
+    }
+}
+
 /// A single subject-predicate-object fact.
 /// `weight` is the forward (subject→object) strength.
 /// `reverse_weight` is the backward (object→subject) strength.
@@ -27,7 +47,7 @@ pub struct TripletEntry {
     pub valid_from_ms: i64,
     pub valid_to_ms: i64, // 0 = still valid
     pub source_memory_id: Option<MemoryId>,
-    pub source_file: Option<String>,
+    pub source_file: Option<TripletSource>,
 }
 
 fn default_reverse_weight() -> f32 {
@@ -47,6 +67,11 @@ impl TripletEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripletStore {
+    /// Runtime flag persisted as an optional V23 section, never in bincode.
+    #[serde(skip)]
+    pub(crate) clean: bool,
+    #[serde(skip)]
+    source_files: std::collections::HashSet<std::sync::Arc<str>>,
     next_id: u64,
     entries: Vec<TripletEntry>,
 
@@ -72,8 +97,24 @@ pub struct TripletStore {
 }
 
 impl TripletStore {
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        use crate::profile::map_bytes;
+        self.entries.capacity() * std::mem::size_of::<TripletEntry>()
+            + self.entries.iter().map(|e| e.subject.capacity() + e.predicate.capacity()
+                + e.object.capacity()).sum::<usize>()
+            + self.source_files.iter().map(|p| p.len() + 16).sum::<usize>()
+            + self.source_files.capacity() * 8 / 7 * (std::mem::size_of::<std::sync::Arc<str>>() + 1)
+            + map_bytes(&self.id_to_index)
+            + [&self.by_subject, &self.by_object, &self.by_predicate].iter().map(|m|
+                map_bytes(m) + m.iter().map(|(k, v)| k.capacity() + v.capacity() * 8).sum::<usize>()).sum::<usize>()
+            + map_bytes(&self.ingestion_times) + map_bytes(&self.supersession_map)
+            + map_bytes(&self.correction_states)
+    }
+
     pub fn new() -> Self {
         Self {
+            clean: true,
+            source_files: Default::default(),
             next_id: 1,
             entries: Vec::new(),
             id_to_index: HashMap::new(),
@@ -84,6 +125,24 @@ impl TripletStore {
             supersession_map: HashMap::new(),
             ingestion_times: HashMap::new(),
         }
+    }
+
+    fn intern_source_file(&mut self, path: Option<String>) -> Option<TripletSource> {
+        path.map(|path| {
+            if let Some(shared) = self.source_files.get(path.as_str()) { return TripletSource(shared.clone()); }
+            let shared: std::sync::Arc<str> = path.into();
+            self.source_files.insert(shared.clone());
+            TripletSource(shared)
+        })
+    }
+
+    /// Legacy families migrate once. WAL duplicates or invalidation clear the flag.
+    pub(crate) fn clean_for_load(&mut self) -> (usize, usize) {
+        if self.clean { return (0, 0); }
+        let purged = self.purge_invalidated();
+        let deduped = self.dedup_entries();
+        self.clean = true;
+        (purged, deduped)
     }
 
     /// Clear derived indexes before serialization so new snapshots stay small.
@@ -101,6 +160,14 @@ impl TripletStore {
 
     /// Rebuild all derived indexes from `entries`. Must be called after deserialization.
     pub fn rebuild_indexes(&mut self) {
+        self.source_files.clear();
+        for entry in &mut self.entries {
+            if let Some(path) = &mut entry.source_file {
+                if let Some(shared) = self.source_files.get(path.as_str()) { path.0 = shared.clone(); }
+                else { self.source_files.insert(path.0.clone()); }
+            }
+        }
+
         self.id_to_index = HashMap::with_capacity(self.entries.len());
         self.by_subject   = HashMap::new();
         self.by_object    = HashMap::new();
@@ -131,13 +198,13 @@ impl TripletStore {
     /// (subject, predicate, object), keep only the highest-weight one. Returns removed count.
     pub fn dedup_entries(&mut self) -> usize {
         use std::collections::hash_map::Entry;
-        // Owned keys to avoid borrow conflicts during retain.
-        let mut live_best: HashMap<(String, String, String), usize> = HashMap::new();
+        // Borrow only while selecting survivors; drop before mutating entries.
+        let mut live_best: HashMap<(&str, &str, &str), usize> = HashMap::new();
         let mut to_remove = std::collections::HashSet::new();
 
         for (idx, e) in self.entries.iter().enumerate() {
             if e.valid_to_ms != 0 { continue; }
-            let key = (e.subject.clone(), e.predicate.clone(), e.object.clone());
+            let key = (e.subject.as_str(), e.predicate.as_str(), e.object.as_str());
             match live_best.entry(key) {
                 Entry::Vacant(v) => { v.insert(idx); }
                 Entry::Occupied(mut o) => {
@@ -152,6 +219,7 @@ impl TripletStore {
             }
         }
 
+        drop(live_best);
         let removed = to_remove.len();
         if removed == 0 { return 0; }
 
@@ -250,6 +318,9 @@ impl TripletStore {
         source_memory_id: Option<MemoryId>,
         source_file: Option<String>,
     ) {
+        if self.clean && self.find_exact_live(&subject, &predicate, &object).is_some() {
+            self.clean = false;
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -268,7 +339,7 @@ impl TripletStore {
             valid_from_ms,
             valid_to_ms: 0,
             source_memory_id,
-            source_file,
+            source_file: self.intern_source_file(source_file),
         };
         self.entries.push(entry);
 
@@ -291,6 +362,7 @@ impl TripletStore {
         if let Some(&idx) = self.id_to_index.get(&triplet_id) {
             if let Some(entry) = self.entries.get_mut(idx) {
                 entry.valid_to_ms = now_ms;
+                self.clean = false;
             }
         }
     }
@@ -420,6 +492,7 @@ impl TripletStore {
                 if let Some(ref sf) = entry.source_file {
                     if sf == source_file {
                         entry.valid_to_ms = now_ms;
+                        self.clean = false;
                         invalidated.push(entry.id);
                     }
                 }
@@ -638,6 +711,49 @@ impl TripletStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_paths_are_shared_and_keep_string_wire_encoding() {
+        let mut store = super::TripletStore::new();
+        for id in 1..=20 {
+            store.replay_add(id, format!("s{id}"), "p".into(), "o".into(), 1.0, 0, None, Some("/repo/source.rs".into()));
+        }
+        let a = store.entries[0].source_file.as_ref().unwrap();
+        let b = store.entries[19].source_file.as_ref().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a.0, &b.0));
+        assert_eq!(bincode::serialize(a).unwrap(), bincode::serialize("/repo/source.rs").unwrap());
+        let bytes = bincode::serialize(&store).unwrap();
+        let mut loaded: super::TripletStore = bincode::deserialize(&bytes).unwrap();
+        loaded.rebuild_indexes();
+        assert!(std::sync::Arc::ptr_eq(&loaded.entries[0].source_file.as_ref().unwrap().0,
+            &loaded.entries[19].source_file.as_ref().unwrap().0));
+        assert_eq!(loaded.invalidate_by_source_file("/repo/source.rs", 10).len(), 20);
+        assert!(!loaded.clean);
+    }
+
+    #[test]
+    fn clean_marker_is_invalidated_by_duplicate_replay_and_invalidation() {
+        let mut store = super::TripletStore::new();
+        store.replay_add(1, "s".into(), "p".into(), "o".into(), 0.5, 0, None, None);
+        assert!(store.clean);
+        store.replay_add(2, "s".into(), "p".into(), "o".into(), 0.8, 0, None, None);
+        assert!(!store.clean);
+        assert_eq!(store.clean_for_load(), (0, 1));
+        assert_eq!(store.query_subject("s", 1)[0].id, 2);
+        assert_eq!(store.clean_for_load(), (0, 0));
+        store.invalidate(2, 10);
+        assert!(!store.clean);
+        assert_eq!(store.clean_for_load(), (1, 0));
+    }
+
+    #[test]
+    fn legacy_bincode_does_not_contain_the_clean_marker() {
+        let store = super::TripletStore::new();
+        let bytes = bincode::serialize(&store).unwrap();
+        let restored: super::TripletStore = bincode::deserialize(&bytes).unwrap();
+        assert!(!restored.clean, "absence of the V23 section must require migration");
+        assert_eq!(bytes, bincode::serialize(&restored).unwrap());
+    }
+
     use super::*;
 
     #[test]

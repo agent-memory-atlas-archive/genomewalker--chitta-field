@@ -24,7 +24,13 @@ pub struct KeywordIndex {
     doc_lengths: HashMap<MemoryId, u32>,
     /// Reverse map used to remove or reindex a single document efficiently.
     #[serde(skip)]
-    doc_terms: HashMap<MemoryId, Vec<(String, u32)>>,
+    doc_terms: HashMap<MemoryId, Vec<u32>>,
+    #[serde(skip)]
+    term_names: Vec<Option<std::sync::Arc<str>>>,
+    #[serde(skip)]
+    term_ids: HashMap<std::sync::Arc<str>, u32>,
+    #[serde(skip)]
+    free_term_ids: Vec<u32>,
     /// running total tokens across all documents
     total_tokens: u64,
     total_docs: u32,
@@ -42,6 +48,9 @@ impl KeywordIndex {
             postings: HashMap::new(),
             doc_lengths: HashMap::new(),
             doc_terms: HashMap::new(),
+            term_names: Vec::new(),
+            term_ids: HashMap::new(),
+            free_term_ids: Vec::new(),
             total_tokens: 0,
             total_docs: 0,
         }
@@ -66,13 +75,14 @@ impl KeywordIndex {
         }
 
         // Insert into postings lists.
-        let mut reverse_terms = Vec::new();
+        let mut reverse_terms = Vec::with_capacity(tf_map.len());
         for (term, tf) in tf_map {
+            let term_id = self.intern_term(&term);
             self.postings
-                .entry(term.clone())
+                .entry(term)
                 .or_insert_with(Vec::new)
                 .push(Posting { memory_id, tf });
-            reverse_terms.push((term, tf));
+            reverse_terms.push(term_id);
         }
 
         self.doc_terms.insert(memory_id, reverse_terms);
@@ -88,15 +98,19 @@ impl KeywordIndex {
             self.total_docs = self.total_docs.saturating_sub(1);
 
             if let Some(terms) = self.doc_terms.remove(&memory_id) {
-                for (term, _) in terms {
-                    let remove_term = if let Some(postings) = self.postings.get_mut(&term) {
+                for term_id in terms {
+                    let Some(term) = self.term_names.get(term_id as usize).and_then(Option::as_ref) else { continue; };
+                    let remove_term = if let Some(postings) = self.postings.get_mut(term.as_ref()) {
                         postings.retain(|p| p.memory_id != memory_id);
                         postings.is_empty()
                     } else {
                         false
                     };
                     if remove_term {
-                        self.postings.remove(&term);
+                        self.postings.remove(term.as_ref());
+                        self.term_ids.remove(term.as_ref());
+                        self.term_names[term_id as usize] = None;
+                        self.free_term_ids.push(term_id);
                     }
                 }
             }
@@ -144,17 +158,54 @@ impl KeywordIndex {
         self.total_docs as usize
     }
 
+    fn intern_term(&mut self, term: &str) -> u32 {
+        if let Some(&id) = self.term_ids.get(term) { return id; }
+        let name: std::sync::Arc<str> = term.into();
+        let id = if let Some(id) = self.free_term_ids.pop() {
+            self.term_names[id as usize] = Some(name.clone());
+            id
+        } else {
+            let id = u32::try_from(self.term_names.len()).expect("keyword vocabulary exceeds u32");
+            self.term_names.push(Some(name.clone()));
+            id
+        };
+        self.term_ids.insert(name, id);
+        id
+    }
+
     pub fn rebuild_reverse_index(&mut self) {
-        let mut doc_terms: HashMap<MemoryId, Vec<(String, u32)>> = HashMap::new();
+        let mut doc_terms: HashMap<MemoryId, Vec<u32>> = HashMap::with_capacity(self.doc_lengths.len());
+        self.term_names.clear();
+        self.term_ids.clear();
+        self.free_term_ids.clear();
         for (term, postings) in &self.postings {
+            let id = u32::try_from(self.term_names.len()).expect("keyword vocabulary exceeds u32");
+            let name: std::sync::Arc<str> = term.as_str().into();
+            self.term_names.push(Some(name.clone()));
+            self.term_ids.insert(name, id);
             for posting in postings {
-                doc_terms
-                    .entry(posting.memory_id)
-                    .or_default()
-                    .push((term.clone(), posting.tf));
+                doc_terms.entry(posting.memory_id).or_default().push(id);
             }
         }
+        for terms in doc_terms.values_mut() { terms.shrink_to_fit(); }
         self.doc_terms = doc_terms;
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> (usize, usize, usize) {
+        use crate::profile::map_bytes;
+        let postings = map_bytes(&self.postings) + map_bytes(&self.doc_lengths)
+            + self.postings.iter().map(|(term, p)| term.capacity()
+                + p.capacity() * std::mem::size_of::<Posting>()).sum::<usize>();
+        let reverse = map_bytes(&self.doc_terms) + self.doc_terms.values().map(|v| v.capacity() * 4).sum::<usize>()
+            + map_bytes(&self.term_ids) + self.term_names.capacity() * std::mem::size_of::<Option<std::sync::Arc<str>>>()
+            + self.term_names.iter().flatten().map(|s| s.len() + 16).sum::<usize>()
+            + self.free_term_ids.capacity() * 4;
+        // Counterfactual estimate of the pre-change reverse map on these exact
+        // postings, excluding malloc headers/alignment (one allocation per term).
+        let legacy = map_bytes(&self.doc_terms) + self.doc_terms.values().map(|v|
+            v.len().next_power_of_two().max(4) * std::mem::size_of::<(String, u32)>()
+                + v.iter().map(|&id| self.term_names[id as usize].as_ref().map_or(0, |s| s.len())).sum::<usize>()).sum::<usize>();
+        (postings, reverse, legacy)
     }
 
     fn query_terms<'a>(&'a self, query_terms: &[String], n: f32) -> Vec<QueryTerm<'a>> {
@@ -442,5 +493,41 @@ mod tests {
         let hits = idx.search("alpha beta gamma", 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].memory_id, 2);
+    }
+}
+
+#[cfg(test)]
+mod compact_reverse_tests {
+    use super::*;
+
+    #[test]
+    fn term_ids_preserve_wire_format_and_survive_remove_reindex_and_rebuild() {
+        let mut index = KeywordIndex::new();
+        index.index(1, "shared alpha alpha");
+        index.index(2, "shared beta");
+        let bytes = bincode::serialize(&index).unwrap();
+        // Decode the historical layout: runtime interning must add no wire fields.
+        #[derive(Deserialize)]
+        struct Legacy { postings: HashMap<String, Vec<Posting>>, doc_lengths: HashMap<MemoryId, u32>, total_tokens: u64, total_docs: u32 }
+        let old: Legacy = bincode::deserialize(&bytes).unwrap();
+        assert_eq!((old.total_tokens, old.total_docs, old.doc_lengths.len(), old.postings.len()), (5, 2, 2, 3));
+        let mut restored: KeywordIndex = bincode::deserialize(&bytes).unwrap();
+        restored.rebuild_reverse_index();
+        for query in ["shared", "alpha", "beta"] {
+            let expected = index.search(query, 5);
+            let actual = restored.search(query, 5);
+            assert_eq!(expected.iter().map(|h| (h.memory_id, h.bm25_score.to_bits())).collect::<Vec<_>>(),
+                actual.iter().map(|h| (h.memory_id, h.bm25_score.to_bits())).collect::<Vec<_>>());
+        }
+        restored.remove(1);
+        assert!(restored.search("alpha", 5).is_empty());
+        assert_eq!(restored.search("shared", 5)[0].memory_id, 2);
+        restored.index(3, "gamma shared"); // reuses freed term ID
+        restored.index(2, "replacement");
+        assert!(restored.search("beta", 5).is_empty());
+        restored.rebuild_reverse_index();
+        restored.remove(3);
+        assert!(restored.search("gamma shared", 5).is_empty());
+        assert_eq!(restored.search("replacement", 5)[0].memory_id, 2);
     }
 }

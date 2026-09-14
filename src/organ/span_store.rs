@@ -174,6 +174,18 @@ fn fnv1a(class: u8, s: &str) -> u64 {
 }
 
 impl SpanStore {
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        use crate::profile::map_bytes;
+        self.spans.capacity() * std::mem::size_of::<SpanEntry>()
+            + self.spans.iter().map(|s| s.text.capacity()
+                + if s.mem_refs.spilled() { s.mem_refs.capacity() * 8 } else { 0 }).sum::<usize>()
+            + self.realm_dict.iter().chain(self.session_dict.iter()).map(|s| std::mem::size_of::<String>() + s.capacity()).sum::<usize>()
+            + map_bytes(&self.by_hash) + map_bytes(&self.mem_watermarks)
+            + map_bytes(&self.mem_adjacency) + map_bytes(&self.watermarks)
+            + map_bytes(&self.realm_idx) + map_bytes(&self.session_idx)
+            + self.trigram.values().map(|b| b.serialized_size()).sum::<usize>()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

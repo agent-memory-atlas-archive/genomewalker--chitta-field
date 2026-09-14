@@ -508,8 +508,8 @@ impl DeltaBatchPlan {
     pub fn is_empty(&self) -> bool { self.plans.is_empty() && self.realm_plans.is_empty() }
 }
 
-/// Maintenance-built 4-bit TurboQuant index over normalized embeddings.
-/// NOT serialized; published in the background after startup.
+/// 4-bit TurboQuant index, warmed before open returns and refreshed by maintenance.
+/// Runtime-only: published through an Arc after construction completes.
 struct TurboState {
     index: TurboQuantIndex,
     /// turbovec row -> MemoryId (insertion order = add order).
@@ -517,6 +517,41 @@ struct TurboState {
     /// `mutations` value the index was built at; stale when it lags.
     built_at_mutation: u64,
     built_at: std::time::Instant,
+}
+
+/// Immutable refresh view: publishing a newer index cannot invalidate this Arc.
+/// Searches run off every store guard, in a bounded pool, with the same single-
+/// query arithmetic and filtering as SemanticIndex::search's raw Turbo arm.
+pub(crate) struct RefreshSearch {
+    turbo: Arc<TurboState>,
+    deleted: HashSet<MemoryId>,
+}
+fn refresh_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map_or(1, |n| n.get().min(16)))
+        .thread_name(|i| format!("cf-refresh-{i}"))
+        .build().expect("competitive refresh pool"))
+}
+
+impl RefreshSearch {
+    pub(crate) fn search_all(&self, candidates: &[(MemoryId, Vec<f32>)]) -> Vec<Vec<SemanticHit>> {
+        use rayon::prelude::*;
+        refresh_pool().install(|| candidates.par_iter().map(|(_, emb)| {
+            let Some(q) = normalize(emb) else { return Vec::new(); };
+            let results = self.turbo.index.search(&q, 9.min(self.turbo.ids.len().max(1)));
+            let mut hits = Vec::with_capacity(9);
+            for (&row, &score) in results.indices_for_query(0).iter().zip(results.scores_for_query(0)) {
+                if row < 0 || !score.is_finite() { continue; }
+                let Some(&id) = self.turbo.ids.get(row as usize) else { continue; };
+                if self.deleted.contains(&id) { continue; }
+                hits.push(SemanticHit { memory_id: id, cosine_similarity: score });
+                if hits.len() == 9 { break; }
+            }
+            hits.sort_unstable_by(|a, b| b.cosine_similarity.total_cmp(&a.cosine_similarity));
+            hits
+        }).collect())
+    }
 }
 
 /// Approximate semantic index over normalized memory embeddings.
@@ -616,6 +651,23 @@ pub struct SemanticIndex {
 }
 
 impl SemanticIndex {
+    pub(crate) fn allocated_bytes(&self) -> (usize, usize, usize) {
+        use crate::profile::map_bytes;
+        let embeddings = map_bytes(&self.embeddings)
+            + self.embeddings.values().map(|v| v.capacity() * 4).sum::<usize>()
+            + self.emb_mmap.as_ref().map_or(0, |m| m.len()) + map_bytes(&self.emb_offsets);
+        let graph = |g: &HnswGraph| map_bytes(&g.neighbors) + g.neighbors.values().map(|layers|
+            layers.capacity() * std::mem::size_of::<Vec<MemoryId>>()
+                + layers.iter().map(|v| v.capacity() * 8).sum::<usize>()).sum::<usize>();
+        let hnsw = graph(&self.hnsw) + graph(&self.delta_hnsw)
+            + self.per_realm_hnsw.values().map(graph).sum::<usize>();
+        let caches = map_bytes(&self.binary_codes)
+            + self.binary_codes.values().map(|v| v.capacity() * 8).sum::<usize>()
+            + self.binary_vec.capacity() * std::mem::size_of::<(MemoryId, [u64; BINARY_WORDS])>()
+            + map_bytes(&self.binary_vec_pos) + map_bytes(&self.turbo_changed);
+        (embeddings, hnsw, caches)
+    }
+
     pub fn new() -> Self {
         Self {
             embeddings: HashMap::new(),
@@ -1224,14 +1276,29 @@ impl SemanticIndex {
         }
     }
 
+    pub(crate) fn plan_refresh_searches(&self, candidates: &[(MemoryId, Vec<f32>)], realm: Option<&str>) -> Option<RefreshSearch> {
+        if candidates.is_empty() || flat_scan_max() == 0 || self.total_embedding_count() > flat_scan_max() { return None; }
+        if self.centroid.is_empty() && realm.and_then(|r| self.per_realm_hnsw.get(r)).is_some_and(|g| !g.is_empty()) { return None; }
+        if std::env::var_os("CHITTA_FLAT_SCAN_CENTER").is_some()
+            && std::env::var_os("CHITTA_FLAT_SCAN_RAW").is_none()
+            && self.centroid.len() == EMBED_DIM { return None; }
+        if candidates.iter().any(|(_, q)| self.center_norm(q).is_none() || normalize(q).is_none()) { return None; }
+        let turbo = self.turbo.read().clone()?;
+        // Dirty vectors keep the existing path, including its exact stale-vector
+        // replacement semantics. Do not silently compute against older embeddings.
+        if turbo.built_at_mutation != self.mutations { return None; }
+        Some(RefreshSearch { turbo, deleted: self.deleted.clone() })
+    }
+
     /// Maintenance-only: copy embeddings under the store read guard, then build
     /// and publish after releasing it. Search never calls this function.
     pub(crate) fn plan_turbo_rebuild(&self, min_mutations: u64) -> Option<TurboBuild> {
         if self.total_embedding_count() < HNSW_THRESHOLD { return None; }
         let current = self.turbo.read().clone();
         if let Some(t) = current.as_ref() {
-            if self.mutations.saturating_sub(t.built_at_mutation) <= min_mutations
-                && t.built_at.elapsed() < std::time::Duration::from_secs(60) {
+            if self.mutations == t.built_at_mutation
+                || (self.mutations.saturating_sub(t.built_at_mutation) <= min_mutations
+                    && t.built_at.elapsed() < std::time::Duration::from_secs(60)) {
                 return None;
             }
         }
@@ -3042,10 +3109,17 @@ pub(crate) struct TurboBuild {
 
 impl TurboBuild {
     pub(crate) fn build(self) {
+        let _phase = crate::profile::LoadPhase::new("turbo");
         let Ok(mut index) = TurboQuantIndex::new(EMBED_DIM, 4) else { return; };
         if self.ids.is_empty() { return; }
         index.add(&self.flat);
         index.prepare();
+        // Initialize worker threads and any per-thread search scratch before
+        // publication. Use a corpus vector, never a benchmark-specific query;
+        // this reads the index without updating competitive weights or scores.
+        refresh_pool().broadcast(|_| {
+            let _ = index.search(&self.flat[..EMBED_DIM], 9.min(self.ids.len()));
+        });
         let built = Arc::new(TurboState { index, ids: self.ids,
             built_at_mutation: self.mutation, built_at: std::time::Instant::now() });
         let mut guard = self.published.write();
@@ -3100,6 +3174,42 @@ mod turbo_maintenance_tests {
         let mut opposite = q.clone(); opposite[1] = -1.0;
         idx.upsert_meta(3001, opposite, None);
         assert_ne!(idx.search(&q, 1, None, None)[0].memory_id, 3001);
+    }
+
+    #[test]
+    fn parallel_refresh_matches_serial_search_and_rejects_dirty_views() {
+        let mut idx = index();
+        for (id, vector) in &mut idx.embeddings {
+            vector.fill(0.0);
+            vector[*id as usize % EMBED_DIM] = 1.0;
+            vector[(*id as usize + 17) % EMBED_DIM] = 0.3;
+            *vector = normalize(vector).unwrap();
+        }
+        idx.deleted.insert(2);
+        idx.plan_turbo_rebuild(0).unwrap().build();
+        let candidates: Vec<_> = (1..=16).map(|id| (id, idx.get_embedding(id).unwrap().to_vec())).collect();
+        let view = idx.plan_refresh_searches(&candidates, None).unwrap();
+        let actual = view.search_all(&candidates);
+        for ((_, query), hits) in candidates.iter().zip(actual) {
+            let expected = idx.search(query, 9, None, None);
+            assert_eq!(hits.iter().map(|h| (h.memory_id, h.cosine_similarity.to_bits())).collect::<Vec<_>>(),
+                expected.iter().map(|h| (h.memory_id, h.cosine_similarity.to_bits())).collect::<Vec<_>>());
+        }
+        idx.upsert_meta(3000, candidates[0].1.clone(), None);
+        assert!(idx.plan_refresh_searches(&candidates, None).is_none());
+        assert!(!view.search_all(&candidates)[0].is_empty(), "prior view remains valid");
+    }
+
+    #[test]
+    fn unchanged_turbo_does_not_rebuild_after_the_age_limit() {
+        let idx = index();
+        idx.plan_turbo_rebuild(0).unwrap().build();
+        {
+            let mut slot = idx.turbo.write();
+            Arc::get_mut(slot.as_mut().unwrap()).unwrap().built_at =
+                std::time::Instant::now() - std::time::Duration::from_secs(120);
+        }
+        assert!(idx.plan_turbo_rebuild(0).is_none(), "age alone cannot invalidate unchanged vectors");
     }
 
     #[test]

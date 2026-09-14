@@ -120,3 +120,23 @@ fn append_recovers_when_the_segment_is_deleted_underneath() {
     assert!(reopened.get_memory(second_id).is_ok(), "op written after recovery must replay");
     assert!(reopened.get_memory(first_id).is_err(), "the op in the deleted segment is gone, by construction");
 }
+
+#[test]
+fn open_prepares_turbo_before_returning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let field = ChittaField::open(tmp.path().to_path_buf()).unwrap();
+    // A real WAL operation gives the snapshot a nonzero sequence and payload identity.
+    put(&field);
+    let mut embedding = vec![0.0; crate::ops::EMBED_DIM];
+    embedding[0] = 1.0;
+    {
+        let mut index = field.semantic_idx.write();
+        for id in 1..=2001 { index.upsert(id, embedding.clone(), None); }
+    }
+    field.save_full_snapshot().unwrap();
+    drop(field);
+    let reopened = ChittaField::open(tmp.path().to_path_buf()).unwrap();
+    let index = reopened.semantic_idx.read();
+    assert!(index.plan_turbo_rebuild(0).is_none(), "open must publish the prepared index");
+    assert!(!index.search(&embedding, 5, None, None).is_empty());
+}

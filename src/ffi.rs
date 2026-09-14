@@ -105,6 +105,18 @@ fn write_hits(hits: Vec<RecallHit>, buf: *mut CfRecallHit, cap: usize, written: 
     }
 }
 
+/// Share the profiling flag with the C++ stages around the FFI calls.
+#[no_mangle]
+pub extern "C" fn cf_recall_profile_enabled() -> c_int { crate::profile::enabled() as c_int }
+
+/// Caller owns the returned string and releases it with cf_free_string.
+#[no_mangle]
+pub extern "C" fn cf_memory_breakdown(h: *mut CfHandle) -> *mut c_char {
+    if h.is_null() { return std::ptr::null_mut(); }
+    let field = &unsafe { &*h }.field;
+    CString::new(field.memory_breakdown()).map_or(std::ptr::null_mut(), CString::into_raw)
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 #[no_mangle]

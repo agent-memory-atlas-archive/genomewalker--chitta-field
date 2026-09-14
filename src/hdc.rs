@@ -223,6 +223,16 @@ pub struct HdcStore {
 }
 
 impl HdcStore {
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        use crate::profile::map_bytes;
+        map_bytes(&self.memories) + map_bytes(&self.seeded_codebook)
+            + self.seeded_codebook.keys().map(String::capacity).sum::<usize>()
+            + map_bytes(&self.realm_bundles)
+            + self.realm_bundles.iter().map(|(k, v)| k.capacity() + v.counts.capacity() * 2).sum::<usize>()
+            + map_bytes(&self.realm_members)
+            + self.realm_members.iter().map(|(k, v)| k.capacity() + v.capacity() * 9).sum::<usize>()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -555,36 +565,57 @@ fn encode_episode_hv(tool_name: &str, entity_name: &str, outcome: u8) -> HdcVec 
 /// Identical to RealmBundle but independent so EpisodeHdcStore has no snapshot dependency.
 #[derive(Default, Clone)]
 struct EpBundle {
-    counts: Vec<u16>,
+    // Bit-sliced saturating u16 counters. A singleton needs one 1024-byte
+    // plane, rather than 8192 u16s (16 KiB). More planes are allocated only
+    // when observation counts require them; the maximum is still 16 planes.
+    planes: Vec<Box<HdcVec>>,
     n: u32,
 }
 
 impl EpBundle {
     fn add(&mut self, hv: &HdcVec) {
-        if self.counts.is_empty() { self.counts = vec![0u16; D * 64]; }
-        for (wi, &w) in hv.iter().enumerate() {
-            for bit in 0u32..64 {
-                if (w >> bit) & 1 == 1 {
-                    self.counts[wi * 64 + bit as usize] =
-                        self.counts[wi * 64 + bit as usize].saturating_add(1);
-                }
+        let needed = (32 - self.n.saturating_add(1).leading_zeros()).min(16) as usize;
+        while self.planes.len() < needed { self.planes.push(Box::new([0; D])); }
+        for (wi, &word) in hv.iter().enumerate() {
+            let mut carry = word;
+            for plane in &mut self.planes {
+                let old = plane[wi];
+                plane[wi] ^= carry;
+                carry &= old;
+                if carry == 0 { break; }
+            }
+            // A carry beyond the sixteenth bit saturates, exactly like the
+            // prior u16::saturating_add. Restore those lanes to all ones.
+            if carry != 0 {
+                for plane in &mut self.planes { plane[wi] |= carry; }
             }
         }
         self.n += 1;
     }
 
     fn to_hv(&self) -> HdcVec {
-        if self.n == 0 { return [0u64; D]; }
         let threshold = self.n / 2 + 1;
-        let mut out = [0u64; D];
-        for wi in 0..D {
-            for bit in 0u32..64 {
-                if self.counts[wi * 64 + bit as usize] as u32 >= threshold {
-                    out[wi] |= 1u64 << bit;
+        if self.n == 0 || threshold >= (1u32 << self.planes.len()) { return [0; D]; }
+        let mut out = [0; D];
+        for (wi, word) in out.iter_mut().enumerate() {
+            let mut equal = !0u64;
+            let mut greater = 0u64;
+            for (bit, plane) in self.planes.iter().enumerate().rev() {
+                if threshold & (1 << bit) == 0 {
+                    greater |= equal & plane[wi];
+                    equal &= !plane[wi];
+                } else {
+                    equal &= plane[wi];
                 }
             }
+            *word = greater | equal;
         }
         out
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.planes.capacity() * std::mem::size_of::<Box<HdcVec>>()
+            + self.planes.len() * std::mem::size_of::<HdcVec>()
     }
 }
 
@@ -605,6 +636,18 @@ pub struct EpisodeHdcStore {
 }
 
 impl EpisodeHdcStore {
+    pub(crate) fn allocated_bytes(&self) -> (usize, usize) {
+        use crate::profile::map_bytes;
+        let mut actual = 0;
+        let mut legacy = 0;
+        for map in [&self.by_tool, &self.by_entity, &self.by_outcome] {
+            let base = map_bytes(map) + map.keys().map(String::capacity).sum::<usize>();
+            actual += base + map.values().map(EpBundle::allocated_bytes).sum::<usize>();
+            legacy += base + map.len() * D * 64 * 2;
+        }
+        (actual, legacy)
+    }
+
     pub fn new() -> Self { Self::default() }
 
     /// Encode one episode and add it to the per-role-value bundles.
@@ -810,5 +853,41 @@ mod tests {
         let sim_same  = store.realm_similarity("tech", "tech");
         let sim_cross = store.realm_similarity("tech", "food");
         assert!(sim_same > sim_cross, "same-realm sim {sim_same} should exceed cross {sim_cross}");
+    }
+}
+
+#[cfg(test)]
+mod episode_counter_tests {
+    use super::*;
+
+    #[test]
+    fn bitplanes_match_scalar_majorities_across_growth_boundaries() {
+        let mut bundle = EpBundle::default();
+        let mut counts = vec![0u16; D * 64];
+        assert_eq!(bundle.to_hv(), [0; D]);
+        let mut seed = 79;
+        for n in 1..=300 {
+            let hv = std::array::from_fn(|_| xorshift64(&mut seed));
+            bundle.add(&hv);
+            let mut expected = [0; D];
+            for wi in 0..D {
+                for bit in 0..64 {
+                    counts[wi * 64 + bit] += ((hv[wi] >> bit) & 1) as u16;
+                    if counts[wi * 64 + bit] as u32 > n / 2 { expected[wi] |= 1 << bit; }
+                }
+            }
+            assert_eq!(bundle.to_hv(), expected, "n={n}");
+            if n == 1 { assert!(bundle.allocated_bytes() < D * 64 * 2 / 8); }
+        }
+    }
+
+    #[test]
+    fn bitplanes_preserve_u16_saturation() {
+        let mut bundle = EpBundle { planes: (0..16).map(|_| Box::new([!0; D])).collect(), n: 65535 };
+        bundle.add(&[!0; D]);
+        assert!(bundle.planes.iter().all(|p| p.iter().all(|&w| w == !0)));
+        assert_eq!(bundle.to_hv(), [!0; D]);
+        bundle.n = 131070;
+        assert_eq!(bundle.to_hv(), [0; D], "threshold exceeds saturated u16 counts");
     }
 }

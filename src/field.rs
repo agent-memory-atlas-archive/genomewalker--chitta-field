@@ -651,11 +651,16 @@ impl ChittaField {
         // ANN indices can be rebuilt from existing embeddings. For `chittad reindex`.
         let reindex_mode = std::env::var_os("CHITTA_REINDEX_MODE").is_some();
         for candidate in &candidates {
-            match FullSnapshot::load(candidate) {
+            let snapshot_phase = crate::profile::LoadPhase::new("snapshot");
+            let loaded = FullSnapshot::load(candidate);
+            drop(snapshot_phase);
+            match loaded {
                 Ok(mut snap) => {
                     full_snapshot_seqno = snap.snapshot_seqno;
                     // v11+: content in .pld sidecar; v10: content already in bincode (no-op).
+                    let pld_phase = crate::profile::LoadPhase::new("pld");
                     let pld_loaded = FullSnapshot::load_payload_sidecar(&candidate.with_extension("pld"), &mut snap.payloads);
+                    drop(pld_phase);
                     if !pld_loaded {
                         // A missing/torn .pld is harmless only if content is still in the
                         // bincode body (≤v10). For content-stripped snapshots (v11+) the .pld
@@ -890,7 +895,9 @@ impl ChittaField {
             // existing embeddings so force_reindex() can rebuild ANN indices from them.
             // .emb: flat binary embeddings (v10+). For v9 snapshots the sidecar won't exist
             // yet, so this is a no-op and embeddings remain populated from bincode.
+            let emb_phase = crate::profile::LoadPhase::new("emb");
             let emb_loaded = semantic_idx.load_embeddings_sidecar(&snap_path.with_extension("emb"));
+            drop(emb_phase);
             if !emb_loaded && semantic_idx.embeddings_count() == 0 {
                 eprintln!("[chitta-field] WARNING: v10 snapshot but .emb sidecar missing — embeddings will be empty until backfill");
             }
@@ -1256,13 +1263,18 @@ impl ChittaField {
         let max_code_file_id = code_files.max_id().unwrap_or(0);
         let code_file_id_alloc = Arc::new(TripletIdAllocator::new(max_code_file_id + 1));
 
-        let loaded_lite_encoder = Self::load_lite_encoder(&data_dir);
-        let loaded_seen_offsets = Self::load_seen_offsets(&data_dir, instance_id);
-        let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
-        let loaded_repl_sessions = crate::repl_sessions::ReplSessionStore::load(&data_dir);
-        let loaded_span_store = crate::organ::span_store::SpanStore::load(&data_dir);
-
+        // These inputs are immutable after WAL replay + normalization. No store
+        // guards exist yet: quantization, HDC and lite I/O can run independently.
+        let (loaded_lite_encoder, hdc_store) = std::thread::scope(|scope| {
+            let lite = scope.spawn(|| {
+                let _phase = crate::profile::LoadPhase::new("lite_encoder");
+                Self::load_lite_encoder(&data_dir)
+            });
+            let turbo = scope.spawn(|| {
+                if let Some(plan) = semantic_idx.plan_turbo_rebuild(0) { plan.build(); }
+            });
         // Build HDC index — load from sidecar if available (fast path), else rebuild.
+        let hdc_phase = crate::profile::LoadPhase::new("hdc");
         let mut hdc_store = crate::hdc::HdcStore::new();
         {
             let hdc_sidecar = best_full_path.as_ref().map(|p| p.with_extension("hdc"));
@@ -1279,6 +1291,18 @@ impl ChittaField {
                 hdc_store.rebuild(entries);
             }
         }
+
+        drop(hdc_phase);
+        turbo.join().expect("startup Turbo worker panicked");
+        let loaded_lite_encoder = lite.join().expect("startup lite encoder worker panicked");
+        (loaded_lite_encoder, hdc_store)
+
+        });
+        semantic_idx.prune_turbo_changes();
+        let loaded_seen_offsets = Self::load_seen_offsets(&data_dir, instance_id);
+        let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
+        let loaded_repl_sessions = crate::repl_sessions::ReplSessionStore::load(&data_dir);
+        let loaded_span_store = crate::organ::span_store::SpanStore::load(&data_dir);
 
         // Build EventTape from snapshot, seed entity interner from triplets, synthesize
         // legacy events for existing memories, then rebuild CDAWG from the tape.
@@ -1446,9 +1470,9 @@ impl ChittaField {
             artifact_idx: RwLock::new(artifact_idx),
             keyword_idx: RwLock::new(keyword_idx),
             triplet_store: RwLock::new({
+                let _phase = crate::profile::LoadPhase::new("triplets");
                 let before = triplet_store.triplet_count();
-                let purged = triplet_store.purge_invalidated();
-                let deduped = triplet_store.dedup_entries();
+                let (purged, deduped) = triplet_store.clean_for_load();
                 if purged > 0 || deduped > 0 {
                     eprintln!("[chitta-field] triplet migration on load: purged {} invalidated, deduped {} duplicates ({} → {})",
                         purged, deduped, before, triplet_store.triplet_count());

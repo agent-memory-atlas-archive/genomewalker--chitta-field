@@ -1264,6 +1264,7 @@ impl FullSnapshot {
             write_section(&mut w, "keyword_idx",        &self.keyword_idx)?;
             write_section(&mut w, "artifact_idx",       &self.artifact_idx)?;
             write_section(&mut w, "triplet_store",      &self.triplet_store)?;
+            write_section(&mut w, "triplets_clean",     &self.triplet_store.clean)?;
             write_section(&mut w, "symbol_idx",         &self.symbol_idx)?;
             write_section(&mut w, "call_graph",         &self.call_graph)?;
             write_section(&mut w, "code_files",         &self.code_files)?;
@@ -1482,6 +1483,7 @@ impl FullSnapshot {
                     "keyword_idx"        => snap.keyword_idx        = read_section(&mut body, n)?,
                     "artifact_idx"       => snap.artifact_idx       = read_section(&mut body, n)?,
                     "triplet_store"      => snap.triplet_store      = read_section(&mut body, n)?,
+                    "triplets_clean"     => snap.triplet_store.clean = read_section(&mut body, n)?,
                     "symbol_idx"         => snap.symbol_idx         = read_section(&mut body, n)?,
                     "call_graph"         => snap.call_graph         = read_section(&mut body, n)?,
                     "code_files"         => snap.code_files         = read_section(&mut body, n)?,
@@ -2280,6 +2282,29 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn v23_triplet_clean_section_is_optional_and_survives_restart() {
+        let path = scratch_path("triplets-clean");
+        let mut snap = FullSnapshot::empty(42);
+        snap.triplet_store.replay_add(1, "s".into(), "p".into(), "o".into(), 0.5, 0, None, None);
+        snap.triplet_store.replay_add(2, "s".into(), "p".into(), "o".into(), 0.8, 0, None, None);
+        // Legacy V23 container has no marker. Its bincode triplet body is unchanged.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&FULL_SNAPSHOT_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&42u64.to_le_bytes());
+        write_section(&mut bytes, "triplet_store", &snap.triplet_store).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let mut loaded = FullSnapshot::load(&path).unwrap();
+        assert!(!loaded.triplet_store.clean);
+        assert_eq!(loaded.triplet_store.clean_for_load(), (0, 1));
+        loaded.save(&path).unwrap();
+        let mut restored = FullSnapshot::load(&path).unwrap();
+        assert!(restored.triplet_store.clean);
+        assert_eq!(restored.triplet_store.clean_for_load(), (0, 0));
+        assert_eq!(restored.triplet_store.query_subject("s", 0)[0].id, 2);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
