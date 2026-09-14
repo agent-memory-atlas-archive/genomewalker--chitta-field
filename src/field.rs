@@ -159,7 +159,38 @@ pub(crate) struct PendingForeign {
     pub(crate) coverage: std::collections::BTreeMap<crate::ids::InstanceId, u64>,
 }
 
+/// Take an exclusive, non-blocking advisory lock on `<data_dir>/.instance.lock`.
+/// Fails fast when another live instance holds it. flock() works on NFS via the
+/// lock daemon and is released automatically when the holder exits.
+fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::File>> {
+    if std::env::var("CHITTA_STORE_LOCK").map(|v| v == "0").unwrap_or(false) {
+        return Ok(None);
+    }
+    use std::os::unix::io::AsRawFd;
+    let path = data_dir.join(".instance.lock");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+            return Err(FieldError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("another chitta-field instance holds {} — refusing to open the same store twice", path.display()),
+            )));
+        }
+        return Err(FieldError::Io(err));
+    }
+    Ok(Some(file))
+}
+
 pub struct ChittaField {
+    /// Exclusive advisory lock on `<data_dir>/.instance.lock`, held for the life
+    /// of this instance. A second instance on the same directory would compact
+    /// away this one's live WAL segment (2026-09-14: the CLI auto-started a
+    /// second chittad on ~/.claude/mind and 15 minutes of appends went to a
+    /// deleted file). `CHITTA_STORE_LOCK=0` disables the check.
+    #[allow(dead_code)]
+    pub(crate) instance_lock: Option<std::fs::File>,
     #[allow(dead_code)]
     pub(crate) data_dir: PathBuf,
     #[allow(dead_code)]
@@ -394,6 +425,17 @@ impl ChittaField {
     }
 
     pub fn open(data_dir: PathBuf) -> Result<Self> {
+        Self::open_with_lock(data_dir, true)
+    }
+
+    /// Open without the exclusive instance lock. Only for tests that model a
+    /// peer instance on the same directory (sync_foreign); production callers
+    /// use `open`, and a shared directory needs `CHITTA_STORE_LOCK=0` explicitly.
+    pub fn open_unlocked(data_dir: PathBuf) -> Result<Self> {
+        Self::open_with_lock(data_dir, false)
+    }
+
+    fn open_with_lock(data_dir: PathBuf, lock: bool) -> Result<Self> {
         #[cfg(feature = "deadlock-detection")]
         {
             static CHECKER: std::sync::Once = std::sync::Once::new();
@@ -415,6 +457,7 @@ impl ChittaField {
         }
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(data_dir.join("segments"))?;
+        let instance_lock = if lock { acquire_instance_lock(&data_dir)? } else { None };
 
         // Each open() generates a fresh InstanceId — no coordination needed.
         let instance_id = new_instance_id();
@@ -1382,6 +1425,7 @@ impl ChittaField {
         };
         eprintln!("[chitta-field] task_key_idx rebuilt: {} keyed task-state entries", task_key_idx.len());
         Ok(Self {
+            instance_lock,
             data_dir,
             instance_id,
             lineage_epoch,
@@ -1752,7 +1796,7 @@ mod sync_foreign_split_tests {
         // `local` must exist BEFORE the peer writes: a fresh instance seeds seen_offsets from
         // current segment sizes (see load_seen_offsets), so one opened afterwards starts at EOF
         // and would legitimately see nothing to sync.
-        let local = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        let local = ChittaField::open_unlocked(dir.path().to_path_buf()).unwrap();
         write_one(&peer, "peer wrote this");
         let before = local.memory_count();
 
@@ -1778,7 +1822,7 @@ mod sync_foreign_split_tests {
     fn sync_foreign_still_applies_peer_ops() {
         let dir = tempfile::tempdir().unwrap();
         let peer = ChittaField::open(dir.path().to_path_buf()).unwrap();
-        let local = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        let local = ChittaField::open_unlocked(dir.path().to_path_buf()).unwrap();
         write_one(&peer, "one");
         write_one(&peer, "two");
         let before = local.memory_count();

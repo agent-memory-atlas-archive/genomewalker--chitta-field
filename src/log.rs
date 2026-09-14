@@ -155,6 +155,7 @@ pub struct OpLog {
     instance_id: InstanceId,
     current_segment: BufWriter<File>,
     current_segment_path: PathBuf,
+    recoveries: u64,
     current_segment_size: u64,
     next_seqno: u64,
     ops_since_sync: u64,
@@ -208,6 +209,7 @@ impl OpLog {
                     instance_id,
                     current_segment: BufWriter::new(f),
                     current_segment_path: last_path.clone(),
+            recoveries: 0,
                     current_segment_size: size,
                     next_seqno,
                     ops_since_sync: 0,
@@ -228,6 +230,7 @@ impl OpLog {
             instance_id,
             current_segment: BufWriter::new(f),
             current_segment_path: path,
+            recoveries: 0,
             current_segment_size: header_size,
             next_seqno,
             ops_since_sync: 0,
@@ -242,6 +245,13 @@ impl OpLog {
     /// Append an op, returning its assigned seqno.
     /// V2 format: [payload_len:4][seqno:8][op_type:1][prev_hash:32][payload:N][crc32:4]
     pub fn append(&mut self, op: &Op) -> Result<u64> {
+        // A local filesystem lets writes to an unlinked file succeed silently;
+        // NFS fails them with ESTALE. Check the path so both cases recover.
+        if !self.current_segment_path.exists() {
+            eprintln!("[chitta-field] WAL segment {} vanished — opening a fresh segment", self.current_segment_path.display());
+            self.recover_segment()?;
+            self.recoveries += 1;
+        }
         self.rotate_if_needed()?;
 
         let seqno = self.next_seqno;
@@ -262,14 +272,22 @@ impl OpLog {
         hasher.update(&payload);
         let crc = hasher.finalize();
 
-        // Write V2 record
-        self.current_segment.write_all(&payload_len.to_be_bytes())?;
-        self.current_segment.write_all(&seqno_bytes)?;
-        self.current_segment.write_all(&op_type_bytes)?;
-        self.current_segment.write_all(&prev_hash)?;
-        self.current_segment.write_all(&payload)?;
-        self.current_segment.write_all(&crc.to_be_bytes())?;
-        self.current_segment.flush()?;
+        // Write V2 record. If the segment file has gone away underneath us
+        // (deleted by another process: ESTALE/ENOENT on NFS), open a fresh
+        // segment and write there rather than losing every later op.
+        let mut record = Vec::with_capacity(4 + 8 + 1 + 32 + payload.len() + 4);
+        record.extend_from_slice(&payload_len.to_be_bytes());
+        record.extend_from_slice(&seqno_bytes);
+        record.extend_from_slice(&op_type_bytes);
+        record.extend_from_slice(&prev_hash);
+        record.extend_from_slice(&payload);
+        record.extend_from_slice(&crc.to_be_bytes());
+        if let Err(e) = self.current_segment.write_all(&record).and_then(|_| self.current_segment.flush()) {
+            eprintln!("[chitta-field] WAL append failed on {}: {} — opening a fresh segment", self.current_segment_path.display(), e);
+            self.recover_segment()?;
+            self.current_segment.write_all(&record)?;
+            self.current_segment.flush()?;
+        }
 
         // Advance chain head
         self.chain_head = compute_record_hash(seqno, op_type, &prev_hash, &payload);
@@ -287,11 +305,36 @@ impl OpLog {
 
     /// Force fsync — call after critical mutations (put_memory, forget, etc.)
     pub fn sync(&mut self) -> Result<()> {
+        if !self.current_segment_path.exists() {
+            eprintln!("[chitta-field] WAL segment {} vanished — opening a fresh segment", self.current_segment_path.display());
+            self.recover_segment()?;
+            self.recoveries += 1;
+        }
         self.current_segment.flush()?;
         self.sync_count += 1;
-        self.current_segment.get_ref().sync_data()?;
+        if let Err(e) = self.current_segment.get_ref().sync_data() {
+            // A stale/deleted segment cannot become durable; move to a fresh one
+            // so the next appends are, and surface it once per recovery.
+            eprintln!("[chitta-field] WAL sync failed on {}: {} — opening a fresh segment", self.current_segment_path.display(), e);
+            self.recover_segment()?;
+            self.recoveries += 1;
+        }
         self.ops_since_sync = 0;
         self.last_sync = Instant::now();
+        Ok(())
+    }
+
+    /// Number of times the writer had to abandon a segment file.
+    pub fn recovery_count(&self) -> u64 { self.recoveries }
+
+    /// Abandon the current segment file (deleted or stale underneath us) and
+    /// start a new one at the next seqno; the hash chain continues unbroken.
+    fn recover_segment(&mut self) -> Result<()> {
+        let new_path = segment_path(&self.data_dir, self.instance_id, self.next_seqno);
+        let f = create_segment_v3(&new_path, self.next_seqno, &self.chain_head, self.vector_space_id)?;
+        self.current_segment = BufWriter::new(f);
+        self.current_segment_path = new_path;
+        self.current_segment_size = V3_HEADER_SIZE as u64;
         Ok(())
     }
 

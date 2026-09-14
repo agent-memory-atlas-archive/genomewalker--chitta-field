@@ -81,3 +81,42 @@ fn deferred_access_does_not_fence_out_explicit_strengthen() {
     assert_eq!(after.last_state_op_ts_ms, before.last_state_op_ts_ms);
     assert_eq!(after.last_accessed_ms, before.last_accessed_ms);
 }
+
+#[test]
+fn second_open_of_the_same_store_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let first = ChittaField::open(tmp.path().to_path_buf()).unwrap();
+    let second = ChittaField::open(tmp.path().to_path_buf());
+    let err = match second {
+        Ok(_) => panic!("second instance must not open the same directory"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("another chitta-field instance"), "{err}");
+    drop(first);
+    ChittaField::open(tmp.path().to_path_buf()).expect("lock released with the first instance");
+}
+
+#[test]
+fn append_recovers_when_the_segment_is_deleted_underneath() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let field = ChittaField::open(tmp.path().to_path_buf()).unwrap();
+    let emb = vec![0.1f32; EMBED_DIM];
+    let (first_id, _) = field
+        .put_memory("wisdom", "project:t", b"before deletion", &emb, 1.0, 0.001, 0, vec![], None, None)
+        .unwrap();
+    let seg_dir = tmp.path().join("segments");
+    for entry in std::fs::read_dir(&seg_dir).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let (second_id, _) = field
+        .put_memory("wisdom", "project:t", b"after deletion", &emb, 1.0, 0.001, 0, vec![], None, None)
+        .unwrap();
+    field.log.write().sync().unwrap();
+    let segments: Vec<_> = std::fs::read_dir(&seg_dir).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(segments.len(), 1, "a fresh segment replaces the deleted one: {segments:?}");
+    assert!(std::fs::metadata(&segments[0]).unwrap().len() > crate::log::V3_HEADER_SIZE as u64);
+    drop(field);
+    let reopened = ChittaField::open(tmp.path().to_path_buf()).unwrap();
+    assert!(reopened.get_memory(second_id).is_ok(), "op written after recovery must replay");
+    assert!(reopened.get_memory(first_id).is_err(), "the op in the deleted segment is gone, by construction");
+}

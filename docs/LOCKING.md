@@ -1,3 +1,11 @@
+> Status as of 2026-09-14 — **one instance per store directory.** `ChittaField::open`
+> takes an exclusive `flock` on `<data_dir>/.instance.lock` and fails fast if another
+> live process holds it (`CHITTA_STORE_LOCK=0` disables). Reason: a second chittad
+> auto-started by the CLI on `~/.claude/mind` compacted away the running daemon's
+> WAL segment; appends then went to a deleted file for 15 minutes. The writer now
+> also abandons a stale/deleted segment on any write or fsync error and continues in
+> a fresh one (`OpLog::recover_segment`), so that failure can no longer be silent.
+
 # LOCKING — chitta-field lock hierarchy and the rules the post-mortems imply
 
 Status as of 2026-09-14: recall access is deferred; WAL group sync and Turbo rebuilds run on Rust maintenance workers.
