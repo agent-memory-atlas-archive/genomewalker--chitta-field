@@ -177,7 +177,12 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
             }
             Box::into_raw(Box::new(CfHandle { field, maintenance }))
         },
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => {
+            // The daemon only sees a null handle; without this line a refused
+            // open (lock held, bad manifest, unreadable segment) is undiagnosable.
+            eprintln!("[chitta-field] open failed: {e}");
+            std::ptr::null_mut()
+        }
     }
 }
 

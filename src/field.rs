@@ -166,21 +166,61 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::F
     if std::env::var("CHITTA_STORE_LOCK").map(|v| v == "0").unwrap_or(false) {
         return Ok(None);
     }
+    use std::io::{Read, Seek, Write};
     use std::os::unix::io::AsRawFd;
     let path = data_dir.join(".instance.lock");
-    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path)?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
-            return Err(FieldError::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                format!("another chitta-field instance holds {} — refusing to open the same store twice", path.display()),
-            )));
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    // Two attempts: the second runs only after a provably stale lock file
+    // (same host, holder pid gone) has been replaced. On NFSv3 a daemon killed
+    // mid-snapshot (2026-09-15, TimeoutStopSec=30) left a server-side lock on
+    // the old inode that no process owned; 49 restarts failed until the file
+    // was renamed by hand. A holder on another host is never overridden.
+    for attempt in 0..2 {
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            let _ = file.set_len(0);
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+            let _ = writeln!(file, "{} {}", std::process::id(), hostname);
+            let _ = file.sync_all();
+            return Ok(Some(file));
         }
-        return Err(FieldError::Io(err));
+        let err = std::io::Error::last_os_error();
+        let would_block = err.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || err.raw_os_error() == Some(libc::EAGAIN);
+        if !would_block {
+            return Err(FieldError::Io(err));
+        }
+        let mut holder = String::new();
+        let _ = file.read_to_string(&mut holder);
+        let mut parts = holder.split_whitespace();
+        let holder_pid: Option<u32> = parts.next().and_then(|p| p.parse().ok());
+        let holder_host = parts.next().unwrap_or("");
+        let stale = attempt == 0
+            && !hostname.is_empty()
+            && holder_host == hostname
+            && holder_pid.map(|pid| unsafe { libc::kill(pid as i32, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+                .unwrap_or(false);
+        if stale {
+            eprintln!(
+                "[chitta-field] stale instance lock {} (holder pid {} on this host is gone); replacing it",
+                path.display(), holder_pid.unwrap_or(0)
+            );
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        return Err(FieldError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "another chitta-field instance holds {} (recorded holder: {}) — refusing to open the same store twice",
+                path.display(), if holder.trim().is_empty() { "unknown" } else { holder.trim() }
+            ),
+        )));
     }
-    Ok(Some(file))
+    unreachable!("instance lock: two attempts exhausted")
 }
 
 pub struct ChittaField {
