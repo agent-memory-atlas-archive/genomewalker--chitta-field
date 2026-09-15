@@ -154,6 +154,10 @@ pub struct SpanStore {
     trigram: HashMap<u32, roaring::RoaringBitmap>,
     #[serde(skip)]
     trigram_built_at: u64,
+    /// Number of leading spans whose trigrams are in `trigram`; spans only append
+    /// (tombstones keep their index), so the index extends incrementally.
+    #[serde(skip)]
+    trigram_indexed: usize,
     #[serde(skip)]
     redacted_total: u64,
     #[serde(skip)]
@@ -203,6 +207,9 @@ impl SpanStore {
 
     /// Rebuild all serde-skipped lookup tables from the persisted vectors.
     fn reindex(&mut self) {
+        // Positions changed: the incremental trigram index is void.
+        self.trigram.clear();
+        self.trigram_indexed = 0;
         self.by_hash.clear();
         self.mem_adjacency.clear();
         for (i, s) in self.spans.iter().enumerate() {
@@ -666,15 +673,26 @@ impl SpanStore {
     /// the last build (the ensure_turbo pattern). Only used above TRIGRAM_MIN;
     /// below that a full scan is already sub-10ms and needs no index.
     fn ensure_trigram(&mut self) {
-        if self.spans.len() < TRIGRAM_MIN || self.trigram_built_at == self.mutations {
+        if self.spans.len() < TRIGRAM_MIN {
             return;
         }
-        self.trigram.clear();
-        for (i, s) in self.spans.iter().enumerate() {
-            for tg in trigrams(&s.text.to_lowercase()) {
+        // Incremental: index only the spans appended since the last query. The
+        // previous full rebuild on every mutation cost seconds under the span
+        // store write lock after each memory write (stall watch 2026-09-15:
+        // 10-13 s recall stalls, queued put_memory holding the exclusive RPC lock
+        // behind it). Spans never change text except to become tombstones,
+        // which the query skips, so old entries stay valid.
+        if self.trigram_indexed > self.spans.len() {
+            self.trigram.clear();
+            self.trigram_indexed = 0;
+        }
+        for i in self.trigram_indexed..self.spans.len() {
+            let text = self.spans[i].text.to_lowercase();
+            for tg in trigrams(&text) {
                 self.trigram.entry(tg).or_default().insert(i as u32);
             }
         }
+        self.trigram_indexed = self.spans.len();
         self.trigram_built_at = self.mutations;
     }
 

@@ -246,8 +246,12 @@ impl OpLog {
     /// V2 format: [payload_len:4][seqno:8][op_type:1][prev_hash:32][payload:N][crc32:4]
     pub fn append(&mut self, op: &Op) -> Result<u64> {
         // A local filesystem lets writes to an unlinked file succeed silently;
-        // NFS fails them with ESTALE. Check the path so both cases recover.
-        if !self.current_segment_path.exists() {
+        // NFS fails them with ESTALE. Detect deletion through the open handle
+        // (fstat, attribute-cached on NFS) rather than a path lookup per append:
+        // the per-append stat cost ~10-50 ms on a loaded NFS and every remember
+        // does several appends under the exclusive RPC lock (lockprof 2026-09-15:
+        // remember held 450-1100 ms).
+        if self.segment_vanished() {
             eprintln!("[chitta-field] WAL segment {} vanished — opening a fresh segment", self.current_segment_path.display());
             self.recover_segment()?;
             self.recoveries += 1;
@@ -305,7 +309,7 @@ impl OpLog {
 
     /// Force fsync — call after critical mutations (put_memory, forget, etc.)
     pub fn sync(&mut self) -> Result<()> {
-        if !self.current_segment_path.exists() {
+        if self.segment_vanished() || !self.current_segment_path.exists() {
             eprintln!("[chitta-field] WAL segment {} vanished — opening a fresh segment", self.current_segment_path.display());
             self.recover_segment()?;
             self.recoveries += 1;
@@ -326,6 +330,16 @@ impl OpLog {
 
     /// Number of times the writer had to abandon a segment file.
     pub fn recovery_count(&self) -> u64 { self.recoveries }
+
+
+    /// True when the open segment's inode has no links left (deleted underneath us).
+    fn segment_vanished(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match self.current_segment.get_ref().metadata() {
+            Ok(m) => m.nlink() == 0,
+            Err(_) => true,
+        }
+    }
 
     /// Abandon the current segment file (deleted or stale underneath us) and
     /// start a new one at the next seqno; the hash chain continues unbroken.
