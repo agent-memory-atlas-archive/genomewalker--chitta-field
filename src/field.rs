@@ -1032,6 +1032,7 @@ impl ChittaField {
             kind_members: &mut replay_kind_members,
             coactivation_stats: &mut replay_coactivation_stats,
         };
+        let wal_replay_phase = crate::profile::LoadPhase::new("wal_replay");
         let replayed_coverage = log.replay(0, |inst, seqno, op| {
             if seqno > max_replayed_seqno { max_replayed_seqno = seqno; }
             if covered_by_full(inst, seqno) {
@@ -1102,6 +1103,7 @@ impl ChittaField {
             if max > *e { *e = max; }
         }
         log.set_next_seqno(max_replayed_seqno + 1);
+        drop(wal_replay_phase);
         semantic_idx.set_inhibit_hnsw(false);
         let purged_ids = semantic_idx.purge_wrong_dim();
         for id in &purged_ids {
@@ -1137,7 +1139,10 @@ impl ChittaField {
                            memories had NO embedding — re-queued for backfill");
             }
         }
-        semantic_idx.normalize_all();
+        {
+            let _phase = crate::profile::LoadPhase::new("normalize");
+            semantic_idx.normalize_all();
+        }
         // After WAL replay, the HNSW may have been backfilled with entries beyond the snapshot.
         // Persist the updated HNSW sidecar now so the next restart loads a complete graph
         // instead of spending O(N log N) re-inserting the delta.
@@ -1157,7 +1162,10 @@ impl ChittaField {
                 let _ = semantic_idx.save_delta_hnsw(&snap_path.with_extension("delta.hnsw"));
             }
         }
-        keyword_idx.rebuild_reverse_index();
+        {
+            let _phase = crate::profile::LoadPhase::new("keyword_reverse");
+            keyword_idx.rebuild_reverse_index();
+        }
 
         // One-time migration: mark SSL memories (content with →) for gloss-baked re-embed.
         // Guard file prevents re-running after backfill completes.
@@ -1249,7 +1257,9 @@ impl ChittaField {
         // Heal the symbol index's derived maps (by_name/dedup) from by_id —
         // snapshots written before the dedup-key fix carry line-keyed dedup
         // entries and by_name buckets with recycled ids.
+        let symbols_phase = crate::profile::LoadPhase::new("symbols");
         let symbol_dups = symbol_idx.rebuild_derived();
+        drop(symbols_phase);
         if symbol_dups > 0 {
             eprintln!(
                 "[chitta-field] symbol index: {} duplicate entries detected (run dedupe_symbols to GC)",
@@ -1302,7 +1312,9 @@ impl ChittaField {
         let loaded_seen_offsets = Self::load_seen_offsets(&data_dir, instance_id);
         let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
         let loaded_repl_sessions = crate::repl_sessions::ReplSessionStore::load(&data_dir);
+        let span_phase = crate::profile::LoadPhase::new("span_store");
         let loaded_span_store = crate::organ::span_store::SpanStore::load(&data_dir);
+        drop(span_phase);
 
         // Build EventTape from snapshot, seed entity interner from triplets, synthesize
         // legacy events for existing memories, then rebuild CDAWG from the tape.
@@ -1325,10 +1337,12 @@ impl ChittaField {
             }
             tape
         };
+        let tape_phase = crate::profile::LoadPhase::new("event_tape_organs");
         let mut cdawg = crate::organ::cdawg::CdawgOrgan::new();
         cdawg.rebuild_from_tape(&event_tape);
         let mut episode_hdc = crate::hdc::EpisodeHdcStore::new();
         episode_hdc.rebuild(&event_tape);
+        drop(tape_phase);
         let refutation_ledger = crate::organ::refutation_ledger::RefutationLedger::new();
         let cec_policy_store  = crate::organ::intervention_store::InterventionStore::new();
         let decision_tape     = snap_decision_tape;
