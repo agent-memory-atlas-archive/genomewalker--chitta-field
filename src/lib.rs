@@ -87,3 +87,4 @@ mod turbovec_bench;
 mod read_path_tests;
 
 mod profile;
+mod startup_cache;
