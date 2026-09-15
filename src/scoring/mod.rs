@@ -187,6 +187,22 @@ pub fn kind_multiplier(kind: &str, config: &ScoringConfig) -> f32 {
         "wisdom"                    => config.kind_wisdom,
         "insight"                   => config.kind_insight,
         "episode"                   => config.kind_episode,
+        "operational"               => config.kind_operational,
         _                           => config.kind_default,
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn operational_fragments_rank_below_curated_kinds() {
+        let c = ScoringConfig::default();
+        let k = |kind| kind_multiplier(kind, &c);
+        assert!(k("operational") < k("wisdom"));
+        assert!(k("operational") < k("correction"));
+        assert!(k("operational") < k("signal"));
+        assert!(k("operational") > k("episode"));
     }
 }

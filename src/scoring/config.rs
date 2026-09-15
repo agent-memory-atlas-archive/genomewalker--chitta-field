@@ -61,6 +61,9 @@ pub struct ScoringConfig {
     pub kind_wisdom: f32,
     pub kind_insight: f32,
     pub kind_episode: f32,
+    /// Distiller fact fragments lifted verbatim from transcripts: evidence, not
+    /// conclusions, so they rank below curated kinds at equal similarity.
+    pub kind_operational: f32,
     pub kind_default: f32,
 
     // ── Epistemic multipliers ───────────────────────────────────────────
@@ -233,6 +236,7 @@ impl Default for ScoringConfig {
             kind_wisdom: 1.1,
             kind_insight: 1.05,
             kind_episode: 0.7,
+            kind_operational: 0.8,
             kind_default: 1.0,
 
             // Epistemic
