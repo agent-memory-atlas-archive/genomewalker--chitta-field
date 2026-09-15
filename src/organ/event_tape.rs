@@ -64,6 +64,13 @@ pub struct EventTape {
 }
 
 impl EventTape {
+    /// Hash ordered events plus the dictionaries used to interpret them. HashMap
+    /// serialization order must not affect identity across process restarts.
+    pub(crate) fn startup_key(&self) -> [u8; 32] {
+        crate::startup_cache::digest(&bincode::serialize(
+            &(1u32, &self.events, &self.tool_names, &self.entity_names)).expect("serialize tape key"))
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

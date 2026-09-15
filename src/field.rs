@@ -842,7 +842,7 @@ impl ChittaField {
             // Skip the most recent stale (keep as backup), delete the rest + their sidecars.
             for (_, path) in stale_by_seqno.iter().skip(1) {
                 let _ = std::fs::remove_file(path);
-                for ext in &["emb", "bin", "mu", "shdr", "hnsw", "pld", "snapshot.tmp"] {
+                for ext in &["emb", "bin", "mu", "shdr", "hnsw", "pld", "snapshot.tmp", "lsh", "organs", "turbo", "turbo.meta"] {
                     let _ = std::fs::remove_file(path.with_extension(ext));
                 }
                 // delta.hnsw: with_extension replaces only last component, handle separately
@@ -870,7 +870,7 @@ impl ChittaField {
                     let hash = parts[1];
                     if live_hashes.contains(hash) { continue; }
                     let ext = parts[2];
-                    if matches!(ext, "emb" | "bin" | "hnsw" | "pld" | "delta.hnsw" | "snapshot.tmp") {
+                    if matches!(ext, "emb" | "bin" | "hnsw" | "pld" | "delta.hnsw" | "snapshot.tmp" | "lsh" | "organs" | "turbo" | "turbo.meta") {
                         let removed = std::fs::remove_file(entry.path()).is_ok();
                         if removed {
                             eprintln!("[chitta-field] pruned orphaned sidecar: {}", name);
@@ -1141,7 +1141,7 @@ impl ChittaField {
         }
         {
             let _phase = crate::profile::LoadPhase::new("normalize");
-            semantic_idx.normalize_all();
+            semantic_idx.normalize_with_cache(best_full_path.as_ref().map(|p| p.with_extension("lsh")).as_deref());
         }
         // After WAL replay, the HNSW may have been backfilled with entries beyond the snapshot.
         // Persist the updated HNSW sidecar now so the next restart loads a complete graph
@@ -1281,7 +1281,7 @@ impl ChittaField {
                 Self::load_lite_encoder(&data_dir)
             });
             let turbo = scope.spawn(|| {
-                if let Some(plan) = semantic_idx.plan_turbo_rebuild(0) { plan.build(); }
+                semantic_idx.warm_turbo_with_cache(best_full_path.as_deref());
             });
         // Build HDC index — load from sidecar if available (fast path), else rebuild.
         let hdc_phase = crate::profile::LoadPhase::new("hdc");
@@ -1338,10 +1338,9 @@ impl ChittaField {
             tape
         };
         let tape_phase = crate::profile::LoadPhase::new("event_tape_organs");
-        let mut cdawg = crate::organ::cdawg::CdawgOrgan::new();
-        cdawg.rebuild_from_tape(&event_tape);
-        let mut episode_hdc = crate::hdc::EpisodeHdcStore::new();
-        episode_hdc.rebuild(&event_tape);
+        let organs_path = best_full_path.as_ref().map(|p| p.with_extension("organs"));
+        let (cdawg, episode_hdc) = crate::startup_cache::load_or_rebuild_organs(
+            &event_tape, organs_path.as_deref());
         drop(tape_phase);
         let refutation_ledger = crate::organ::refutation_ledger::RefutationLedger::new();
         let cec_policy_store  = crate::organ::intervention_store::InterventionStore::new();

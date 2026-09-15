@@ -8920,7 +8920,17 @@ impl ChittaField {
                 self.idx_sidecars_saved_at
                     .store(idx_mutations, std::sync::atomic::Ordering::Relaxed);
             }
+            // Optional startup caches follow the same dirty-skip discipline.
+            // The clone still owns the embeddings here; .emb was saved BEFORE
+            // this applies the next loader's normalization. No store guards held.
+            if !clean || ["lsh", "turbo", "turbo.meta"].iter().any(|ext| !path.with_extension(ext).exists()) {
+                snap.semantic_idx.prepare_startup_caches(&path);
+            }
         }
+        // Tape identity includes same-length edits and dictionary changes. The
+        // helper skips reconstruction when unchanged; derived organs stay optional.
+        let _ = crate::startup_cache::load_or_rebuild_organs(
+            &snap.event_tape, Some(&path.with_extension("organs")));
         // Save HDC sidecar — avoids tokenize+encode rebuild on next startup.
         // Dirty-skipped when the store hasn't mutated since the last write
         // (the sidecar is a lossy cache; a same-content file stays valid).

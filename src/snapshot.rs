@@ -1205,10 +1205,46 @@ fn write_section<W: Write, T: serde::Serialize>(w: &mut W, name: &str, value: &T
     Ok(())
 }
 
+/// Measures only buffered file refills; section timers include decode and allocation.
+struct SnapshotReader {
+    file: std::fs::File,
+    profile: bool,
+    elapsed: std::time::Duration,
+    bytes: usize,
+}
+impl SnapshotReader {
+    fn new(file: std::fs::File) -> Self {
+        Self { file, profile: std::env::var_os("CHITTA_PROFILE_SNAPSHOT").is_some(),
+            elapsed: std::time::Duration::ZERO, bytes: 0 }
+    }
+}
+impl Read for SnapshotReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.profile { return self.file.read(buf); }
+        let start = std::time::Instant::now();
+        let result = self.file.read(buf);
+        self.elapsed += start.elapsed();
+        self.bytes += result.as_ref().copied().unwrap_or(0);
+        result
+    }
+}
+impl Drop for SnapshotReader {
+    fn drop(&mut self) {
+        if self.profile {
+            eprintln!("[chitta-field] snapshot io_ms={} bytes={}", self.elapsed.as_millis(), self.bytes);
+        }
+    }
+}
+
 /// Deserialize one V23 section body from a length-capped reader.
 fn read_section<R: Read, T: serde::de::DeserializeOwned>(r: &mut R, name: &str) -> Result<T> {
-    bincode::deserialize_from(r)
-        .map_err(|e| FieldError::Serialization(format!("section '{name}': {e}")))
+    let start = std::time::Instant::now();
+    let result = bincode::deserialize_from(r)
+        .map_err(|e| FieldError::Serialization(format!("section '{name}': {e}")));
+    if std::env::var_os("CHITTA_PROFILE_SNAPSHOT").is_some() {
+        eprintln!("[chitta-field] snapshot section={name} decode_ms={}", start.elapsed().as_millis());
+    }
+    result
 }
 
 impl FullSnapshot {
@@ -1443,7 +1479,7 @@ impl FullSnapshot {
     fn load_inner(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| FieldError::Manifest(e.to_string()))?;
-        let mut r = BufReader::with_capacity(1 << 20, file);
+        let mut r = BufReader::with_capacity(1 << 20, SnapshotReader::new(file));
         let mut magic_buf = [0u8; 8];
         r.read_exact(&mut magic_buf)
             .map_err(|_| FieldError::Manifest("snapshot too short".to_string()))?;

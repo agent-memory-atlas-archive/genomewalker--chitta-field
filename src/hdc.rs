@@ -563,11 +563,12 @@ fn encode_episode_hv(tool_name: &str, entity_name: &str, outcome: u8) -> HdcVec 
 
 /// Bit-count accumulator for a set of episode hypervectors.
 /// Identical to RealmBundle but independent so EpisodeHdcStore has no snapshot dependency.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct EpBundle {
     // Bit-sliced saturating u16 counters. A singleton needs one 1024-byte
     // plane, rather than 8192 u16s (16 KiB). More planes are allocated only
     // when observation counts require them; the maximum is still 16 planes.
+    #[serde(with = "episode_planes")]
     planes: Vec<Box<HdcVec>>,
     n: u32,
 }
@@ -620,8 +621,8 @@ impl EpBundle {
 }
 
 /// Episode-level HDC heteroassociative index.
-/// Not serialized: rebuilt from EventTape at startup via `rebuild()`.
-#[derive(Default)]
+/// Optional startup sidecar; never embedded in the full snapshot.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct EpisodeHdcStore {
     /// Episodes grouped by tool name
     by_tool:    std::collections::HashMap<String, EpBundle>,
@@ -889,5 +890,19 @@ mod episode_counter_tests {
         assert_eq!(bundle.to_hv(), [!0; D]);
         bundle.n = 131070;
         assert_eq!(bundle.to_hv(), [0; D], "threshold exceeds saturated u16 counts");
+    }
+}
+
+mod episode_planes {
+    use super::HdcVec;
+    use serde::{Serialize, Deserialize};
+    pub fn serialize<S: serde::Serializer>(planes: &[Box<HdcVec>], serializer: S) -> Result<S::Ok, S::Error> {
+        planes.iter().map(|p| p.as_slice()).collect::<Vec<_>>().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Box<HdcVec>>, D::Error> {
+        let planes = Vec::<Vec<u64>>::deserialize(deserializer)?;
+        if planes.len() > 16 { return Err(serde::de::Error::custom("too many episode planes")); }
+        planes.into_iter().map(|p| p.try_into().map(Box::new)
+            .map_err(|_| serde::de::Error::custom("wrong episode plane dimension"))).collect()
     }
 }
