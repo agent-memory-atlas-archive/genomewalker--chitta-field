@@ -94,10 +94,10 @@ impl SparseEncoder {
 
         // Partial sort: top SHORTLIST_PER_HALF from each half
         left_scores.select_nth_unstable_by(SHORTLIST_PER_HALF, |a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1))
         });
         right_scores.select_nth_unstable_by(SHORTLIST_PER_HALF, |a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1))
         });
 
         // Build shortlist of SHORTLIST_PER_HALF² = 256 candidates
@@ -113,7 +113,7 @@ impl SparseEncoder {
         // Top-K from candidates
         let k = K_ACTIVE.min(candidates.len());
         candidates.select_nth_unstable_by(k, |a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1))
         });
         candidates.truncate(k);
         candidates.sort_by(|a, b| a.1.cmp(&b.1)); // sort by feature_id ascending
@@ -553,7 +553,7 @@ impl CorticalIndex {
             .collect();
 
         // Top-K
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         results.truncate(k);
         results
     }
@@ -843,7 +843,7 @@ fn blend_sparse_codes(a: &SparseCode, b: &SparseCode, alpha: f32) -> SparseCode 
     let mut features: Vec<(u32, f32)> = merged.into_iter().filter(|(_, a)| *a > 0.0).collect();
     if features.len() > K_ACTIVE {
         features.select_nth_unstable_by(K_ACTIVE, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
         });
         features.truncate(K_ACTIVE);
     }

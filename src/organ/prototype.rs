@@ -108,7 +108,8 @@ impl PrototypeIndex {
         let mut best_sim = f32::NEG_INFINITY;
         for (i, proto) in self.protos.iter().enumerate() {
             let sim = sparse_dot(&proto.centroid, code);
-            if sim > best_sim {
+            if sim.total_cmp(&best_sim).is_gt()
+                || (sim.total_cmp(&best_sim).is_eq() && proto.id < self.protos[best_idx].id) {
                 best_sim = sim;
                 best_idx = i;
             }
@@ -150,7 +151,7 @@ impl PrototypeIndex {
         const TOP_K: usize = 64;
         if features.len() > TOP_K {
             features.select_nth_unstable_by(TOP_K, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
             });
             features.truncate(TOP_K);
         }
@@ -208,7 +209,7 @@ impl PrototypeIndex {
             .filter(|&(&(a, _), _)| a == from)
             .map(|(&(_, b), &w)| (b, w))
             .collect();
-        out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out.truncate(n);
         out
     }

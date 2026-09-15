@@ -371,7 +371,7 @@ fn rrf_merge(
             })
         })
         .collect();
-    ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id)));
     ranked.truncate(k);
     ranked
 }
@@ -2044,6 +2044,14 @@ impl ChittaField {
     }
 
     pub fn get_memory(&self, memory_id: MemoryId) -> Result<MemoryPayload> {
+        let payload = self.peek_memory(memory_id)?;
+        self.pending_touches.lock().push((memory_id, now_ms()));
+        Ok(payload)
+    }
+
+    /// Hydrate recall results without scheduling access updates. Scoring and
+    /// explicit reads own learning; metadata reads must not race the touch timer.
+    pub(crate) fn peek_memory(&self, memory_id: MemoryId) -> Result<MemoryPayload> {
         {
             let states = self.states.read();
             let state = states
@@ -2056,8 +2064,6 @@ impl ChittaField {
 
         let payload = self.payloads.read().get(&memory_id).cloned()
             .ok_or(FieldError::NotFound(memory_id))?;
-        // No core write guard, learner guard, or WAL lock on the recall path.
-        self.pending_touches.lock().push((memory_id, now_ms()));
         Ok(payload)
     }
 
@@ -3145,9 +3151,7 @@ impl ChittaField {
             .collect();
 
         hits.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id))
         });
 
         // Lure detection (Price of Meaning no-escape theorem):
@@ -3467,10 +3471,11 @@ impl ChittaField {
                 .collect();
             if cand.len() > max_degree {
                 cand.select_nth_unstable_by(max_degree, |a, b| {
-                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                    b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1))
                 });
                 cand.truncate(max_degree);
             }
+            cand.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             for (_, dst) in cand {
                 if index.contains_key(&dst) || !legal(&dst) {
                     continue;
@@ -3502,10 +3507,11 @@ impl ChittaField {
                 // the power iteration O(iters * n * max_degree) instead of O(n^2).
                 if row.len() > max_degree {
                     row.select_nth_unstable_by(max_degree, |a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
                     });
                     row.truncate(max_degree);
                 }
+                row.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
                 let sum: f32 = row.iter().map(|e| e.1).sum();
                 if sum > 0.0 {
                     for e in &mut row {
@@ -3583,7 +3589,7 @@ impl ChittaField {
             .filter(|&(i, _)| p[i] > 0.0)
             .map(|(i, &id)| (id, p[i]))
             .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(top_g);
         ranked
     }
@@ -3693,7 +3699,7 @@ impl ChittaField {
             .into_iter()
             .filter(|(id, _)| by_id.contains_key(id))
             .collect();
-        order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        order.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let mut merged = Vec::with_capacity(order.len());
         for (mid, s) in order {
             if let Some(mut h) = by_id.remove(&mid) {
@@ -3826,9 +3832,7 @@ impl ChittaField {
             .collect();
 
         hits.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id))
         });
         hits.truncate(limit);
 
@@ -4048,7 +4052,7 @@ impl ChittaField {
                 spacing_boost:      1.0,
             });
         }
-        hits.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id)));
         hits.truncate(k);
         Ok(hits)
     }
@@ -5168,9 +5172,7 @@ impl ChittaField {
             .collect();
 
         hits.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id))
         });
         hits.truncate(k);
 
@@ -5271,7 +5273,7 @@ impl ChittaField {
             .collect();
 
         session_hits.sort_unstable_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score.total_cmp(&a.score).then_with(|| a.session_id.cmp(&b.session_id))
         });
         session_hits.truncate(k);
         Ok(session_hits)
@@ -5510,7 +5512,7 @@ impl ChittaField {
                 .unwrap_or(0.0);
             h.score = h.semantic_score;
         }
-        pool.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        pool.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id)));
         out.extend(pool.into_iter().take(k - out.len()));
         Ok(())
     }
@@ -5676,7 +5678,7 @@ impl ChittaField {
                     hits[*i].semantic_score = cos;
                 }
             }
-            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id)));
             all_hits.extend(hits);
 
             // s_T becomes the query for the next hop.
@@ -5684,7 +5686,7 @@ impl ChittaField {
         }
 
         // Merge: sort by score, dedup keeping highest, truncate.
-        all_hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all_hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.memory_id.cmp(&b.memory_id)));
         let mut seen = std::collections::HashSet::new();
         all_hits.retain(|h| seen.insert(h.memory_id));
         Ok(all_hits.into_iter().take(k).collect())
@@ -5964,7 +5966,7 @@ impl ChittaField {
 
         // Sort by score descending, take top k
         let mut ranked: Vec<(MemoryId, f32)> = memory_scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(k * 4); // fetch extra for realm filtering
 
         let payloads = match self.payloads.try_read_for(std::time::Duration::from_secs(5)) {

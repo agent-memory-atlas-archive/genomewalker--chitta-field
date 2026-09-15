@@ -320,7 +320,7 @@ impl HdcStore {
             }
             None => self.memories.iter().map(|(&id, hv)| (id, hamming(&q, hv))).collect(),
         };
-        scored.sort_unstable_by_key(|&(_, d)| d);
+        scored.sort_unstable_by_key(|&(id, d)| (d, id));
         scored.truncate(k);
         scored
     }
@@ -339,7 +339,7 @@ impl HdcStore {
         let mut scored: Vec<(MemoryId, u32)> = members.iter()
             .filter_map(|id| self.memories.get(id).map(|hv| (*id, hamming(&q, hv))))
             .collect();
-        scored.sort_unstable_by_key(|&(_, d)| d);
+        scored.sort_unstable_by_key(|&(id, d)| (d, id));
         scored.truncate(k);
         scored
     }
@@ -526,7 +526,7 @@ impl HdcStore {
             }
             None => self.memories.iter().map(|(&id, hv)| (id, hamming(&q, hv))).collect(),
         };
-        scored.sort_unstable_by_key(|&(_, d)| d);
+        scored.sort_unstable_by_key(|&(id, d)| (d, id));
         scored.truncate(k);
         scored
     }
@@ -721,7 +721,7 @@ impl EpisodeHdcStore {
             _ => return vec![],
         };
 
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scores.truncate(k);
         scores
     }
@@ -750,6 +750,21 @@ impl EpisodeHdcStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tied_candidates_are_selected_by_id_in_every_query_mode() {
+        for reverse in [false, true] {
+            let mut store = HdcStore::new();
+            let ids: Vec<_> = if reverse { (1..=80).rev().collect() } else { (1..=80).collect() };
+            for id in ids { store.insert(id, "same words", "realm"); }
+            for hits in [store.query("same words", 7, None),
+                         store.query("same words", 7, Some("realm")),
+                         store.realm_theme_query("realm", 7),
+                         store.query_and(&["same", "words"], 7, None)] {
+                assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
+            }
+        }
+    }
 
     #[test]
     fn word_hv_deterministic() {

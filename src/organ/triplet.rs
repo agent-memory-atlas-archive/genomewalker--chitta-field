@@ -70,6 +70,14 @@ pub struct TripletStore {
     /// Runtime flag persisted as an optional V23 section, never in bincode.
     #[serde(skip)]
     pub(crate) clean: bool,
+    /// None on legacy/uncertified stores; otherwise only these subject postings
+    /// can contain duplicates or invalidations since the persisted clean marker.
+    #[serde(skip)]
+    dirty_subjects: Option<std::collections::HashSet<String>>,
+    /// Historical imports can reuse IDs for distinct facts. Only mutations
+    /// touching such IDs need the legacy scan; unrelated subjects remain cheap.
+    #[serde(skip)]
+    duplicate_ids: std::collections::HashSet<u64>,
     #[serde(skip)]
     source_files: std::collections::HashSet<std::sync::Arc<str>>,
     next_id: u64,
@@ -109,11 +117,14 @@ impl TripletStore {
                 map_bytes(m) + m.iter().map(|(k, v)| k.capacity() + v.capacity() * 8).sum::<usize>()).sum::<usize>()
             + map_bytes(&self.ingestion_times) + map_bytes(&self.supersession_map)
             + map_bytes(&self.correction_states)
+            + self.duplicate_ids.capacity() * 8 / 7 * (std::mem::size_of::<u64>() + 1)
     }
 
     pub fn new() -> Self {
         Self {
             clean: true,
+            dirty_subjects: None,
+            duplicate_ids: Default::default(),
             source_files: Default::default(),
             next_id: 1,
             entries: Vec::new(),
@@ -139,8 +150,84 @@ impl TripletStore {
     /// Legacy families migrate once. WAL duplicates or invalidation clear the flag.
     pub(crate) fn clean_for_load(&mut self) -> (usize, usize) {
         if self.clean { return (0, 0); }
+        if self.dirty_subjects.as_ref().is_some_and(|subjects| subjects.iter().any(|subject|
+            self.by_subject.get(subject).into_iter().flatten().any(|id| self.duplicate_ids.contains(id)))) {
+            self.dirty_subjects = None;
+        }
+        if let Some(subjects) = self.dirty_subjects.take() {
+            eprintln!("[chitta-field] triplet cleanup mode=incremental subjects={}", subjects.len());
+            return self.clean_subjects(subjects);
+        }
         let purged = self.purge_invalidated();
         let deduped = self.dedup_entries();
+        self.clean = true;
+        (purged, deduped)
+    }
+
+    fn mark_dirty(&mut self, subject: String) {
+        if self.clean {
+            self.dirty_subjects = Some(Default::default());
+            self.clean = false;
+        }
+        if let Some(subjects) = &mut self.dirty_subjects { subjects.insert(subject); }
+    }
+
+    /// Select survivors only within mutated subject postings. Keep entry order
+    /// (including first-wins ties and NaNs) identical to the full legacy scan.
+    /// Stable Vec compaction is still O(N), but avoids rebuilding/string-cloning
+    /// all four indexes and hashing every SPO tuple on every small replay.
+    fn clean_subjects(&mut self, subjects: std::collections::HashSet<String>) -> (usize, usize) {
+        let mut removed = std::collections::HashSet::new();
+        let mut purged = 0;
+        let mut deduped = 0;
+        for subject in &subjects {
+            let mut positions: Vec<_> = self.by_subject.get(subject).into_iter().flatten()
+                .filter_map(|id| self.id_to_index.get(id).copied()).collect();
+            positions.sort_unstable();
+            let mut best = HashMap::<(&str, &str), usize>::new();
+            for pos in positions {
+                let entry = &self.entries[pos];
+                if entry.valid_to_ms != 0 {
+                    if removed.insert(entry.id) { purged += 1; }
+                    continue;
+                }
+                let key = (entry.predicate.as_str(), entry.object.as_str());
+                if let Some(previous) = best.get_mut(&key) {
+                    if entry.weight > self.entries[*previous].weight {
+                        removed.insert(self.entries[*previous].id);
+                        *previous = pos;
+                    } else { removed.insert(entry.id); }
+                    deduped += 1;
+                } else { best.insert(key, pos); }
+            }
+        }
+        if !removed.is_empty() {
+            let mut objects = std::collections::HashSet::new();
+            let mut predicates = std::collections::HashSet::new();
+            for id in &removed {
+                if let Some(pos) = self.id_to_index.remove(id) {
+                    objects.insert(self.entries[pos].object.clone());
+                    predicates.insert(self.entries[pos].predicate.clone());
+                }
+                self.ingestion_times.remove(id);
+            }
+            self.entries.retain(|e| !removed.contains(&e.id));
+            for (pos, entry) in self.entries.iter().enumerate() {
+                *self.id_to_index.get_mut(&entry.id).expect("survivor index") = pos;
+            }
+            // A legacy supersession sidecar can contain stale ingestion IDs;
+            // match the full cleaner's pruning when any entry was removed.
+            self.ingestion_times.retain(|id, _| self.id_to_index.contains_key(id));
+            for (index, keys) in [(&mut self.by_subject, subjects),
+                (&mut self.by_object, objects), (&mut self.by_predicate, predicates)] {
+                for key in keys {
+                    if let Some(ids) = index.get_mut(&key) {
+                        ids.retain(|id| !removed.contains(id));
+                        if ids.is_empty() { index.remove(&key); }
+                    }
+                }
+            }
+        }
         self.clean = true;
         (purged, deduped)
     }
@@ -169,11 +256,12 @@ impl TripletStore {
         }
 
         self.id_to_index = HashMap::with_capacity(self.entries.len());
+        self.duplicate_ids.clear();
         self.by_subject   = HashMap::new();
         self.by_object    = HashMap::new();
         self.by_predicate = HashMap::new();
         for (idx, e) in self.entries.iter().enumerate() {
-            self.id_to_index.insert(e.id, idx);
+            if self.id_to_index.insert(e.id, idx).is_some() { self.duplicate_ids.insert(e.id); }
             self.by_subject.entry(e.subject.clone()).or_default().push(e.id);
             self.by_object.entry(e.object.clone()).or_default().push(e.id);
             self.by_predicate.entry(e.predicate.clone()).or_default().push(e.id);
@@ -318,8 +406,15 @@ impl TripletStore {
         source_memory_id: Option<MemoryId>,
         source_file: Option<String>,
     ) {
-        if self.clean && self.find_exact_live(&subject, &predicate, &object).is_some() {
+        // Legacy repeated explicit IDs cannot be represented by id_to_index's
+        // single position; retain the full-scan behavior for this malformed case.
+        if self.id_to_index.contains_key(&id) {
+            self.duplicate_ids.insert(id);
             self.clean = false;
+            self.dirty_subjects = None;
+        }
+        if !self.clean || self.find_exact_live(&subject, &predicate, &object).is_some() {
+            self.mark_dirty(subject.clone());
         }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -362,7 +457,8 @@ impl TripletStore {
         if let Some(&idx) = self.id_to_index.get(&triplet_id) {
             if let Some(entry) = self.entries.get_mut(idx) {
                 entry.valid_to_ms = now_ms;
-                self.clean = false;
+                let subject = entry.subject.clone();
+                self.mark_dirty(subject);
             }
         }
     }
@@ -487,17 +583,19 @@ impl TripletStore {
 
     pub fn invalidate_by_source_file(&mut self, source_file: &str, now_ms: i64) -> Vec<u64> {
         let mut invalidated = Vec::new();
+        let mut subjects = Vec::new();
         for entry in self.entries.iter_mut() {
             if entry.valid_to_ms == 0 {
                 if let Some(ref sf) = entry.source_file {
                     if sf == source_file {
                         entry.valid_to_ms = now_ms;
-                        self.clean = false;
+                        subjects.push(entry.subject.clone());
                         invalidated.push(entry.id);
                     }
                 }
             }
         }
+        for subject in subjects { self.mark_dirty(subject); }
         invalidated
     }
 
@@ -578,7 +676,7 @@ impl TripletStore {
                 }
             }
             if next_layer.len() > max_nodes {
-                next_layer.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                next_layer.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 next_layer.truncate(max_nodes);
             }
             current_layer = next_layer;
@@ -743,6 +841,67 @@ mod tests {
         store.invalidate(2, 10);
         assert!(!store.clean);
         assert_eq!(store.clean_for_load(), (1, 0));
+    }
+
+    #[test]
+    fn incremental_cleanup_matches_full_scan_after_replay() {
+        let mut base = super::TripletStore::new();
+        for id in 1..=2000 {
+            base.replay_add(id, format!("s{}", id % 20), "p".into(), format!("o{id}"),
+                0.5, 0, None, Some("file.rs".into()));
+        }
+        for id in 1..=200 {
+            base.replay_add(2000 + id, format!("s{}", id % 20), "p".into(), format!("o{id}"),
+                if id % 3 == 0 { 0.5 } else { 0.8 }, 0, None, None);
+        }
+        base.invalidate(3, 10);
+        // A unique addition after the first duplicate must also be tracked.
+        base.replay_add(3000, "new".into(), "p".into(), "o".into(), 0.2, 0, None, None);
+        base.invalidate(3000, 10);
+        let mut full = base.clone();
+        full.dirty_subjects = None;
+        assert_eq!(base.clean_for_load(), full.clean_for_load());
+        assert_eq!(bincode::serialize(&base.entries).unwrap(), bincode::serialize(&full.entries).unwrap());
+        assert_eq!(base.id_to_index, full.id_to_index);
+        assert_eq!(base.by_subject, full.by_subject);
+        assert_eq!(base.by_object, full.by_object);
+        assert_eq!(base.by_predicate, full.by_predicate);
+        assert_eq!(base.ingestion_times, full.ingestion_times);
+        assert_eq!(base.clean_for_load(), (0, 0));
+        base.invalidate_by_source_file("file.rs", 20);
+        let mut full = base.clone(); full.dirty_subjects = None;
+        assert_eq!(base.clean_for_load(), full.clean_for_load());
+        assert_eq!(bincode::serialize(&base.entries).unwrap(), bincode::serialize(&full.entries).unwrap());
+    }
+
+    #[test]
+    fn incremental_cleanup_handles_unrelated_legacy_id_collisions() {
+        let mut store = super::TripletStore::new();
+        store.replay_add(1, "old-a".into(), "p".into(), "o".into(), 0.5, 0, None, None);
+        store.replay_add(1, "old-b".into(), "p".into(), "o".into(), 0.5, 0, None, None);
+        store.clean_for_load();
+        store.rebuild_indexes();
+        assert!(store.clean);
+        assert!(store.duplicate_ids.contains(&1));
+        store.replay_add(2, "new".into(), "p".into(), "o".into(), 0.5, 0, None, None);
+        store.invalidate(2, 10);
+        assert!(store.dirty_subjects.is_some());
+        let mut full = store.clone(); full.dirty_subjects = None;
+        assert_eq!(store.clean_for_load(), full.clean_for_load());
+        assert_eq!(bincode::serialize(&store.entries).unwrap(), bincode::serialize(&full.entries).unwrap());
+        assert_eq!(store.id_to_index, full.id_to_index);
+        assert_eq!(store.by_subject, full.by_subject);
+        assert_eq!(store.by_object, full.by_object);
+        assert_eq!(store.by_predicate, full.by_predicate);
+        // An ambiguous affected ID still requires the full cleaner: only the
+        // last entry for ID 1 was invalidated; its earlier fact must survive.
+        store.invalidate(1, 20);
+        let mut full = store.clone(); full.dirty_subjects = None;
+        assert_eq!(store.clean_for_load(), full.clean_for_load());
+        assert_eq!(bincode::serialize(&store.entries).unwrap(), bincode::serialize(&full.entries).unwrap());
+        assert_eq!(store.id_to_index, full.id_to_index);
+        assert_eq!(store.by_subject, full.by_subject);
+        assert_eq!(store.entries[0].subject, "old-a");
     }
 
     #[test]

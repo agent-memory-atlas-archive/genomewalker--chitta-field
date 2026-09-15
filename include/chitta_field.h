@@ -100,6 +100,10 @@ int cf_recall_keyword(CfHandle* h,
 int cf_get_content(CfHandle* h, uint64_t memory_id,
     uint8_t* buf, size_t buf_cap, size_t* written);
 
+// Read-only recall hydration: never records an access, including buffer retries.
+int cf_peek_content(CfHandle* h, uint64_t memory_id,
+    uint8_t* buf, size_t buf_cap, size_t* written);
+
 /* Deterministic provenance lookup (keyed lane). 0=hit (fills out_id+buf),
    1=clean miss, <0=error. sha tried first, then input path; either may be NULL. */
 int cf_provenance_lookup(CfHandle* h,

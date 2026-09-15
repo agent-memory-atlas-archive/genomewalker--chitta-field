@@ -315,7 +315,7 @@ impl HnswGraph {
             .filter_map(|id| embs.get(id).map(|e| (id, dot(query, e))))
             .collect();
 
-        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(k);
         scored
     }
@@ -383,7 +383,7 @@ impl HnswGraph {
             .iter()
             .filter_map(|&id| embs.get(id).map(|e| (dot(query, e), id)))
             .collect();
-        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         scored.truncate(m);
         scored.into_iter().map(|(_, id)| id).collect()
     }
@@ -511,12 +511,14 @@ impl DeltaBatchPlan {
 /// 4-bit TurboQuant index, warmed before open returns and refreshed by maintenance.
 /// Runtime-only: published through an Arc after construction completes.
 struct TurboState {
-    index: TurboQuantIndex,
+    index: crate::turbo::SearchIndex,
     /// turbovec row -> MemoryId (insertion order = add order).
     ids: Vec<MemoryId>,
     /// `mutations` value the index was built at; stale when it lags.
     built_at_mutation: u64,
     built_at: std::time::Instant,
+    /// A snapshot cache with replay changes must be rebuilt on the first maintenance tick.
+    startup_delta: bool,
 }
 
 /// Immutable refresh view: publishing a newer index cannot invalidate this Arc.
@@ -548,7 +550,7 @@ impl RefreshSearch {
                 hits.push(SemanticHit { memory_id: id, cosine_similarity: score });
                 if hits.len() == 9 { break; }
             }
-            hits.sort_unstable_by(|a, b| b.cosine_similarity.total_cmp(&a.cosine_similarity));
+            hits.sort_unstable_by(|a, b| b.cosine_similarity.total_cmp(&a.cosine_similarity).then_with(|| a.memory_id.cmp(&b.memory_id)));
             hits
         }).collect())
     }
@@ -647,6 +649,9 @@ pub struct SemanticIndex {
     turbo_changed: HashMap<MemoryId, u64>,
     #[serde(skip, default)]
     turbo_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Exact raw snapshot sidecar identity, captured BEFORE WAL replay.
+    #[serde(skip)]
+    startup_key: Option<[u8; 32]>,
 
 }
 
@@ -696,6 +701,7 @@ impl SemanticIndex {
             turbo: Arc::new(RwLock::new(None)),
             turbo_changed: HashMap::new(),
             turbo_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            startup_key: None,
         }
     }
 
@@ -951,7 +957,7 @@ impl SemanticIndex {
                                         Some((dot_i8(nbr_emb, e), r))
                                     })
                                     .collect();
-                                scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                                scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
                                 scored.truncate(m_max);
                                 *cell = scored.into_iter().map(|(_, r)| r).collect();
                             }
@@ -1086,7 +1092,7 @@ impl SemanticIndex {
         let embs = EmbLookup { heap: &self.embeddings, offsets: &self.emb_offsets, mmap: &self.emb_mmap, arena: None };
         let mut pairs = self.hnsw.search(&query_unit, k, None, &self.deleted, &embs);
         pairs.extend(self.delta_hnsw.search(&query_unit, k, None, &self.deleted, &embs));
-        pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         pairs.dedup_by_key(|p| p.0);
         pairs.truncate(k);
         pairs.into_iter().map(|(memory_id, cosine_similarity)| SemanticHit { memory_id, cosine_similarity }).collect()
@@ -1297,14 +1303,17 @@ impl SemanticIndex {
         let current = self.turbo.read().clone();
         if let Some(t) = current.as_ref() {
             if self.mutations == t.built_at_mutation
-                || (self.mutations.saturating_sub(t.built_at_mutation) <= min_mutations
+                || (!t.startup_delta && self.mutations.saturating_sub(t.built_at_mutation) <= min_mutations
                     && t.built_at.elapsed() < std::time::Duration::from_secs(60)) {
                 return None;
             }
         }
         let mut flat = Vec::with_capacity(self.total_embedding_count() * EMBED_DIM);
         let mut ids = Vec::with_capacity(self.total_embedding_count());
-        for id in self.all_ids() {
+        let mut ordered_ids: Vec<_> = self.all_ids().collect();
+        ordered_ids.sort_unstable();
+        ordered_ids.dedup();
+        for id in ordered_ids {
             if self.deleted.contains(&id) { continue; }
             let Some(emb) = self.get_embedding(id) else { continue; };
             if emb.len() != EMBED_DIM { continue; }
@@ -1679,7 +1688,7 @@ impl SemanticIndex {
                                 if sim.is_finite() { hits.push(SemanticHit { memory_id: id, cosine_similarity: sim }); }
                             }
                         }
-                        hits.sort_unstable_by(|a, b| b.cosine_similarity.total_cmp(&a.cosine_similarity));
+                        hits.sort_unstable_by(|a, b| b.cosine_similarity.total_cmp(&a.cosine_similarity).then_with(|| a.memory_id.cmp(&b.memory_id)));
                         hits.truncate(k);
                         return hits;
                     }
@@ -1755,7 +1764,7 @@ impl SemanticIndex {
             if self.use_tier2() && !self.delta_hnsw.is_empty() {
                 let delta_pairs = self.delta_hnsw.search(&query_unit, k, allowed, &self.deleted, &embs);
                 pairs.extend(delta_pairs);
-                pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 pairs.dedup_by_key(|p| p.0);
                 pairs.truncate(k);
             }
@@ -1939,20 +1948,44 @@ impl SemanticIndex {
     /// Normalize embeddings loaded from older snapshots that stored raw vectors.
     pub fn normalize_all(&mut self) { self.normalize_with_cache(None); }
 
-    /// Exact per-vector arithmetic, parallelized; the expensive LSH projection is
-    /// optional derived state, keyed by the post-replay normalized vector bits.
+    /// Cached divisors preserve the historical f32 division exactly; only the
+    /// replay delta needs a norm reduction and LSH projection. The raw snapshot
+    /// digest is captured while loading .emb, never from post-replay vectors.
     pub(crate) fn normalize_with_cache(&mut self, path: Option<&std::path::Path>) {
         self.mutations += 1;
         self.invalidate_turbo();
-        refresh_pool().install(|| self.embeddings.par_iter_mut().for_each(|(_, embedding)| normalize_in_place(embedding)));
-        let key = path.filter(|_| self.emb_mmap.is_none()).map(|_| self.startup_vector_key());
-        let cached: Option<HashMap<MemoryId, Vec<u16>>> = path.zip(key.as_ref())
+        let key = self.startup_key.filter(|_| self.emb_mmap.is_none());
+        let cached: Option<HashMap<MemoryId, (f32, Vec<u16>)>> = path.zip(key.as_ref())
             .and_then(|(p, k)| crate::startup_cache::load(p, k));
-        let loaded = cached.filter(|m| m.len() == self.embeddings.len()
-            && m.iter().all(|(id, sigs)| self.embeddings.contains_key(id)
-                && sigs.len() == LSH_TABLES && sigs.iter().all(|s| (*s as usize) < (1 << LSH_BITS))));
-        let cache_hit = loaded.is_some();
-        if let Some(m) = loaded { self.mem_lsh = m; }
+        let cached = cached.filter(|m| m.values().all(|(_, sigs)|
+            sigs.len() == LSH_TABLES && sigs.iter().all(|s| (*s as usize) < (1 << LSH_BITS))));
+        let cache_hit = cached.is_some();
+        // Save only a pristine snapshot subset, never a post-replay mixture under
+        // the snapshot's key. Normal checkpoints always create both base caches.
+        let can_save = !cache_hit && self.turbo_changed.is_empty() && key.is_some();
+        let mut divisors = HashMap::new();
+        if can_save {
+            divisors = refresh_pool().install(|| self.embeddings.par_iter()
+                .map(|(&id, v)| (id, l2_norm(v))).collect());
+        }
+        let changed = &self.turbo_changed;
+        refresh_pool().install(|| self.embeddings.par_iter_mut().for_each(|(id, embedding)| {
+            let norm = cached.as_ref().filter(|_| !changed.contains_key(id))
+                .and_then(|m| m.get(id)).map(|r| r.0).unwrap_or_else(|| l2_norm(embedding));
+            if !(norm < 1e-9 || norm == 1.0) {
+                for x in embedding { *x /= norm; }
+            }
+        }));
+        if self.lsh_planes.is_empty() { self.lsh_planes = default_lsh_planes(); }
+        // Upsert's signatures precede the loader's final normalization. Recompute
+        // delta signatures after it, even if the old count happens to match.
+        self.mem_lsh = refresh_pool().install(|| self.all_ids().collect::<Vec<_>>().par_iter()
+            .filter_map(|&id| self.get_embedding(id).map(|v| {
+                let sigs = cached.as_ref().filter(|_| !changed.contains_key(&id))
+                    .and_then(|m| m.get(&id)).map(|r| r.1.clone())
+                    .unwrap_or_else(|| self.assign_lsh(v));
+                (id, sigs)
+            })).collect());
         if self.binary_codes.len() != self.total_embedding_count() {
             // Centered binary codes when a centroid is loaded (.mu sidecar); raw otherwise.
             let centroid = self.centroid.clone();
@@ -2009,9 +2042,11 @@ impl SemanticIndex {
             }
         }
         self.trim_deleted();
-        if !cache_hit {
+        if can_save {
             if let Some((p, k)) = path.zip(key.as_ref()) {
-                if let Err(e) = crate::startup_cache::save(p, k, &self.mem_lsh) {
+                let rows: HashMap<_, _> = self.mem_lsh.iter().filter_map(|(&id, sigs)|
+                    divisors.get(&id).map(|&norm| (id, (norm, sigs.clone())))).collect();
+                if let Err(e) = crate::startup_cache::save(p, k, &rows) {
                     eprintln!("[chitta-field] optional LSH cache write failed: {e}");
                 }
             }
@@ -2019,29 +2054,15 @@ impl SemanticIndex {
         if path.is_some() { eprintln!("[chitta-field] LSH cache hit={cache_hit}"); }
     }
 
-    /// Order-independent fingerprint: same-size vector replacements and WAL
-    /// updates invalidate caches, even when the snapshot filename is unchanged.
-    fn startup_vector_key(&self) -> [u8; 32] {
+    fn snapshot_vector_key(bytes: &[u8]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        let mut rows: Vec<_> = refresh_pool().install(|| self.all_ids().collect::<Vec<_>>().par_iter().map(|&id| {
-            let mut h = Sha256::new();
-            h.update(id.to_le_bytes());
-            if let Some(v) = self.get_embedding(id) {
-                // f32 has no padding; hash exact stored bits, without float rounding.
-                let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4) };
-                h.update(bytes);
-            }
-            h.update([u8::from(self.deleted.contains(&id))]);
-            (id, <[u8; 32]>::from(h.finalize()))
-        }).collect());
-        rows.sort_unstable_by_key(|r| r.0);
         let mut h = Sha256::new();
-        h.update(b"startup-lsh-turbovec-0.9-v1");
+        h.update(b"snapshot-lsh-divisors-turbovec-0.9-v2");
         h.update(crate::ops::EMBED_MODEL_ID.as_bytes());
         h.update((EMBED_DIM as u64).to_le_bytes());
         h.update((LSH_TABLES as u64).to_le_bytes());
         h.update((LSH_BITS as u64).to_le_bytes());
-        for (_, digest) in rows { h.update(digest); }
+        h.update(bytes);
         h.finalize().into()
     }
 
@@ -2051,6 +2072,12 @@ impl SemanticIndex {
     pub(crate) fn prepare_startup_caches(&mut self, snapshot: &std::path::Path) {
         self.turbo = Arc::new(RwLock::new(None));
         self.turbo_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Reload the bytes actually persisted: saving filters invalid/deleted
+        // vectors, and mmap snapshots keep their historical raw-vector semantics.
+        if !self.load_embeddings_sidecar(&snapshot.with_extension("emb")) { return; }
+        self.emb_mmap = None;
+        self.emb_offsets.clear();
+        self.turbo_changed.clear();
         self.mem_lsh.clear();
         self.lsh_buckets.clear();
         self.normalize_with_cache(Some(&snapshot.with_extension("lsh")));
@@ -2059,33 +2086,38 @@ impl SemanticIndex {
 
     pub(crate) fn warm_turbo_with_cache(&self, snapshot: Option<&std::path::Path>) {
         let _phase = crate::profile::LoadPhase::new("turbo_startup");
-        let key = snapshot.map(|_| self.startup_vector_key());
+        let key = self.startup_key.filter(|_| self.emb_mmap.is_none());
         if let Some((snapshot, key)) = snapshot.zip(key.as_ref()) {
             let path = snapshot.with_extension("turbo");
             let meta: Option<(Vec<MemoryId>, [u8; 32])> =
                 crate::startup_cache::load(&snapshot.with_extension("turbo.meta"), key);
             if let Some((ids, checksum)) = meta {
                 let valid_ids = ids.iter().copied().collect::<HashSet<_>>();
+                // Snapshot rows remain usable during replay-delta maintenance.
+                // Search excludes deleted/replaced rows and scores changed rows exactly.
                 if valid_ids.len() == ids.len()
-                    && ids.iter().all(|id| !self.deleted.contains(id) && self.get_embedding(*id).is_some())
                     && std::fs::read(&path).ok().is_some_and(|b| crate::startup_cache::digest(&b) == checksum) {
-                    if let Ok(index) = TurboQuantIndex::load(&path) {
+                    if let Ok(index) = refresh_pool().install(|| crate::turbo::SearchIndex::load(&path)) {
                         if index.dim() == EMBED_DIM && index.bit_width() == 4 && index.len() == ids.len() {
-                            index.prepare();
+                            refresh_pool().install(|| index.prepare());
                             if let Some(query) = ids.first().and_then(|id| self.get_embedding(*id)).and_then(normalize) {
                                 refresh_pool().broadcast(|_| { let _ = index.search(&query, 9.min(ids.len())); });
                             }
                             *self.turbo.write() = Some(Arc::new(TurboState { index, ids,
-                                built_at_mutation: self.mutations, built_at: std::time::Instant::now() }));
-                            eprintln!("[chitta-field] Turbo cache hit=true");
+                                built_at_mutation: self.turbo_changed.values().min().map_or(self.mutations, |m| m.saturating_sub(1)),
+                                built_at: std::time::Instant::now(), startup_delta: !self.turbo_changed.is_empty() }));
+                            eprintln!("[chitta-field] Turbo cache hit=true replay_delta={}", self.turbo_changed.len());
                             return;
                         }
                     }
                 }
             }
         }
+        if !self.turbo_changed.is_empty() && snapshot.is_some() {
+            eprintln!("[chitta-field] Turbo cache hit=false reason=corpus_calibration_delta");
+        }
         if let Some(plan) = self.plan_turbo_rebuild(0) { plan.build(); }
-        if let Some((snapshot, key)) = snapshot.zip(key.as_ref()) {
+        if let Some((snapshot, key)) = snapshot.filter(|_| self.turbo_changed.is_empty()).zip(key.as_ref()) {
             if let Some(t) = self.turbo.read().as_ref() {
                 let path = snapshot.with_extension("turbo");
                 let tmp = snapshot.with_extension("turbo.tmp");
@@ -2108,6 +2140,7 @@ impl SemanticIndex {
     /// vector space, so normalize_all()'s count-gated refresh cannot detect they are
     /// geometrically stale. This recomputes them from scratch.
     pub fn force_reindex(&mut self) {
+        self.startup_key = None;
         self.mutations += 1;
         self.invalidate_turbo();
         for embedding in self.embeddings.values_mut() {
@@ -2190,7 +2223,7 @@ impl SemanticIndex {
                 Some((hamming_dist(query_bits, codes.as_slice()), *id))
             })
             .collect();
-        scored.sort_unstable_by_key(|&(d, _)| d);
+        scored.sort_unstable_by_key(|&(d, id)| (d, id));
         scored.truncate(HAMMING_CANDIDATES);
         scored.into_iter().map(|(_, id)| id).collect()
     }
@@ -2455,6 +2488,38 @@ impl SemanticIndex {
         }
         self.invalidate_turbo();
         self.embeddings = map;
+        self.startup_key = Some(Self::snapshot_vector_key(bytes));
+        self.turbo_changed.clear();
+        // Heal absent/old/corrupt caches from the actual snapshot before replay.
+        // Otherwise a busy legacy family would miss forever until checkpoint.
+        if count <= EMB_MMAP_MIN {
+            let cache_path = path.with_extension("lsh");
+            let key = self.startup_key.as_ref().unwrap();
+            let cached: Option<HashMap<MemoryId, (f32, Vec<u16>)>> =
+                crate::startup_cache::load(&cache_path, key);
+            let valid = cached.as_ref().is_some_and(|m| m.len() == self.embeddings.len()
+                && m.iter().all(|(id, (_, sigs))| self.embeddings.contains_key(id)
+                    && sigs.len() == LSH_TABLES
+                    && sigs.iter().all(|s| (*s as usize) < (1 << LSH_BITS))));
+            if !valid {
+                let _phase = crate::profile::LoadPhase::new("lsh_snapshot_cache");
+                if self.lsh_planes.is_empty() { self.lsh_planes = default_lsh_planes(); }
+                // Both fields are serde-skipped. Cache regeneration activates
+                // projections before WAL replay, so its bucket array must exist
+                // before replay upserts try to insert the new signatures.
+                self.lsh_buckets.resize_with(LSH_TABLES, HashMap::new);
+                let rows: HashMap<_, _> = refresh_pool().install(|| self.embeddings.par_iter()
+                    .map(|(&id, v)| {
+                        let norm = l2_norm(v);
+                        let mut unit = v.clone();
+                        if !(norm < 1e-9 || norm == 1.0) { for x in &mut unit { *x /= norm; } }
+                        (id, (norm, self.assign_lsh(&unit)))
+                    }).collect());
+                if let Err(e) = crate::startup_cache::save(&cache_path, key, &rows) {
+                    eprintln!("[chitta-field] optional snapshot LSH cache write failed: {e}");
+                }
+            }
+        }
         eprintln!("[hnsw] load_emb: loaded {} embeddings from sidecar", count);
         true
     }
@@ -2682,9 +2747,9 @@ impl SemanticIndex {
             .map(|(idx, centroid)| (dot(query, centroid), idx as u16))
             .collect();
         let nth = take.saturating_sub(1);
-        scored.select_nth_unstable_by(nth, |a, b| b.0.total_cmp(&a.0));
+        scored.select_nth_unstable_by(nth, |a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         scored.truncate(take);
-        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         scored.into_iter().map(|(_, id)| id).collect()
     }
 
@@ -2703,7 +2768,9 @@ impl SemanticIndex {
             let Some(members) = self.coarse_members.get(coarse_id) else {
                 continue;
             };
-            for &memory_id in members {
+            let mut ordered = members.clone();
+            ordered.sort_unstable();
+            for memory_id in ordered {
                 if self.deleted.contains(&memory_id) {
                     continue;
                 }
@@ -2781,7 +2848,9 @@ impl SemanticIndex {
         let Some(members) = self.lsh_buckets[table_idx].get(&signature) else {
             return;
         };
-        for &memory_id in members {
+        let mut ordered = members.clone();
+        ordered.sort_unstable();
+        for memory_id in ordered {
             if self.deleted.contains(&memory_id) {
                 continue;
             }
@@ -2941,7 +3010,7 @@ fn compute_insert_plan_rows(
             let base = r as usize * EMBED_DIM;
             (dot_i8(emb, &arena[base..base + EMBED_DIM]), r)
         }).collect();
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         scored.truncate(m);
         plan[layer] = scored.iter().map(|(_, r)| *r).collect();
         ep_set = candidates;
@@ -3211,18 +3280,21 @@ pub(crate) struct TurboBuild {
 impl TurboBuild {
     pub(crate) fn build(self) {
         let _phase = crate::profile::LoadPhase::new("turbo");
+        eprintln!("[chitta-field] Turbo rebuild start rows={} mutation={}", self.ids.len(), self.mutation);
         let Ok(mut index) = TurboQuantIndex::new(EMBED_DIM, 4) else { return; };
         if self.ids.is_empty() { return; }
-        index.add(&self.flat);
-        index.prepare();
+        refresh_pool().install(|| {
+            index.add(&self.flat);
+            index.prepare();
+        });
         // Initialize worker threads and any per-thread search scratch before
         // publication. Use a corpus vector, never a benchmark-specific query;
         // this reads the index without updating competitive weights or scores.
         refresh_pool().broadcast(|_| {
             let _ = index.search(&self.flat[..EMBED_DIM], 9.min(self.ids.len()));
         });
-        let built = Arc::new(TurboState { index, ids: self.ids,
-            built_at_mutation: self.mutation, built_at: std::time::Instant::now() });
+        let built = Arc::new(TurboState { index: crate::turbo::SearchIndex::Native(index), ids: self.ids,
+            built_at_mutation: self.mutation, built_at: std::time::Instant::now(), startup_delta: false });
         let mut guard = self.published.write();
         // Protect against an older concurrent maintenance plan winning the swap.
         if self.current_epoch.load(Ordering::Relaxed) == self.epoch
@@ -3342,39 +3414,132 @@ mod startup_cache_tests {
         idx
     }
 
+    fn load_raw(raw: &SemanticIndex, path: &std::path::Path) -> SemanticIndex {
+        raw.save_embeddings_sidecar(&path.with_extension("emb")).unwrap();
+        let mut loaded = SemanticIndex::new();
+        assert!(loaded.load_embeddings_sidecar(&path.with_extension("emb")));
+        loaded
+    }
+
     #[test]
-    fn lsh_cache_preserves_vector_bits_and_rejects_same_count_replacement() {
+    fn deserialized_index_with_missing_lsh_cache_accepts_replay() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.lsh");
-        let raw = raw_index(32);
-        let mut first = raw.clone(); first.normalize_with_cache(Some(&path));
-        let mut second = raw.clone(); second.normalize_with_cache(Some(&path));
-        assert_eq!(first.mem_lsh, second.mem_lsh);
-        for (&id, input) in &raw.embeddings {
-            let mut expected = input.clone();
-            let norm = l2_norm(&expected);
-            for x in &mut expected { *x /= norm; }
-            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-            assert_eq!(bits(&expected), bits(&second.embeddings[&id]));
+        let path = dir.path().join("test.snapshot");
+        let raw = raw_index(2001);
+        raw.save_embeddings_sidecar(&path.with_extension("emb")).unwrap();
+        let mut replayed: SemanticIndex = bincode::deserialize(&bincode::serialize(&raw).unwrap()).unwrap();
+        assert!(replayed.lsh_planes.is_empty() && replayed.lsh_buckets.is_empty());
+        assert!(replayed.load_embeddings_sidecar(&path.with_extension("emb")));
+        replayed.set_inhibit_hnsw(true);
+        replayed.upsert(3000, vec![0.1; EMBED_DIM], None);
+        replayed.normalize_with_cache(Some(&path.with_extension("lsh")));
+        assert!(replayed.contains(3000));
+        assert_eq!(replayed.mem_lsh[&3000].len(), LSH_TABLES);
+        for (table, signature) in replayed.mem_lsh[&3000].iter().enumerate() {
+            assert!(replayed.lsh_buckets[table][signature].contains(&3000));
         }
-        let mut changed = raw.clone();
-        changed.embeddings.get_mut(&0).unwrap()[10] = 9.0;
-        changed.normalize_with_cache(Some(&path));
-        assert_ne!(first.startup_vector_key(), changed.startup_vector_key());
+    }
+
+    #[test]
+    fn lsh_cache_plus_replayed_delta_matches_full_rebuild_bitwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.snapshot");
+        let mut base = load_raw(&raw_index(2001), &path);
+        base.normalize_with_cache(Some(&path.with_extension("lsh")));
+        let mut replayed = SemanticIndex::new();
+        assert!(replayed.load_embeddings_sidecar(&path.with_extension("emb")));
+        replayed.set_inhibit_hnsw(true);
+        for id in 1900..2201 {
+            let mut v = raw_index(1).embeddings.remove(&0).unwrap();
+            v[id as usize % EMBED_DIM] = 0.827;
+            replayed.upsert(id, v, None);
+        }
+        replayed.remove(17);
+        let mut full = replayed.clone();
+        full.normalize_all();
+        replayed.normalize_with_cache(Some(&path.with_extension("lsh")));
+        assert_eq!(full.mem_lsh, replayed.mem_lsh);
+        for (&id, vector) in &full.embeddings {
+            assert_eq!(vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                replayed.embeddings[&id].iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+        let mut changed_raw = raw_index(2001);
+        changed_raw.embeddings.get_mut(&0).unwrap()[10] = 0.82;
+        let mut changed = load_raw(&changed_raw, &path);
+        assert_ne!(base.startup_key, changed.startup_key);
+        changed.normalize_with_cache(Some(&path.with_extension("lsh")));
         assert_eq!(changed.mem_lsh[&0], changed.assign_lsh(&changed.embeddings[&0]));
-        // A missing/corrupt optional file always follows the existing rebuild path.
-        std::fs::write(&path, b"truncated").unwrap();
-        let mut rebuilt = raw; rebuilt.normalize_with_cache(Some(&path));
-        assert_eq!(first.mem_lsh, rebuilt.mem_lsh);
+        std::fs::write(path.with_extension("lsh"), b"truncated").unwrap();
+        let mut rebuilt = load_raw(&raw_index(2001), &path);
+        rebuilt.normalize_with_cache(Some(&path.with_extension("lsh")));
+        assert_eq!(base.mem_lsh, rebuilt.mem_lsh);
+    }
+
+    fn turbo_rows(index: &TurboState, path: &std::path::Path) -> (HashMap<MemoryId, Vec<u8>>, Vec<u8>) {
+        index.index.write(path).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[..6], b"TVPI\x03\x04");
+        let row_bytes = EMBED_DIM / 2;
+        let scale_offset = 14 + index.ids.len() * row_bytes;
+        let rows = index.ids.iter().enumerate().map(|(row, &id)| {
+            let mut value = bytes[14 + row * row_bytes..14 + (row + 1) * row_bytes].to_vec();
+            value.extend_from_slice(&bytes[scale_offset + row * 4..scale_offset + (row + 1) * 4]);
+            (id, value)
+        }).collect();
+        (rows, bytes[scale_offset + index.ids.len() * 4..].to_vec())
+    }
+
+    #[test]
+    fn turbo_replayed_delta_preserves_full_rebuild_rows_and_calibration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.snapshot");
+        let mut base = load_raw(&raw_index(2001), &path);
+        base.normalize_with_cache(Some(&path.with_extension("lsh")));
+        base.warm_turbo_with_cache(Some(&path));
+        let mut replayed = SemanticIndex::new();
+        assert!(replayed.load_embeddings_sidecar(&path.with_extension("emb")));
+        replayed.set_inhibit_hnsw(true);
+        for id in 1900..2201 {
+            let mut v = vec![0.013; EMBED_DIM];
+            v[id as usize % EMBED_DIM] = 0.827;
+            replayed.upsert(id, v, None);
+        }
+        replayed.remove(17);
+        replayed.normalize_with_cache(Some(&path.with_extension("lsh")));
+        let mut full = replayed.clone();
+        full.turbo = Arc::new(RwLock::new(None));
+        full.warm_turbo_with_cache(None);
+        replayed.warm_turbo_with_cache(Some(&path));
+        let snapshot = replayed.turbo.read().clone().unwrap();
+        assert!(snapshot.startup_delta);
+        assert_eq!(snapshot.ids, base.turbo.read().as_ref().unwrap().ids);
+        // Even an arbitrarily high mutation threshold cannot delay startup work.
+        let plan = replayed.plan_turbo_rebuild(u64::MAX).unwrap();
+        let query = replayed.get_embedding(2200).unwrap().to_vec();
+        let hits = replayed.search(&query, 10, None, None);
+        assert!(hits.iter().any(|h| h.memory_id == 2200));
+        assert!(!hits.iter().any(|h| h.memory_id == 17));
+        // Search can complete while the maintenance plan is outstanding.
+        assert!(Arc::ptr_eq(&snapshot, replayed.turbo.read().as_ref().unwrap()));
+        plan.build();
+        replayed.prune_turbo_changes();
+        assert!(replayed.plan_turbo_rebuild(u64::MAX).is_none());
+        let expected = turbo_rows(full.turbo.read().as_ref().unwrap(), &dir.path().join("full.tv"));
+        assert_eq!(expected,
+            turbo_rows(replayed.turbo.read().as_ref().unwrap(), &dir.path().join("cached.tv")));
+        let snapshot_rows = turbo_rows(base.turbo.read().as_ref().unwrap(), &dir.path().join("base.tv"));
+        assert_ne!(snapshot_rows.1, expected.1,
+            "TQ+ calibration changes with the corpus: blindly appending cannot preserve rebuild bits");
     }
 
     #[test]
     fn turbo_cache_preserves_rows_scores_and_rejects_changed_vectors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.snapshot");
-        let first = raw_index(2001);
+        let first = load_raw(&raw_index(2001), &path);
         first.warm_turbo_with_cache(Some(&path));
-        let second = raw_index(2001);
+        let mut second = SemanticIndex::new();
+        assert!(second.load_embeddings_sidecar(&path.with_extension("emb")));
         second.warm_turbo_with_cache(Some(&path));
         let a = first.turbo.read(); let b = second.turbo.read();
         let a = a.as_ref().unwrap(); let b = b.as_ref().unwrap();
@@ -3386,7 +3551,8 @@ mod startup_cache_tests {
                    y.scores_for_query(0).iter().map(|x| x.to_bits()).collect::<Vec<_>>());
         let mut changed = raw_index(2001);
         changed.embeddings.get_mut(&0).unwrap()[7] = 0.82;
-        assert_ne!(first.startup_vector_key(), changed.startup_vector_key());
+        let changed = load_raw(&changed, &path);
+        assert_ne!(first.startup_key, changed.startup_key);
         changed.warm_turbo_with_cache(Some(&path));
         assert!(changed.turbo.read().is_some());
     }

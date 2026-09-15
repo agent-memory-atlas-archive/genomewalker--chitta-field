@@ -972,12 +972,29 @@ pub extern "C" fn cf_get_content(
     buf_cap: usize,
     written: *mut usize,
 ) -> c_int {
+    get_content_impl(h, memory_id, buf, buf_cap, written, true)
+}
+
+/// Read-only payload hydration, including buffer-size probes and retries.
+#[no_mangle]
+pub extern "C" fn cf_peek_content(
+    h: *mut CfHandle,
+    memory_id: u64,
+    buf: *mut u8,
+    buf_cap: usize,
+    written: *mut usize,
+) -> c_int {
+    get_content_impl(h, memory_id, buf, buf_cap, written, false)
+}
+
+fn get_content_impl(h: *mut CfHandle, memory_id: u64, buf: *mut u8,
+    buf_cap: usize, written: *mut usize, touch: bool) -> c_int {
     if h.is_null() || buf.is_null() || written.is_null() {
         return -1;
     }
     let handle = unsafe { &*h };
 
-    match handle.field.get_memory(memory_id) {
+    match if touch { handle.field.get_memory(memory_id) } else { handle.field.peek_memory(memory_id) } {
         Ok(payload) => {
             let content = &payload.content;
             // Require room for the trailing NUL the contract promises.
@@ -1071,7 +1088,7 @@ pub extern "C" fn cf_get_kind(
     }
     let handle = unsafe { &*h };
 
-    match handle.field.get_memory(memory_id) {
+    match handle.field.peek_memory(memory_id) {
         Ok(payload) => {
             let bytes = payload.kind.as_bytes();
             if bytes.len() >= buf_cap {
@@ -1100,7 +1117,7 @@ pub extern "C" fn cf_get_realm(
     }
     let handle = unsafe { &*h };
 
-    match handle.field.get_memory(memory_id) {
+    match handle.field.peek_memory(memory_id) {
         Ok(payload) => {
             let bytes = payload.realm.as_bytes();
             if bytes.len() >= buf_cap {
@@ -10283,6 +10300,36 @@ pub extern "C" fn cf_wal_status(h: *const CfHandle) -> *mut c_char {
 #[cfg(test)]
 mod read_maintenance_tests {
     use super::*;
+
+    #[test]
+    fn recall_hydration_never_schedules_accesses_including_buffer_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let h = cf_open(path.as_ptr(), std::ptr::null());
+        assert!(!h.is_null());
+        let field = &unsafe { &*h }.field;
+        let embedding = vec![0.1; crate::ops::EMBED_DIM];
+        let id = field.put_memory("wisdom", "test", b"hydration", &embedding,
+            1.0, 0.001, 0, vec![], None, None).unwrap().0;
+        let seq = field.log.read().last_seqno();
+        for _ in 0..8 {
+            let mut hits = vec![unsafe { std::mem::zeroed::<CfRecallHit>() }; 4];
+            let mut n = 0;
+            assert_eq!(cf_recall_semantic(h, embedding.as_ptr(), embedding.len(),
+                std::ptr::null(), 4, hits.as_mut_ptr(), 4, &mut n, true), 0);
+            assert_eq!(n, 1);
+            let mut buf = [0u8; 128]; let mut written = 0;
+            assert_eq!(cf_peek_content(h, id, buf.as_mut_ptr(), 1, &mut written), -2);
+            assert_eq!(cf_peek_content(h, id, buf.as_mut_ptr(), buf.len(), &mut written), 0);
+            assert_eq!(cf_get_kind(h, id, buf.as_mut_ptr(), buf.len()), 0);
+            assert_eq!(cf_get_realm(h, id, buf.as_mut_ptr(), buf.len()), 0);
+            assert!(field.pending_touches.lock().is_empty());
+            field.drain_pending_touches().unwrap();
+            assert_eq!(field.get_state(id).unwrap().access_count, 0);
+            assert_eq!(field.log.read().last_seqno(), seq);
+        }
+        cf_close(h);
+    }
 
     #[test]
     fn ffi_worker_drains_touches_and_syncs_without_a_queue() {
