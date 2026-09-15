@@ -33,10 +33,7 @@ thread_local! {
 pub struct CfHandle {
     field: std::sync::Arc<ChittaField>,
     maintenance: Vec<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
-    /// Analogy lane index — derived from the triplet store, never persisted.
-    /// Handle-scoped rather than a process global so two open fields (tests,
-    /// migrations) cannot read each other's signatures.
-    analogy: parking_lot::RwLock<crate::analogy::AnalogyIndex>,
+
 }
 
 impl CfHandle {
@@ -178,7 +175,7 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                     }
                 }
             }
-            Box::into_raw(Box::new(CfHandle { field, maintenance, analogy: Default::default() }))
+            Box::into_raw(Box::new(CfHandle { field, maintenance }))
         },
         Err(_) => std::ptr::null_mut(),
     }
@@ -10056,169 +10053,57 @@ pub extern "C" fn cf_span_query(
     }
 }
 
-/// Analogical recall over the triplet lane (VSA). JSON in, JSON out.
-///
-///   in  {"mode":"proportional","a":"paris","b":"france","c":"tokyo","limit":8}
-///       {"mode":"structural","memory_id":123,"cross_realm":true,"limit":8}
-///       {"mode":"structural","text":"...","realm":"cc-soul","limit":8}
-///   out {"mode":..,"indexed":N,"results":[{"id","score","text","realm",..}]}
-///
-/// Free with cf_free_string.
+/// Directed relation transfer. JSON retains mode/indexed/results; reason is
+/// null on success, no_source_relation/no_target_relation on abstention.
+/// Each result includes all supporting target edges; relations cites a→b.
+/// Free with cf_free_string. Errors are JSON so wrappers preserve explanations.
 #[no_mangle]
 pub extern "C" fn cf_recall_analogy(h: *const CfHandle, json_in: *const c_char) -> *mut c_char {
-    if h.is_null() {
-        return json_null("cf_recall_analogy: null argument");
-    }
+    let reply = |body: serde_json::Value| CString::new(body.to_string()).unwrap().into_raw();
+    let error = |reason: &str| reply(serde_json::json!({"error": reason}));
+    if h.is_null() || json_in.is_null() { return error("recall_analogy: null argument"); }
     let handle = unsafe { &*h };
-    let args: serde_json::Value = if json_in.is_null() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        match unsafe { CStr::from_ptr(json_in) }.to_str().ok()
-            .and_then(|s| serde_json::from_str(s).ok()) {
-            Some(v) => v,
-            None => return json_null("cf_recall_analogy: bad json"),
-        }
+    let args: serde_json::Value = match unsafe { CStr::from_ptr(json_in) }.to_str().ok()
+        .and_then(|s| serde_json::from_str(s).ok()) {
+        Some(v) => v, None => return error("recall_analogy: bad JSON"),
     };
-    let mode = args["mode"].as_str().unwrap_or("structural").to_string();
+    if args["mode"].as_str().unwrap_or("proportional") != "proportional" {
+        return error("recall_analogy supports proportional mode only; use query_graph for graph queries");
+    }
+    let a = args["a"].as_str().unwrap_or("");
+    let b = args["b"].as_str().unwrap_or("");
+    let c = args["c"].as_str().unwrap_or("");
+    if [a, b, c].iter().any(|s| s.trim().is_empty()) {
+        return error("proportional mode needs a, b and c (a:b :: c:?)");
+    }
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 100) as usize;
-    let fact_limit = args["fact_limit"].as_u64().unwrap_or(10_000).clamp(1, 50_000) as usize;
-
-    // Copy the lane out first: every hypervector op below runs off the store locks.
-    // `meta` is id -> realm only; payload text is fetched per mode via
-    // `analogy_texts` once the result set has been cut down to `limit`.
-    let (facts, meta, triplet_count) = handle.field.analogy_snapshot(fact_limit);
-    let reply = |mode: &str, indexed: usize, results: Vec<serde_json::Value>| -> *mut c_char {
-        let body = serde_json::json!({ "mode": mode, "indexed": indexed, "results": results });
-        match CString::new(body.to_string()) {
-            Ok(s) => s.into_raw(),
-            Err(e) => json_null(format!("cf_recall_analogy: {e}")),
-        }
+    let mut transfer = {
+        let store = handle.field.triplet_store.read();
+        crate::analogy::proportional(&store, a, b, c, crate::store::now_ms())
     };
-    if facts.is_empty() {
-        return reply(&mode, 0, Vec::new());
-    }
-
-    // Build only the half the mode reads, and re-check staleness under the write
-    // guard: two callers can each observe a stale index through the read guard,
-    // and rebuilding a live store twice is pure waste while the RPC mutex is held.
-    let ensure_table = || {
-        if handle.analogy.read().is_table_stale(triplet_count) {
-            let mut w = handle.analogy.write();
-            if w.is_table_stale(triplet_count) {
-                w.rebuild_table(&facts, triplet_count);
-            }
-        }
-    };
-    let ensure_signatures = || {
-        if handle.analogy.read().is_stale(triplet_count) {
-            let mut w = handle.analogy.write();
-            if w.is_stale(triplet_count) {
-                w.rebuild_signatures(&facts, triplet_count);
-            }
-        }
-    };
-
-    match mode.as_str() {
-        "proportional" => {
-            let a = args["a"].as_str().unwrap_or("");
-            let b = args["b"].as_str().unwrap_or("");
-            let c = args["c"].as_str().unwrap_or("");
-            if a.is_empty() || b.is_empty() || c.is_empty() {
-                return json_null("cf_recall_analogy: proportional needs a, b and c");
-            }
-            ensure_table();
-            let idx = handle.analogy.read();
-            let hits = idx.proportional(a, b, c, limit);
-            let indexed = idx.table().len();
-            drop(idx);
-            // `hits` is already cut to `limit`; fetch text for just those ids.
-            let ids: Vec<u64> = hits.iter().filter_map(|hit| hit.memory_id).collect();
-            let texts = handle.field.analogy_texts(&ids);
-            let results = hits
-                .into_iter()
-                .map(|hit| {
-                    let realm: String = hit
-                        .memory_id
-                        .and_then(|id| meta.get(&id).cloned())
-                        .unwrap_or_default();
-                    let text: String = hit
-                        .memory_id
-                        .and_then(|id| texts.get(&id).cloned())
-                        .unwrap_or_default();
-                    serde_json::json!({
-                        "id": hit.memory_id.unwrap_or(0),
-                        "score": hit.score,
-                        "answer": hit.answer,
-                        "predicate": hit.predicate,
-                        "realm": realm,
-                        "text": text,
-                    })
-                })
-                .collect();
-            reply("proportional", indexed, results)
-        }
-        "structural" => {
-            ensure_table();
-            ensure_signatures();
-            let idx = handle.analogy.read();
-            let (probe, exclude) = match args["memory_id"].as_u64() {
-                Some(mid) if mid > 0 => match idx.signature_of(mid) {
-                    Some(hv) => (hv, Some(mid)),
-                    None => return json_null("cf_recall_analogy: memory has no triplets to shape a probe"),
-                },
-                _ => {
-                    let text = args["text"].as_str().unwrap_or("");
-                    if text.is_empty() {
-                        return json_null("cf_recall_analogy: structural needs memory_id or text");
-                    }
-                    match crate::analogy::signature(&crate::analogy::facts_for_text(&facts, text)) {
-                        Some(hv) => (hv, None),
-                        None => return reply("structural", idx.len(), Vec::new()),
-                    }
-                }
-            };
-            let realm = args["realm"].as_str().unwrap_or("");
-            let mut exclude_realm = args["exclude_realm"].as_str().unwrap_or("").to_string();
-            if exclude_realm.is_empty() && args["cross_realm"].as_bool().unwrap_or(false) {
-                exclude_realm = exclude
-                    .and_then(|id| meta.get(&id).cloned())
-                    .unwrap_or_default();
-            }
-            // Over-fetch before the realm filter so a scoped query still fills `limit`.
-            // Rank and realm-filter on ids alone, then fetch payload text for the
-            // <= `limit` survivors — the realm filter can discard most of the
-            // over-fetch, so fetching text before it would be wasted copying.
-            let ranked: Vec<(u64, f32)> = idx
-                .rank(&probe, exclude, limit.saturating_mul(8))
-                .into_iter()
-                .filter(|(id, _)| {
-                    let r = meta.get(id).map(String::as_str).unwrap_or("");
-                    if !realm.is_empty() && r != realm {
-                        return false;
-                    }
-                    if !exclude_realm.is_empty() && r == exclude_realm {
-                        return false;
-                    }
-                    true
-                })
-                .take(limit)
-                .collect();
-            let indexed = idx.len();
-            drop(idx);
-            let ids: Vec<u64> = ranked.iter().map(|(id, _)| *id).collect();
-            let texts = handle.field.analogy_texts(&ids);
-            let results = ranked
-                .into_iter()
-                .map(|(id, score)| {
-                    let r = meta.get(&id).cloned().unwrap_or_default();
-                    let text = texts.get(&id).cloned().unwrap_or_default();
-                    serde_json::json!({ "id": id, "score": score, "realm": r, "text": text })
-                })
-                .collect();
-            reply("structural", indexed, results)
-        }
-        other => json_null(format!("cf_recall_analogy: unknown mode '{other}'")),
-    }
+    transfer.rank(limit);
+    let edge_json = |e: &crate::organ::triplet::TripletEntry| serde_json::json!({
+        "subject": e.subject, "predicate": e.predicate, "object": e.object,
+        "memory_id": e.source_memory_id, "triplet_id": e.id,
+        "weight": if e.weight.is_finite() { e.weight } else { 0.0 },
+        "valid_from_ms": e.valid_from_ms,
+    });
+    let relations: Vec<_> = transfer.relations.iter().map(&edge_json).collect();
+    let results: Vec<_> = transfer.results.iter().map(|edges| {
+        let best = &edges[0];
+        let payload = best.source_memory_id.and_then(|id| handle.field.get_memory(id).ok());
+        let support: Vec<_> = edges.iter().map(&edge_json).collect();
+        serde_json::json!({
+            "id": best.source_memory_id.unwrap_or(0),
+            "score": if best.weight.is_finite() { best.weight } else { 0.0 },
+            "answer": best.object, "predicate": best.predicate,
+            "realm": payload.as_ref().map(|p| p.realm.as_str()).unwrap_or(""),
+            "text": payload.as_ref().map(|p| String::from_utf8_lossy(&p.content).into_owned()).unwrap_or_default(),
+            "edges": support,
+        })
+    }).collect();
+    reply(serde_json::json!({"mode": "proportional", "indexed": transfer.indexed,
+        "results": results, "reason": transfer.reason, "relations": relations}))
 }
 
 /// Forward edge: verbatim atoms a recalled memory references. JSON array of
