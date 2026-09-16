@@ -174,12 +174,30 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::F
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    // Two attempts: the second runs only after a provably stale lock file
-    // (same host, holder pid gone) has been replaced. On NFSv3 a daemon killed
-    // mid-snapshot (2026-09-15, TimeoutStopSec=30) left a server-side lock on
-    // the old inode that no process owned; 49 restarts failed until the file
-    // was renamed by hand. A holder on another host is never overridden.
-    for attempt in 0..2 {
+    // A provably stale lock file (same host, holder pid gone) is replaced at
+    // once. On NFSv3 a daemon killed mid-snapshot (2026-09-15, TimeoutStopSec=30)
+    // left a server-side lock on the old inode that no process owned; 49
+    // restarts failed until the file was renamed by hand.
+    //
+    // A LIVE holder is waited for, up to CHITTA_STORE_LOCK_WAIT_S (default 45 s,
+    // 0 = fail at once), polling every 250 ms: the previous instance on this
+    // host is usually still finishing its shutdown snapshot, and on 2026-09-16
+    // chittad units on other login nodes (shared home) retried the lock every
+    // 10 s and took it the instant a restart here released it. Polling at
+    // 250 ms wins that race; a holder on another host is never overridden.
+    // Unit tests open a directory twice on purpose and must not wait.
+    #[cfg(test)]
+    const DEFAULT_LOCK_WAIT_S: u64 = 0;
+    #[cfg(not(test))]
+    const DEFAULT_LOCK_WAIT_S: u64 = 45;
+    let wait = std::env::var("CHITTA_STORE_LOCK_WAIT_S")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LOCK_WAIT_S);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    let mut replaced_stale = false;
+    let mut warned = false;
+    loop {
         let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path)?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
@@ -187,6 +205,9 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::F
             let _ = file.seek(std::io::SeekFrom::Start(0));
             let _ = writeln!(file, "{} {}", std::process::id(), hostname);
             let _ = file.sync_all();
+            if warned {
+                eprintln!("[chitta-field] instance lock {} acquired after waiting", path.display());
+            }
             return Ok(Some(file));
         }
         let err = std::io::Error::last_os_error();
@@ -200,7 +221,7 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::F
         let mut parts = holder.split_whitespace();
         let holder_pid: Option<u32> = parts.next().and_then(|p| p.parse().ok());
         let holder_host = parts.next().unwrap_or("");
-        let stale = attempt == 0
+        let stale = !replaced_stale
             && !hostname.is_empty()
             && holder_host == hostname
             && holder_pid.map(|pid| unsafe { libc::kill(pid as i32, 0) } != 0
@@ -212,17 +233,30 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::F
                 path.display(), holder_pid.unwrap_or(0)
             );
             let _ = std::fs::remove_file(&path);
+            replaced_stale = true;
+            continue;
+        }
+        let holder_text = if holder.trim().is_empty() { "unknown".to_string() } else { holder.trim().to_string() };
+        if std::time::Instant::now() < deadline {
+            if !warned {
+                eprintln!(
+                    "[chitta-field] instance lock {} held by {}; waiting up to {} s",
+                    path.display(), holder_text, wait
+                );
+                warned = true;
+            }
+            drop(file);
+            std::thread::sleep(std::time::Duration::from_millis(250));
             continue;
         }
         return Err(FieldError::Io(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             format!(
                 "another chitta-field instance holds {} (recorded holder: {}) — refusing to open the same store twice",
-                path.display(), if holder.trim().is_empty() { "unknown" } else { holder.trim() }
+                path.display(), holder_text
             ),
         )));
     }
-    unreachable!("instance lock: two attempts exhausted")
 }
 
 pub struct ChittaField {
