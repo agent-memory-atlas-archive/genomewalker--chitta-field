@@ -2666,3 +2666,83 @@ pub(crate) fn apply_access_delta(state: &mut MemoryState, delta: &crate::ops::St
         state.access_timestamps.drain(..state.access_timestamps.len() - 16);
     }
 }
+
+#[cfg(test)]
+mod chaos_tests {
+    use super::*;
+    use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("chitta-chaos-{}-{}", std::process::id(), tag));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn chaos_lock_fences_live_and_foreign_holders_reclaims_dead_local() {
+        assert_ne!(std::env::var("CHITTA_STORE_LOCK").ok().as_deref(), Some("0"));
+        let tmp = Scratch::new("lock");
+        let path = tmp.0.join(".instance.lock");
+        let held = acquire_instance_lock(&tmp.0).unwrap().unwrap();
+        let error = acquire_instance_lock(&tmp.0).unwrap_err().to_string();
+        assert!(error.contains("recorded holder:"), "{error}");
+        assert!(error.contains(&std::process::id().to_string()), "{error}");
+        drop(held);
+        // Hold the inode to model the NFS server retaining a departed holder's lock.
+        let held = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let old_inode = held.metadata().unwrap().ino();
+        let dead = std::process::Command::new("/bin/true").spawn().unwrap().wait_with_output().unwrap();
+        assert!(dead.status.success());
+        // Linux reserves pid_max; it cannot name a living process.
+        let dead_pid: i32 = std::fs::read_to_string("/proc/sys/kernel/pid_max").unwrap().trim().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(dead_pid, 0) }, -1);
+        std::fs::write(&path, format!("{} another-host.invalid\n", dead_pid)).unwrap();
+        let error = acquire_instance_lock(&tmp.0).unwrap_err().to_string();
+        assert!(error.contains("another-host.invalid"), "{error}");
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), old_inode);
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        std::fs::write(&path, format!("{} {}", dead_pid, host)).unwrap();
+        let recovered = acquire_instance_lock(&tmp.0).unwrap().unwrap();
+        assert_ne!(recovered.metadata().unwrap().ino(), old_inode);
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with(&format!("{} ", std::process::id())));
+    }
+
+    #[test]
+    fn chaos_partial_snapshot_preserves_acknowledged_prefix_and_replay() {
+        let tmp = Scratch::new("snapshot");
+        let mut ids = Vec::new();
+        {
+            let field = ChittaField::open(tmp.0.clone()).unwrap();
+            for n in 0..3 {
+                let text = format!("chaos durable prefix {n}");
+                let (id, _) = field.put_memory("wisdom", "chaos", text.as_bytes(), &[],
+                    0.9, 0.001, 0, vec![], None, None).unwrap();
+                ids.push((id, text));
+            }
+            field.flush().unwrap();
+            field.save_full_snapshot().unwrap();
+            let text = "chaos acknowledged WAL suffix";
+            let (id, _) = field.put_memory("wisdom", "chaos", text.as_bytes(), &[],
+                0.9, 0.001, 0, vec![], None, None).unwrap();
+            ids.push((id, text.to_string()));
+            field.flush().unwrap();
+        }
+        // A killed save leaves unpublished temporary files, not a new manifest.
+        std::fs::write(tmp.0.join("chitta.deadbeef.snapshot.tmp"), b"partial snapshot").unwrap();
+        std::fs::write(tmp.0.join("MANIFEST.1.tmp"), b"partial manifest").unwrap();
+        for _ in 0..2 {
+            let field = ChittaField::open(tmp.0.clone()).unwrap();
+            for (id, text) in &ids {
+                assert_eq!(field.get_memory(*id).unwrap().content, text.as_bytes());
+            }
+            assert_eq!(field.payloads.read().len(), ids.len());
+        }
+    }
+}

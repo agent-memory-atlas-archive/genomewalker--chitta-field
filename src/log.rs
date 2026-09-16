@@ -1030,6 +1030,28 @@ mod tests {
         segs.pop().unwrap()
     }
 
+    #[test]
+    fn chaos_unlinked_segment_recovers_durable_suffix() {
+        let tmp = ScratchDir::new("unlinked-segment");
+        let mut log = OpLog::open(tmp.path(), 0x7788, 0).unwrap();
+        log.append(&make_op(1)).unwrap();
+        log.sync().unwrap();
+        fs::remove_file(&log.current_segment_path).unwrap();
+        for id in 2..=8 { log.append(&make_op(id)).unwrap(); }
+        log.sync().unwrap();
+        assert_eq!(log.recovery_count(), 1);
+        drop(log);
+        let mut reopened = OpLog::open(tmp.path(), 0x8899, 0).unwrap();
+        for _ in 0..2 {
+            let mut seen = Vec::new();
+            reopened.replay(0, |_, _, op| {
+                if let Op::UpdateState(s) = op { seen.push(s.memory_id); }
+                Ok(())
+            }).unwrap();
+            assert_eq!(seen, (2..=8).collect::<Vec<_>>());
+        }
+    }
+
     // Power loss mid-append leaves an incomplete final record. Replay must
     // recover every committed op, truncate the torn tail, and keep the store
     // openable — a torn tail must never brick startup.
