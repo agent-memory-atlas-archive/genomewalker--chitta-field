@@ -18,6 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod analogy;
+pub mod anchors;
 pub mod binary;
 pub mod contradiction;
 pub mod error;
