@@ -102,6 +102,7 @@ impl ScoringPipeline {
             Box::new(ACTRActivationFactor),
             Box::new(StrengthFactor),
             Box::new(ConfidenceFactor),
+            Box::new(ReplicationFactor),
             Box::new(SurpriseFactor),
             Box::new(ArousalFactor),
             Box::new(MoodCongruenceFactor),
@@ -204,5 +205,32 @@ mod kind_tests {
         assert!(k("operational") < k("correction"));
         assert!(k("operational") < k("signal"));
         assert!(k("operational") > k("episode"));
+    }
+}
+
+#[cfg(test)]
+mod replication_envelope_tests {
+    use super::*;
+    #[test]
+    fn independent_evidence_only_modulates_secondary_envelope() {
+        let mut state = MemoryState::new(1, [0; 32], 0);
+        state.replication_count = 3;
+        let ctx = ScoringContext {
+            relevance_score: 0.5, recall_mode: RecallMode::Semantic,
+            state: &state, kind: "wisdom", realm: "test", realm_reliability: 1.0,
+            now_ms: 1, query_valence: None, query_arousal: None, prediction_prob: None,
+            surprise_role: None, has_open_debt: false, integration_weight: None,
+            ack_score: 0, max_query_idf: 0.0,
+        };
+        let mut config = ScoringConfig::default();
+        config.replication_max = 1.15;
+        let mut pipeline = ScoringPipeline {
+            factors: vec![Box::new(factors::RelevanceFactor), Box::new(factors::ReplicationFactor)],
+            config,
+        };
+        let boosted = pipeline.score(&ctx).unwrap().0;
+        pipeline.config.replication_max = 0.0;
+        let neutral = pipeline.score(&ctx).unwrap().0;
+        assert!((boosted / neutral - 1.045).abs() < 1e-6);
     }
 }

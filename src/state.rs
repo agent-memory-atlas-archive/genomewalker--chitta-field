@@ -165,6 +165,10 @@ pub struct MemoryState {
     pub utility_alpha: f32,
     #[serde(skip)]
     pub utility_beta: f32,
+
+    /// Derived from durable session provenance after load; never changes snapshot layout.
+    #[serde(skip)]
+    pub replication_count: u32,
 }
 
 fn default_true() -> bool { true }
@@ -202,6 +206,7 @@ impl MemoryState {
             last_cw_refresh_ms: 0,
             utility_alpha: 1.0,
             utility_beta: 1.0,
+            replication_count: 1,
         }
     }
 

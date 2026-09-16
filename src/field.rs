@@ -1505,6 +1505,7 @@ impl ChittaField {
             idx
         };
         eprintln!("[chitta-field] task_key_idx rebuilt: {} keyed task-state entries", task_key_idx.len());
+        crate::replication::rebuild(&payloads, &triplet_store, &mut states);
         Ok(Self {
             instance_lock,
             data_dir,
@@ -1829,6 +1830,7 @@ impl ChittaField {
             apply_op(op, ctx.reborrow());
         }
 
+        crate::replication::rebuild(&payloads, &triplet_store, &mut states);
         if count > 0 {
             self.persist_seen_offsets();
             self.pld_mutations
