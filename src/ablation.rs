@@ -209,6 +209,19 @@ mod store_tests {
             time_scope: crate::organ::observer::TimeScope::Current,
             confidence: 1.0, source_id: 7, valid_from: 1000, valid_to: None,
         }, 1000);
+        field.turiya_monitor.write().sample(1000, &field.cdawg.read(), &field.event_tape.read(),
+            &field.refutation_ledger.read(), &field.hypothesis_market.read(), &field.fep_prior.read());
+        field.interaction_ledger.write().append(crate::organ::interaction_ledger::InteractionEvent {
+            event_id: 0, ts_ms: 1000, session_id: "rollback".into(), thread_id: None,
+            kind: crate::organ::interaction_ledger::EventKind::Inject,
+            payload: crate::organ::interaction_ledger::EventPayload::Inject { memory_ids: vec![7], token_budget: 100 },
+            causal_parent: None, observation_mode: crate::organ::interaction_ledger::ObsMode::Live,
+        });
+        field.predicate_store.write().attach(7, "true".into(), 1000);
+        field.msg_registry.write().insert(crate::organ::msg::MsgEvent {
+            event_id: 7, domain: "session".into(), kind: "register".into(),
+            target: "rollback".into(), payload_json: "{}".into(), realm: "test".into(), ts_ms: 1000,
+        });
         field.save_full_snapshot().unwrap();
         let original = crate::snapshot::FullSnapshot::load(&dir.path().join(format!("chitta.{:08x}.snapshot", field.instance_id))).unwrap();
         drop(field);
@@ -216,6 +229,10 @@ mod store_tests {
         assert!(field.event_tape.read().events.is_empty());
         assert!(field.decision_tape.read().points.is_empty());
         assert!(field.observer_state.read().current_facts().is_empty());
+        assert!(field.turiya_monitor.read().samples.is_empty());
+        assert!(field.interaction_ledger.read().events.is_empty());
+        assert!(field.predicate_store.read().for_memory(7).is_empty());
+        assert!(field.msg_registry.read().ledger_session_events().is_empty());
         field.event_tape.write().log("discarded", "rollback", 1, 7, 2000);
         field.decision_tape.write().log(9, 9, vec![], 0.0, 2000);
         field.save_full_snapshot().unwrap();
