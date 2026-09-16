@@ -2,6 +2,26 @@
 
 use super::*;
 
+// Evaluation clock for recall only: never change WAL, access or write timestamps.
+fn parse_recall_now(value: Option<&str>) -> Option<i64> {
+    value?.parse::<i64>().ok().filter(|now| *now > 0)
+}
+
+fn recall_now_ms() -> i64 {
+    static FIXED: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    FIXED.get_or_init(|| parse_recall_now(std::env::var("CHITTA_RECALL_NOW").ok().as_deref()))
+        .unwrap_or_else(super::now_ms)
+}
+
+#[cfg(test)]
+#[test]
+fn evaluation_recall_clock_accepts_only_positive_unix_milliseconds() {
+    assert_eq!(parse_recall_now(Some("1789560000123")), Some(1789560000123));
+    for value in [None, Some(""), Some("0"), Some("-1"), Some("123oops"), Some("99999999999999999999")] {
+        assert_eq!(parse_recall_now(value), None);
+    }
+}
+
 impl ChittaField {
 
     pub(super) fn enqueue_recall_effects(&self, hit_ids: &[MemoryId]) {
@@ -206,7 +226,7 @@ impl ChittaField {
             });
         }
 
-        let now = now_ms();
+        let now = recall_now_ms();
         // Realm-filtered HNSW traversal needs a wider beam: with an allowed-set
         // the graph skips most neighbors, and at k*3 a memory that is the true
         // in-realm nearest neighbor can be unreachable (observed: rank 0 at
@@ -242,7 +262,12 @@ impl ChittaField {
         // Phase A — find candidates that need refresh, clone embeddings.
         // Uses read locks only; the inflight check here is a cheap pre-filter,
         // the authoritative check-and-reserve happens under the write guard below.
-        let candidates: Vec<(MemoryId, Vec<f32>)> = {
+        let candidates: Vec<(MemoryId, Vec<f32>)> = if !strengthen {
+            // Measurement reads must use the stored scoring inputs. Refreshing a
+            // budgeted subset here changes later no_learn queries and restart
+            // identity even though no access count or WAL entry is written.
+            Vec::new()
+        } else {
             // Lock order: states before semantic_idx (struct order) — the
             // inverse deadlocked against sync_foreign in production.
             let states_r = self.states.read();
@@ -915,7 +940,7 @@ impl ChittaField {
         let payloads = self.payloads.read();
         let states = self.states.read();
         let pipeline_config = self.scoring_pipeline.read().config.clone();
-        let now = now_ms();
+        let now = recall_now_ms();
         for (rank, (mid, _)) in lane.iter().enumerate() {
             let contrib = lane_w * (1.0 / (RRF_K + (rank + 1) as f32));
             if by_id.contains_key(mid) {
@@ -1065,7 +1090,7 @@ impl ChittaField {
 
         drop(assoc_edges);
 
-        let now = now_ms();
+        let now = recall_now_ms();
 
         let mut hits: Vec<RecallHit> = activation
             .into_iter()
@@ -1127,7 +1152,7 @@ impl ChittaField {
             .time_idx
             .read()
             .range_query(start_ms, end_ms, realm, limit);
-        let now = now_ms();
+        let now = recall_now_ms();
         let payloads = self.payloads.read();
         let states = self.states.read();
 
@@ -1571,7 +1596,7 @@ impl ChittaField {
 
         let hits: Vec<String> = match dispatch {
             DispatchKind::Exact => {
-                let now = now_ms();
+                let now = recall_now_ms();
                 let ts = self.triplet_store.read();
                 let entries = match (&req.subject, &req.predicate) {
                     (Some(s), _) => ts.query_subject(s, now),
@@ -1619,7 +1644,7 @@ impl ChittaField {
             }
             DispatchKind::Hybrid => {
                 // Exact lane first, fuzzy fills remaining slots.
-                let now = now_ms();
+                let now = recall_now_ms();
                 let ts = self.triplet_store.read();
                 let mut out: Vec<String> = match (&req.subject, &req.predicate) {
                     (Some(s), _) => ts.query_subject(s, now),
@@ -1780,7 +1805,7 @@ impl ChittaField {
         let bm25_fetch = if realm.is_some() { k * 12 } else { k * 3 };
         let keyword_hits = self.keyword_idx.read().search(query, bm25_fetch);
 
-        let now = now_ms();
+        let now = recall_now_ms();
         let payloads = self.payloads.read();
         let states = self.states.read();
         let learners = self.learners.read();
@@ -2126,7 +2151,7 @@ impl ChittaField {
                 return Ok(out);
             }
             log::warn!("RRF hybrid empty (semantic+BM25), falling back to recency");
-            let now = now_ms();
+            let now = recall_now_ms();
             let temporal = self.recall_temporal(0, now, realm, fetch_k)?;
             return Ok(if stratify {
                 stratify_recall_hits(temporal, k, reliability.as_ref())
@@ -2167,7 +2192,7 @@ impl ChittaField {
         }
 
         log::warn!("BM25 fallback also empty, falling back to recency");
-        let now = now_ms();
+        let now = recall_now_ms();
         let temporal = self.recall_temporal(0, now, realm, fetch_k)?;
         Ok(stratify_recall_hits(temporal, k, reliability.as_ref()))
     }
@@ -2382,7 +2407,7 @@ impl ChittaField {
     /// Recall memories associated with a file path (exact match).
     pub fn recall_artifact(&self, path: &str, limit: usize) -> Result<Vec<RecallHit>> {
         let entries = self.artifact_idx.read().query_path(path, limit);
-        let now = now_ms();
+        let now = recall_now_ms();
         let payloads = self.payloads.read();
         let states = self.states.read();
 
