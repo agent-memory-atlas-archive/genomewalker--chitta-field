@@ -1276,6 +1276,7 @@ impl ChittaField {
         if embed_pending {
             self.pending_embed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        self.anchors.write().upsert(memory_id, &payload);
         self.payloads.write().insert(memory_id, payload);
         self.pld_mutations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.memory_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2273,6 +2274,7 @@ impl ChittaField {
         self.keyword_idx.write().remove(memory_id);
         self.cortical_idx.write().remove(memory_id);
         self.artifact_idx.write().remove_memory(memory_id);
+        self.anchors.write().entries.remove(&memory_id);
 
         // Transitive forgetting: invalidate triplets sourced from this memory (each call
         // writes its own WAL op so replay stays consistent).

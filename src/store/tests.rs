@@ -2341,3 +2341,39 @@ fn test_deferred_batch_exclusive_hold() {
     assert!(hold_b.as_micros() * 3 < hold_a.as_micros(),
         "batched exclusive hold {hold_b:?} must be <⅓ of per-item {hold_a:?}");
 }
+
+
+#[test]
+fn measurement_recall_preserves_competitive_weights_and_refresh_timestamps() {
+    let (field, _tmp) = open_test_field();
+    let mut queries = Vec::new();
+    for i in 0..24usize {
+        let mut embedding = vec![0.0; crate::ops::EMBED_DIM];
+        embedding[i] = 1.0;
+        let (id, _) = field.put_memory("wisdom", "readonly",
+            format!("independent measurement candidate {i}").as_bytes(),
+            &embedding, 0.9, 0.0, 0, vec![], None, None).unwrap();
+        let mut states = field.states.write();
+        let state = states.get_mut(&id).unwrap();
+        state.competitive_weight = 0.8;
+        state.last_cw_refresh_ms = 0;
+        queries.push(embedding);
+    }
+    let snapshot = || {
+        let mut rows: Vec<_> = field.states.read().iter().map(|(&id, state)| {
+            (id, state.competitive_weight.to_bits(), state.last_cw_refresh_ms,
+             state.access_count, state.last_accessed_ms, state.strength.to_bits())
+        }).collect();
+        rows.sort_unstable();
+        rows
+    };
+    let before = snapshot();
+    for query in &queries {
+        assert!(!field.recall_semantic_measure(query, 24, Some("readonly")).unwrap().is_empty());
+    }
+    assert_eq!(before, snapshot(), "no_learn must not alter scoring inputs for later queries");
+    assert!(field.cw_refresh_inflight.read().is_empty());
+    // Learning still refreshes stale weights; only the measurement path is read-only.
+    field.recall_semantic(&queries[0], 24, Some("readonly")).unwrap();
+    assert_ne!(before, snapshot());
+}

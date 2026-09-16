@@ -2685,6 +2685,7 @@ pub extern "C" fn cf_update_memory_content(
         match payloads.get_mut(&id) {
             Some(payload) => {
                 payload.content = new_content.clone();
+                handle.field.anchors.write().upsert(id, payload);
                 handle
                     .field
                     .pld_mutations

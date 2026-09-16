@@ -2,7 +2,10 @@
 //! from the empty runtime view, and existing snapshot codecs remain authoritative.
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::profile::{ProfiledRwLock as RwLock, ProfiledGuard};
+
+type RwLockReadGuard<'a, T> = ProfiledGuard<'a, parking_lot::RwLockReadGuard<'a, T>>;
+type RwLockWriteGuard<'a, T> = ProfiledGuard<'a, parking_lot::RwLockWriteGuard<'a, T>>;
 
 pub(crate) const ORGANS: &[&str] = &[
     "session_registry",
@@ -104,7 +107,7 @@ impl Ablations {
     pub(crate) fn disabled(&self, name: &str) -> bool { self.0.contains(name) }
 }
 
-/// With ablation off this is an ordinary parking_lot lock. When ablated,
+/// With ablation off this retains the field's named, profiled lock. When ablated,
 /// readers see an empty organ and writes have only guard-local scratch state.
 /// Persistence and foreign WAL replay explicitly use the preserved state.
 /// Keeping those accesses explicit prevents a maintenance save from discarding
@@ -116,11 +119,11 @@ pub(crate) struct Organ<T> {
 }
 
 impl<T> Organ<T> {
-    pub(crate) fn new(value: T, empty: fn() -> T, disabled: bool) -> Self {
+    pub(crate) fn new(component: &'static str, value: T, empty: fn() -> T, disabled: bool) -> Self {
         if disabled {
-            Self { runtime: RwLock::new(empty()), preserved: Some(RwLock::new(value)), empty }
+            Self { runtime: RwLock::new(component, empty()), preserved: Some(RwLock::new(component, value)), empty }
         } else {
-            Self { runtime: RwLock::new(value), preserved: None, empty }
+            Self { runtime: RwLock::new(component, value), preserved: None, empty }
         }
     }
 
@@ -169,7 +172,7 @@ mod tests {
 
     #[test]
     fn ablation_hides_state_but_preserves_rollback_and_foreign_replay() {
-        let organ = Organ::new(vec![1], Vec::new, true);
+        let organ = Organ::new("test_ablated", vec![1], Vec::new, true);
         assert!(organ.read().is_empty());
         organ.write().push(2);
         assert!(organ.read().is_empty());
@@ -181,7 +184,7 @@ mod tests {
 
     #[test]
     fn control_preserves_normal_lock_semantics() {
-        let organ = Organ::new(vec![1], Vec::new, false);
+        let organ = Organ::new("test_enabled", vec![1], Vec::new, false);
         organ.write().push(2);
         assert_eq!(*organ.read(), vec![1, 2]);
         assert_eq!(*organ.persisted_read(), vec![1, 2]);

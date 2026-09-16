@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// Internal derived-index access; no new daemon tool or snapshot field.
+#[no_mangle]
+pub extern "C" fn cf_source_anchors(h: *mut CfHandle, request: *const c_char,
+    buf: *mut u8, cap: usize, written: *mut usize) -> c_int {
+    if h.is_null() || request.is_null() || buf.is_null() || written.is_null() { return -1; }
+    let handle = unsafe { &*h };
+    let request = unsafe { CStr::from_ptr(request) }.to_bytes();
+    let request: serde_json::Value = match serde_json::from_slice(request) { Ok(v) => v, Err(e) => return handle.err(e) };
+    let output = handle.field.source_anchors(&request).to_string();
+    unsafe { *written = output.len(); }
+    if output.len() >= cap { return -2; }
+    unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), buf, output.len()); *buf.add(output.len()) = 0; }
+    handle.ok()
+}
+
 /// Share the profiling flag with the C++ stages around the FFI calls.
 #[no_mangle]
 pub extern "C" fn cf_recall_profile_enabled() -> c_int { crate::profile::enabled() as c_int }
