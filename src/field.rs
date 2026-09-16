@@ -45,7 +45,8 @@ use crate::organ::user_model::UserModelRegistry;
 use crate::payload::MemoryPayload;
 use crate::snapshot::FullSnapshot;
 use crate::state::MemoryState;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
+use crate::profile::{ProfiledRwLock as RwLock, ProfiledStdRwLock};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -437,12 +438,12 @@ pub struct ChittaField {
     pub(crate) predicate_store:    RwLock<crate::organ::predicate_store::PredicateStore>,
     /// In-flight competitive_weight refresh reservations: memory_id -> reservation_ts_ms.
     /// Prevents thundering-herd when multiple sessions refresh simultaneously.
-    pub(crate) cw_refresh_inflight: parking_lot::RwLock<std::collections::HashMap<crate::ids::MemoryId, i64>>,
+    pub(crate) cw_refresh_inflight: RwLock<std::collections::HashMap<crate::ids::MemoryId, i64>>,
     /// Per-writer WAL coverage of the in-memory state: instance → max seqno
     /// applied (open replay ⊔ sync_foreign ⊔ own appends at save time).
     /// Written into the manifest family on save; the safe pruning and
     /// replay-skip vector of THEORY.md §4.
-    pub(crate) wal_coverage: parking_lot::RwLock<std::collections::BTreeMap<crate::ids::InstanceId, u64>>,
+    pub(crate) wal_coverage: RwLock<std::collections::BTreeMap<crate::ids::InstanceId, u64>>,
     /// SemanticIndex mutation count at the last successful sidecar write by
     /// this instance. u64::MAX = never written (first save must write).
     /// Dirty-skip: unchanged index ⇒ the .emb/.bin/.mu/.hnsw/.delta.hnsw/
@@ -462,13 +463,13 @@ pub struct ChittaField {
     /// Memories whose sparse encode produced an empty code (runtime-only;
     /// retried after restart). Keeps encode_all_unindexed from re-encoding
     /// the same unencodable ids every consolidation cycle.
-    pub(crate) encode_skip: parking_lot::RwLock<HashSet<MemoryId>>,
+    pub(crate) encode_skip: RwLock<HashSet<MemoryId>>,
     /// memory → distinct instances that recalled it (cross-context
     /// generality evidence; THEORY.md §6). Capped at 8 per memory.
     /// Persisted as the V23 "recall_provenance" section.
-    pub(crate) recall_provenance: parking_lot::RwLock<HashMap<MemoryId, std::collections::BTreeSet<crate::ids::InstanceId>>>,
+    pub(crate) recall_provenance: RwLock<HashMap<MemoryId, std::collections::BTreeSet<crate::ids::InstanceId>>>,
     /// G6: quality-diversity (MAP-Elites) archive — best genome per (realm, task_type) niche.
-    pub(crate) archive: std::sync::Arc<std::sync::RwLock<crate::learner::archive::QdArchive>>,
+    pub(crate) archive: std::sync::Arc<ProfiledStdRwLock<crate::learner::archive::QdArchive>>,
 }
 
 impl Drop for ChittaField {
@@ -737,22 +738,22 @@ impl ChittaField {
             instance_id,
             lineage_epoch,
             writer_uuid,
-            log: RwLock::new(log),
+            log: RwLock::new("log", log),
             pending_touches: Mutex::new(Vec::new()),
             touch_drain: Mutex::new(()),
             id_alloc,
             artifact_id_alloc,
-            payloads: RwLock::new(payloads),
-            retrieval_surfaces: RwLock::new(retrieval_surfaces),
-            states: RwLock::new(states),
-            assoc_edges: RwLock::new(assoc_edges),
-            artifacts: RwLock::new(artifacts),
-            artifact_paths: RwLock::new(artifact_paths),
-            semantic_idx: RwLock::new(semantic_idx),
-            time_idx: RwLock::new(time_idx),
-            artifact_idx: RwLock::new(artifact_idx),
-            keyword_idx: RwLock::new(keyword_idx),
-            triplet_store: RwLock::new({
+            payloads: RwLock::new("payloads", payloads),
+            retrieval_surfaces: RwLock::new("retrieval_surfaces", retrieval_surfaces),
+            states: RwLock::new("states", states),
+            assoc_edges: RwLock::new("assoc_edges", assoc_edges),
+            artifacts: RwLock::new("artifacts", artifacts),
+            artifact_paths: RwLock::new("artifact_paths", artifact_paths),
+            semantic_idx: RwLock::new("semantic_idx", semantic_idx),
+            time_idx: RwLock::new("time_idx", time_idx),
+            artifact_idx: RwLock::new("artifact_idx", artifact_idx),
+            keyword_idx: RwLock::new("keyword_idx", keyword_idx),
+            triplet_store: RwLock::new("triplet_store", {
                 let _phase = crate::profile::LoadPhase::new("triplets");
                 let before = triplet_store.triplet_count();
                 let (purged, deduped) = triplet_store.clean_for_load();
@@ -763,48 +764,48 @@ impl ChittaField {
                 triplet_store
             }),
             triplet_id_alloc,
-            symbol_idx: RwLock::new(symbol_idx),
-            call_graph: RwLock::new(call_graph),
-            code_files: RwLock::new(code_files),
+            symbol_idx: RwLock::new("symbol_idx", symbol_idx),
+            call_graph: RwLock::new("call_graph", call_graph),
+            code_files: RwLock::new("code_files", code_files),
             symbol_id_alloc,
             code_file_id_alloc,
-            learners: RwLock::new(LearnerSet::new()),
-            sparse_encoder: RwLock::new(SparseEncoder::new()),
-            cortical_idx: RwLock::new(cortical_idx),
+            learners: RwLock::new("learners", LearnerSet::new()),
+            sparse_encoder: RwLock::new("sparse_encoder", SparseEncoder::new()),
+            cortical_idx: RwLock::new("cortical_idx", cortical_idx),
             event_id_alloc: Arc::new(AtomicU64::new(1)),
-            session_registry: RwLock::new(session_registry),
-            transcript_registry: RwLock::new(transcript_registry),
-            task_registry: RwLock::new(task_registry),
-            user_model_registry: RwLock::new(user_model_registry),
-            theme_organ: RwLock::new(theme_organ),
-            analytics_registry: RwLock::new(analytics_registry),
-            msg_registry: RwLock::new(msg_registry),
-            skill_registry: RwLock::new(skill_registry),
-            agent_registry: RwLock::new(agent_registry),
-            constraint_store: RwLock::new(constraint_store),
-            trigger_store: RwLock::new(trigger_store),
-            predictor: RwLock::new(predictor),
-            surprise_store: RwLock::new(surprise_store),
-            epistemic_debt_store: RwLock::new(epistemic_debt_store),
-            integration_kernel: RwLock::new(integration_kernel),
-            surprise_learning: RwLock::new(surprise_learning),
-            wisdom_promotion: RwLock::new(wisdom_promotion),
-            learned_scorer: RwLock::new(learned_scorer),
-            intervention_store: RwLock::new(intervention_store),
-            agent_protocol_store: RwLock::new(agent_protocol_store),
-            wisdom_lineage_store: RwLock::new(wisdom_lineage_store),
-            symbol_event_log: RwLock::new(symbol_event_log),
-            lite_encoder: RwLock::new(loaded_lite_encoder),
-            seen_offsets: RwLock::new(loaded_seen_offsets),
-            pending_foreign: RwLock::new(PendingForeign::default()),
-            chunk_hash_idx: RwLock::new(chunk_hash_idx),
-            content_prov_idx: RwLock::new(content_prov_idx),
-            prov_key_idx: RwLock::new(prov_key_idx),
-            correction_key_idx: RwLock::new(correction_key_idx),
-            task_key_idx: RwLock::new(task_key_idx),
-            realm_members: RwLock::new(realm_members),
-            kind_members:  RwLock::new(kind_members),
-            session_recent: RwLock::new(HashMap::new()),
+            session_registry: RwLock::new("session_registry", session_registry),
+            transcript_registry: RwLock::new("transcript_registry", transcript_registry),
+            task_registry: RwLock::new("task_registry", task_registry),
+            user_model_registry: RwLock::new("user_model_registry", user_model_registry),
+            theme_organ: RwLock::new("theme_organ", theme_organ),
+            analytics_registry: RwLock::new("analytics_registry", analytics_registry),
+            msg_registry: RwLock::new("msg_registry", msg_registry),
+            skill_registry: RwLock::new("skill_registry", skill_registry),
+            agent_registry: RwLock::new("agent_registry", agent_registry),
+            constraint_store: RwLock::new("constraint_store", constraint_store),
+            trigger_store: RwLock::new("trigger_store", trigger_store),
+            predictor: RwLock::new("predictor", predictor),
+            surprise_store: RwLock::new("surprise_store", surprise_store),
+            epistemic_debt_store: RwLock::new("epistemic_debt_store", epistemic_debt_store),
+            integration_kernel: RwLock::new("integration_kernel", integration_kernel),
+            surprise_learning: RwLock::new("surprise_learning", surprise_learning),
+            wisdom_promotion: RwLock::new("wisdom_promotion", wisdom_promotion),
+            learned_scorer: RwLock::new("learned_scorer", learned_scorer),
+            intervention_store: RwLock::new("intervention_store", intervention_store),
+            agent_protocol_store: RwLock::new("agent_protocol_store", agent_protocol_store),
+            wisdom_lineage_store: RwLock::new("wisdom_lineage_store", wisdom_lineage_store),
+            symbol_event_log: RwLock::new("symbol_event_log", symbol_event_log),
+            lite_encoder: RwLock::new("lite_encoder", loaded_lite_encoder),
+            seen_offsets: RwLock::new("seen_offsets", loaded_seen_offsets),
+            pending_foreign: RwLock::new("pending_foreign", PendingForeign::default()),
+            chunk_hash_idx: RwLock::new("chunk_hash_idx", chunk_hash_idx),
+            content_prov_idx: RwLock::new("content_prov_idx", content_prov_idx),
+            prov_key_idx: RwLock::new("prov_key_idx", prov_key_idx),
+            correction_key_idx: RwLock::new("correction_key_idx", correction_key_idx),
+            task_key_idx: RwLock::new("task_key_idx", task_key_idx),
+            realm_members: RwLock::new("realm_members", realm_members),
+            kind_members:  RwLock::new("kind_members", kind_members),
+            session_recent: RwLock::new("session_recent", HashMap::new()),
             densify_enabled: std::sync::atomic::AtomicBool::new(
                 std::env::var("CHITTA_DENSIFY").map(|v| v == "1").unwrap_or(false),
             ),
@@ -817,14 +818,14 @@ impl ChittaField {
             memory_count: Arc::new(AtomicUsize::new(initial_memory_count)),
             pending_embed_count: Arc::new(AtomicUsize::new(init_pending)),
             last_compact_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            realm_stats: RwLock::new(HashMap::new()),
-            kind_stats:  RwLock::new(HashMap::new()),
-            ack_scores:  RwLock::new(snap_ack_scores),
-            repl_sessions: RwLock::new(loaded_repl_sessions),
-            span_store: RwLock::new(loaded_span_store),
+            realm_stats: RwLock::new("realm_stats", HashMap::new()),
+            kind_stats:  RwLock::new("kind_stats", HashMap::new()),
+            ack_scores:  RwLock::new("ack_scores", snap_ack_scores),
+            repl_sessions: RwLock::new("repl_sessions", loaded_repl_sessions),
+            span_store: RwLock::new("span_store", loaded_span_store),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             backfill_plan_stage: Mutex::new(None),
-            coactivation_stats: RwLock::new({
+            coactivation_stats: RwLock::new("coactivation_stats", {
                 let mut cs = replay_coactivation_stats;
                 let n = cs.len();
                 // Prune to 100 pairs/memory to bound startup RAM on old snapshots.
@@ -834,33 +835,33 @@ impl ChittaField {
                 }
                 cs
             }),
-            hopfield: RwLock::new(HopfieldNetwork::new()),
+            hopfield: RwLock::new("hopfield", HopfieldNetwork::new()),
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            scoring_pipeline: RwLock::new(crate::scoring::ScoringPipeline::new(scoring_config)),
-            hdc_idx:    RwLock::new(hdc_store),
-            event_tape:   RwLock::new(event_tape),
-            cdawg:        RwLock::new(cdawg),
-            episode_hdc:        RwLock::new(episode_hdc),
-            refutation_ledger:  RwLock::new(refutation_ledger),
-            cec_policy_store:   RwLock::new(cec_policy_store),
-            decision_tape:      RwLock::new(decision_tape),
-            hypothesis_market:  RwLock::new(hypothesis_market),
-            turiya_monitor:     RwLock::new(turiya_monitor),
-            fep_prior:          RwLock::new(fep_prior),
+            scoring_pipeline: RwLock::new("scoring_pipeline", crate::scoring::ScoringPipeline::new(scoring_config)),
+            hdc_idx:    RwLock::new("hdc_idx", hdc_store),
+            event_tape:   RwLock::new("event_tape", event_tape),
+            cdawg:        RwLock::new("cdawg", cdawg),
+            episode_hdc:        RwLock::new("episode_hdc", episode_hdc),
+            refutation_ledger:  RwLock::new("refutation_ledger", refutation_ledger),
+            cec_policy_store:   RwLock::new("cec_policy_store", cec_policy_store),
+            decision_tape:      RwLock::new("decision_tape", decision_tape),
+            hypothesis_market:  RwLock::new("hypothesis_market", hypothesis_market),
+            turiya_monitor:     RwLock::new("turiya_monitor", turiya_monitor),
+            fep_prior:          RwLock::new("fep_prior", fep_prior),
             tape_tombstoned:    std::sync::atomic::AtomicU64::new(0),
             observer:           crate::organ::observer::Observer::new(),
-            observer_state:     RwLock::new(crate::organ::observer::ObserverState::default()),
-            interaction_ledger: RwLock::new(snap_interaction_ledger),
-            predicate_store:    RwLock::new(snap_predicate_store),
-            cw_refresh_inflight: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            wal_coverage: parking_lot::RwLock::new(wal_coverage),
+            observer_state:     RwLock::new("observer_state", crate::organ::observer::ObserverState::default()),
+            interaction_ledger: RwLock::new("interaction_ledger", snap_interaction_ledger),
+            predicate_store:    RwLock::new("predicate_store", snap_predicate_store),
+            cw_refresh_inflight: RwLock::new("cw_refresh_inflight", std::collections::HashMap::new()),
+            wal_coverage: RwLock::new("wal_coverage", wal_coverage),
             idx_sidecars_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             hdc_sidecar_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
             pld_mutations: std::sync::atomic::AtomicU64::new(0),
             pld_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
-            encode_skip: parking_lot::RwLock::new(HashSet::new()),
-            recall_provenance: parking_lot::RwLock::new(recall_provenance),
-            archive: std::sync::Arc::new(std::sync::RwLock::new(crate::learner::archive::QdArchive::new())),
+            encode_skip: RwLock::new("encode_skip", HashSet::new()),
+            recall_provenance: RwLock::new("recall_provenance", recall_provenance),
+            archive: std::sync::Arc::new(ProfiledStdRwLock::new("archive", crate::learner::archive::QdArchive::new())),
         })
     }
 }
