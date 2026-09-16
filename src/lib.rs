@@ -36,6 +36,7 @@ pub mod payload;
 pub mod recall;
 pub mod repl_executor;
 pub mod repl_sessions;
+pub mod replication;
 pub mod scoring;
 pub mod snapshot;
 pub mod state;

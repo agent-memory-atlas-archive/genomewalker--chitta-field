@@ -459,3 +459,38 @@ impl ScoringFactor for StagedFactor {
         if ctx.state.staged { Some(0.80) } else { Some(1.0) }
     }
 }
+
+/// Distinct source sessions, cached on state, modulate the secondary envelope.
+pub struct ReplicationFactor;
+
+impl ScoringFactor for ReplicationFactor {
+    fn name(&self) -> &'static str { "replication" }
+    fn compute(&self, ctx: &ScoringContext, config: &ScoringConfig,
+               _decomp: &mut ScoreDecomposition) -> Option<f32> {
+        Some(replication_multiplier(ctx.state.replication_count, config.replication_max))
+    }
+}
+
+fn replication_multiplier(count: u32, max: f32) -> f32 {
+    if !max.is_finite() || max <= 1.0 { return 1.0; }
+    // Concave, saturating at three sessions: 0, 2/3, 1 of the available boost.
+    let n = count.max(1).min(3) as f32 - 1.0;
+    1.0 + (max - 1.0) * n * (5.0 - n) / 6.0
+}
+
+#[cfg(test)]
+mod replication_tests {
+    use super::*;
+    #[test]
+    fn curve_is_neutral_bounded_and_saturating() {
+        for count in [0, 1, 2, 3, 100, u32::MAX] {
+            assert_eq!(replication_multiplier(count, 0.0), 1.0);
+            assert_eq!(replication_multiplier(count, f32::NAN), 1.0);
+        }
+        assert_eq!(replication_multiplier(0, 1.15), 1.0);
+        assert_eq!(replication_multiplier(1, 1.15), 1.0);
+        assert!((replication_multiplier(2, 1.15) - 1.10).abs() < 1e-6);
+        assert_eq!(replication_multiplier(3, 1.15), 1.15);
+        assert_eq!(replication_multiplier(100, 1.15), 1.15);
+    }
+}

@@ -1267,6 +1267,7 @@ impl ChittaField {
                     .unwrap_or(false);
                 if is_alive {
                     let _ = self.update_state(existing_id, Some(0.0), Some(0.03), None, true, None);
+                    self.record_replication_session(existing_id, source_session.as_deref())?;
                     return Ok((existing_id, chunk_hash));
                 }
             }
@@ -1292,6 +1293,7 @@ impl ChittaField {
                         .write()
                         .domain_reliability
                         .record_partial_success(realm, 0.3);
+                    self.record_replication_session(existing_id, source_session.as_deref())?;
                     return Ok((existing_id, chunk_hash));
                 }
             }
@@ -1336,6 +1338,7 @@ impl ChittaField {
                         .unwrap_or(true);
                     if candidate_realm == realm && !candidate_deleted {
                         let _ = self.update_state(top.memory_id, Some(0.0), Some(0.02), None, true, None);
+                        self.record_replication_session(top.memory_id, source_session.as_deref())?;
                         return Ok((top.memory_id, chunk_hash));
                     }
                 }
@@ -1414,6 +1417,7 @@ impl ChittaField {
         self.pld_mutations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.memory_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.states.write().insert(memory_id, state);
+        self.refresh_replications(&[memory_id]);
         self.chunk_hash_idx
             .write()
             .entry(chunk_hash)
@@ -2535,6 +2539,7 @@ impl ChittaField {
                 state.deleted = true;
             }
         }
+        self.refresh_replications(&[memory_id]);
         // Remove from temporal index (need authored_at_ms from payload).
         // Also subtract from spectral accumulators before removing from semantic_idx.
         {
@@ -5767,6 +5772,7 @@ impl ChittaField {
         });
         let _seqno = self.log.write().append(&op)?;
 
+        let replication_ids = crate::replication::affected_edge(&subject, &predicate, &object);
         self.triplet_store.write().replay_add(
             triplet_id,
             subject,
@@ -5778,6 +5784,7 @@ impl ChittaField {
             source_file,
         );
 
+        self.refresh_replications(&replication_ids);
         Ok(triplet_id)
     }
 
@@ -5879,8 +5886,13 @@ impl ChittaField {
         }
     }
 
-    /// Set the source_session tag on a memory payload. In-memory only; persisted at next snapshot.
+    /// Set the source_session payload tag (snapshot-persisted). Preserve both
+    /// old and new session witnesses in the WAL before changing the tag.
     pub fn set_source_session(&self, memory_id: MemoryId, session_id: &str) -> Result<()> {
+        let previous = self.payloads.read().get(&memory_id)
+            .ok_or(FieldError::NotFound(memory_id))?.source_session.clone();
+        self.record_replication_session(memory_id, previous.as_deref())?;
+        self.record_replication_session(memory_id, Some(session_id))?;
         let realm = {
             let mut payloads = self.payloads.write();
             let p = payloads.get_mut(&memory_id).ok_or(FieldError::NotFound(memory_id))?;
@@ -5891,6 +5903,7 @@ impl ChittaField {
         // the session here (cf_put_memory carries no session), so this is the
         // moment the SameSession chain can form. Idempotent: skips ids already
         // in the ring, and add_assoc_edge dedups edges by (dst, type).
+        self.refresh_replications(&[memory_id]);
         self.densify_write_edges(memory_id, &realm, Some(session_id));
         Ok(())
     }
@@ -6083,6 +6096,7 @@ impl ChittaField {
         );
 
         if let Some(original) = superseded_by {
+            self.add_triplet(original.to_string(), "merged_from".into(), memory_id.to_string(), 1.0, None, None)?;
             let _ = self.set_memory_status(memory_id, crate::state::MemoryStatus::Superseded);
             let _ = self.update_state(original, Some(0.0), Some(0.02), None, true, None);
         }
@@ -6499,7 +6513,9 @@ impl ChittaField {
         });
         let _seqno = self.log.write().append(&op)?;
 
+        let replication_ids = self.replication_edge_ids(triplet_id);
         self.triplet_store.write().invalidate(triplet_id, now);
+        self.refresh_replications(&replication_ids);
 
         Ok(())
     }
@@ -6561,7 +6577,9 @@ impl ChittaField {
             superseded_at_ms: at_ms,
         });
         let _seqno = self.log.write().append(&op)?;
+        let replication_ids = self.replication_edge_ids(old_id);
         self.triplet_store.write().supersede(old_id, new_id, at_ms);
+        self.refresh_replications(&replication_ids);
         Ok(())
     }
 

@@ -100,6 +100,9 @@ pub struct ScoringConfig {
     pub cross_context_weight: f32,
     pub cross_context_max: f32,
 
+    /// Saturating independent-session multiplier; 0 disables. Opt-in value: 1.15.
+    pub replication_max: f32,
+
     /// Max competitive-weight refreshes per recall. Each refresh costs one
     /// ANN/flat search; unbounded refresh after a restart with stale
     /// timestamps turned k-large recalls into minutes-long scan convoys
@@ -262,6 +265,7 @@ impl Default for ScoringConfig {
 
             // Cross-context generality
             cross_context_weight: 0.05,
+            replication_max: 0.0,
             cross_context_max: 3.0,
 
             // Competitive-weight refresh budget
@@ -318,6 +322,18 @@ impl ScoringConfig {
     /// Load config from `scoring.json` in the given directory.
     /// Falls back to defaults if the file doesn't exist or is malformed.
     pub fn load(data_dir: &Path) -> Self {
+        let mut config = Self::load_file(data_dir);
+        if let Ok(value) = std::env::var("CHITTA_REPLICATION_MAX") {
+            if let Ok(value) = value.parse::<f32>() {
+                if value.is_finite() && (value == 0.0 || value >= 1.0) {
+                    config.replication_max = value;
+                }
+            }
+        }
+        config
+    }
+
+    fn load_file(data_dir: &Path) -> Self {
         let path = data_dir.join("scoring.json");
         if !path.exists() {
             log::info!("No scoring.json found, using default scoring config");

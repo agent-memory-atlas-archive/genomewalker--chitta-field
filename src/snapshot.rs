@@ -318,6 +318,7 @@ impl LegacyMemoryStateV4 {
             last_cw_refresh_ms: 0,
             utility_alpha: 1.0,
             utility_beta: 1.0,
+            replication_count: 1,
         }
     }
 }
@@ -377,6 +378,7 @@ impl LegacyMemoryStateV5 {
             last_cw_refresh_ms: 0,
             utility_alpha: 1.0,
             utility_beta: 1.0,
+            replication_count: 1,
         }
     }
 }
@@ -441,6 +443,7 @@ impl LegacyMemoryStateV6 {
             last_cw_refresh_ms: 0,
             utility_alpha: 1.0,
             utility_beta: 1.0,
+            replication_count: 1,
         }
     }
 }
@@ -506,6 +509,7 @@ impl LegacyMemoryStateV7 {
             last_cw_refresh_ms: 0,
             utility_alpha: 1.0,
             utility_beta: 1.0,
+            replication_count: 1,
         }
     }
 }
@@ -677,6 +681,7 @@ impl LegacyMemoryStateV11 {
             last_cw_refresh_ms: 0,
             utility_alpha: 1.0,
             utility_beta: 1.0,
+            replication_count: 1,
         }
     }
 }
