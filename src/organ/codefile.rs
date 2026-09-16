@@ -91,10 +91,13 @@ impl CodeFileIndex {
     }
 
     pub fn get_by_project(&self, project: &str) -> Vec<&CodeFile> {
-        self.by_id
+        let project = project.strip_prefix("project:").unwrap_or(project);
+        let mut files: Vec<_> = self.by_id
             .values()
-            .filter(|f| f.project == project)
-            .collect()
+            .filter(|f| f.project.strip_prefix("project:").unwrap_or(&f.project) == project)
+            .collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files
     }
 
     pub fn remove(&mut self, id: CodeFileId) {
@@ -119,10 +122,11 @@ impl CodeFileIndex {
 
     /// Remove all code files belonging to a project. Returns removed file paths.
     pub fn remove_by_project(&mut self, project: &str) -> Vec<String> {
+        let project = project.strip_prefix("project:").unwrap_or(project);
         let ids_to_remove: Vec<CodeFileId> = self
             .by_id
             .iter()
-            .filter(|(_, f)| f.project == project)
+            .filter(|(_, f)| f.project.strip_prefix("project:").unwrap_or(&f.project) == project)
             .map(|(&id, _)| id)
             .collect();
         let mut paths = Vec::new();
@@ -133,5 +137,25 @@ impl CodeFileIndex {
             }
         }
         paths
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_aliases_share_sorted_coverage_and_removal() {
+        let mut index = CodeFileIndex::new();
+        index.upsert("/repo/z.rs", "project:demo", 0, None, None, None, None, || 1);
+        index.upsert("/repo/a.rs", "demo", 0, None, None, None, None, || 2);
+        index.upsert("/other/x.rs", "other", 0, None, None, None, None, || 3);
+        for alias in ["demo", "project:demo"] {
+            let files = index.get_by_project(alias);
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0].path, "/repo/a.rs");
+        }
+        assert_eq!(index.remove_by_project("project:demo").len(), 2);
+        assert_eq!(index.count(), 1);
     }
 }
