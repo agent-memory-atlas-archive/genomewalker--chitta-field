@@ -23,9 +23,13 @@ impl LockMetrics {
         let old_hold = self.max_hold.fetch_max(held_us, Ordering::Relaxed);
         if n == 1 || wait_us > old_wait || held_us > old_hold
             || wait_us > 50_000 || held_us > 50_000 || n % 4096 == 0 {
-            eprintln!("[lockprof] RUST component={} mode={} held_us={} wait_us={} acquisitions={} max_hold_us={} max_wait_us={}",
+            let line = format!("[lockprof] RUST component={} mode={} held_us={} wait_us={} acquisitions={} max_hold_us={} max_wait_us={}\n",
                 self.component, mode, held_us, wait_us, n,
                 self.max_hold.load(Ordering::Relaxed), self.max_wait.load(Ordering::Relaxed));
+            // stderr is shared with C++/llama writers that do not take Rust's
+            // stdio lock. One short write keeps a record intact through the
+            // daemon's timestamp pipe (well below PIPE_BUF).
+            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
         }
     }
 }
