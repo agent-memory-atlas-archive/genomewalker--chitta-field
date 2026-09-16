@@ -1202,10 +1202,6 @@ impl ChittaField {
                 let _ = semantic_idx.save_delta_hnsw(&snap_path.with_extension("delta.hnsw"));
             }
         }
-        {
-            let _phase = crate::profile::LoadPhase::new("keyword_reverse");
-            keyword_idx.rebuild_reverse_index();
-        }
 
         // One-time migration: mark SSL memories (content with →) for gloss-baked re-embed.
         // Guard file prevents re-running after backfill completes.
@@ -1316,6 +1312,13 @@ impl ChittaField {
         // These inputs are immutable after WAL replay + normalization. No store
         // guards exist yet: quantization, HDC and lite I/O can run independently.
         let (loaded_lite_encoder, hdc_store) = std::thread::scope(|scope| {
+            // Reverse postings are independent of the semantic/HDC/lite inputs.
+            // Finish this before publishing the field, so mutation/removal APIs
+            // observe the same complete keyword index as the serial loader.
+            let keyword = scope.spawn(|| {
+                let _phase = crate::profile::LoadPhase::new("keyword_reverse");
+                keyword_idx.rebuild_reverse_index();
+            });
             let lite = scope.spawn(|| {
                 let _phase = crate::profile::LoadPhase::new("lite_encoder");
                 Self::load_lite_encoder(&data_dir)
@@ -1343,6 +1346,7 @@ impl ChittaField {
         }
 
         drop(hdc_phase);
+        keyword.join().expect("startup keyword worker panicked");
         turbo.join().expect("startup Turbo worker panicked");
         let loaded_lite_encoder = lite.join().expect("startup lite encoder worker panicked");
         (loaded_lite_encoder, hdc_store)

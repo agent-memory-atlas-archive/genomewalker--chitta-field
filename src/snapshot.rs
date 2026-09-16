@@ -1,4 +1,5 @@
 use crate::error::{FieldError, Result};
+use rayon::prelude::*;
 use crate::field::{AssocEdge, CoActivationStats};
 use crate::hnsw::SemanticIndex;
 use crate::ids::{ArtifactId, ChunkHash, MemoryId};
@@ -1236,7 +1237,8 @@ impl Drop for SnapshotReader {
     }
 }
 
-/// Deserialize one V23 section body from a length-capped reader.
+/// Historical streaming decoder, retained as the compatibility test oracle.
+#[cfg(test)]
 fn read_section<R: Read, T: serde::de::DeserializeOwned>(r: &mut R, name: &str) -> Result<T> {
     let start = std::time::Instant::now();
     let result = bincode::deserialize_from(r)
@@ -1245,6 +1247,155 @@ fn read_section<R: Read, T: serde::de::DeserializeOwned>(r: &mut R, name: &str) 
         eprintln!("[chitta-field] snapshot section={name} decode_ms={}", start.elapsed().as_millis());
     }
     result
+}
+
+/// Decode directly from the resident bytes (no per-string reader scratch copy).
+/// On malformed input, replay the historical reader decoder for its exact error
+/// text and category, including bincode's reader-versus-slice EOF distinction.
+fn decode_body<T: serde::de::DeserializeOwned>(bytes: &[u8], name: &str) -> Result<T> {
+    let _phase = crate::profile::SnapshotPhase::new(name);
+    bincode::deserialize(bytes).or_else(|_| bincode::deserialize_from(bytes))
+        .map_err(|e| FieldError::Serialization(format!("section '{name}': {e}")))
+}
+
+// Limit startup concurrency independently of the host's (often hundreds of) CPUs.
+fn decode_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(4)
+        .thread_name(|i| format!("snapshot-{i}")).build().expect("snapshot decode pool"))
+}
+
+/// Serde caps its default HashMap reservation to 1 MiB. The section byte bound
+/// lets these large, trusted-length maps reserve once without trusting a corrupt
+/// count alone. Entries with zero-sized encodings still grow normally if needed.
+fn read_map_section<K, V>(bytes: &[u8], name: &str) -> Result<HashMap<K, V>>
+where K: serde::de::DeserializeOwned + Eq + std::hash::Hash,
+      V: serde::de::DeserializeOwned,
+{
+    use bincode::Options;
+    use serde::de::{DeserializeSeed, MapAccess, Visitor};
+    struct MapSeed<K, V>(usize, std::marker::PhantomData<(K, V)>);
+    impl<'de, K, V> Visitor<'de> for MapSeed<K, V>
+    where K: Deserialize<'de> + Eq + std::hash::Hash, V: Deserialize<'de> {
+        type Value = HashMap<K, V>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> std::result::Result<Self::Value, A::Error> {
+            let mut map = HashMap::with_capacity(entries.size_hint().unwrap_or(0).min(self.0));
+            while let Some((key, value)) = entries.next_entry()? { map.insert(key, value); }
+            Ok(map)
+        }
+    }
+    impl<'de, K, V> DeserializeSeed<'de> for MapSeed<K, V>
+    where K: Deserialize<'de> + Eq + std::hash::Hash, V: Deserialize<'de> {
+        type Value = HashMap<K, V>;
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<Self::Value, D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+    let _phase = crate::profile::SnapshotPhase::new(name);
+    let options = bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes();
+    let mut decoder = bincode::Deserializer::from_slice(bytes, options);
+    MapSeed(bytes.len() / 8, std::marker::PhantomData).deserialize(&mut decoder)
+        .or_else(|_| bincode::deserialize_from(bytes))
+        .map_err(|e| FieldError::Serialization(format!("section '{name}': {e}")))
+}
+
+struct Section<'a> {
+    name: String,
+    body: &'a [u8],
+    declared_len: u64,
+}
+
+type ApplySection = Box<dyn FnOnce(&mut FullSnapshot) + Send>;
+
+fn decode_section(section: &Section<'_>) -> Result<ApplySection> {
+    let n = section.name.as_str();
+    macro_rules! decode {
+        ($field:ident) => {{
+            let value = decode_body(section.body, n)?;
+            Ok(Box::new(move |snap: &mut FullSnapshot| snap.$field = value) as ApplySection)
+        }};
+    }
+    macro_rules! map {
+        ($field:ident) => {{
+            let value = read_map_section(section.body, n)?;
+            Ok(Box::new(move |snap: &mut FullSnapshot| snap.$field = value) as ApplySection)
+        }};
+    }
+    match n {
+        "payloads" => map!(payloads),
+        "states" => map!(states),
+        "assoc_edges" => map!(assoc_edges),
+        "artifacts" => map!(artifacts),
+        "artifact_paths" => map!(artifact_paths),
+        "time_idx" => decode!(time_idx),
+        "keyword_idx" => decode!(keyword_idx),
+        "artifact_idx" => decode!(artifact_idx),
+        "triplet_store" => {
+            let mut value: TripletStore = decode_body(section.body, n)?;
+            let _phase = crate::profile::SnapshotPhase::new("triplet_indexes");
+            value.rebuild_indexes();
+            Ok(Box::new(move |snap: &mut FullSnapshot| snap.triplet_store = value))
+        }
+        "triplets_clean" => {
+            let value = decode_body(section.body, n)?;
+            Ok(Box::new(move |snap: &mut FullSnapshot| snap.triplet_store.clean = value))
+        }
+        "symbol_idx" => decode!(symbol_idx),
+        "call_graph" => decode!(call_graph),
+        "code_files" => decode!(code_files),
+        "semantic_idx" => decode!(semantic_idx),
+        "coactivation_stats" => map!(coactivation_stats),
+        "ack_scores" => map!(ack_scores),
+        "correction_states" => map!(correction_states),
+        "event_tape" => decode!(event_tape),
+        "decision_tape" => decode!(decision_tape),
+        "turiya_monitor" => decode!(turiya_monitor),
+        "observer_state" => decode!(observer_state),
+        "interaction_ledger" => decode!(interaction_ledger),
+        "predicate_store" => decode!(predicate_store),
+        "cw_refresh_ts" => map!(cw_refresh_ts),
+        "recall_provenance" => map!(recall_provenance),
+        "utility_posteriors" => map!(utility_posteriors),
+        "ledger_session_events" => decode!(ledger_session_events),
+        _ => {
+            let name = section.name.clone();
+            let len = section.declared_len;
+            Ok(Box::new(move |_| eprintln!(
+                "[chitta-field] skipping unknown snapshot section '{}' ({} bytes)", name, len)))
+        }
+    }
+}
+
+/// Index the length-prefixed V23 bodies without decoding them. Save a malformed
+/// later header as the last result: an earlier section's decode error must win,
+/// just as it did in the streaming loader. A lone final name-length byte and a
+/// short unknown body were accepted by that loader and remain accepted here.
+fn section_table(mut bytes: &[u8]) -> (Vec<Section<'_>>, Result<()>) {
+    let mut sections = Vec::new();
+    let result = (|| {
+        loop {
+            let mut nlen = [0; 2];
+            match bytes.read_exact(&mut nlen) {
+                Ok(()) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(FieldError::Io(e)),
+            }
+            let mut name = vec![0; u16::from_le_bytes(nlen) as usize];
+            bytes.read_exact(&mut name)?;
+            let mut blen = [0; 8];
+            bytes.read_exact(&mut blen)?;
+            let declared_len = u64::from_le_bytes(blen);
+            let len = declared_len.min(bytes.len() as u64) as usize;
+            let (body, rest) = bytes.split_at(len);
+            sections.push(Section { name: String::from_utf8_lossy(&name).into_owned(), body, declared_len });
+            bytes = rest;
+        }
+        Ok(())
+    })();
+    (sections, result)
 }
 
 impl FullSnapshot {
@@ -1453,10 +1604,10 @@ impl FullSnapshot {
     }
 
     /// Load a full snapshot from disk. Transparently migrates all legacy formats.
-    /// Uses a streaming BufReader — never reads the whole file into a Vec<u8>.
+    /// V23 bodies decode concurrently from an immutable mapping; legacy layouts stream.
     pub fn load(path: &Path) -> Result<Self> {
-        let mut snap = Self::load_inner(path)?;
-        snap.triplet_store.rebuild_indexes();
+        let (mut snap, rebuilt) = Self::load_inner(path)?;
+        if !rebuilt { snap.triplet_store.rebuild_indexes(); }
         // V22: hydrate per-state refresh timestamps from the persisted map so a
         // restart does not trigger a full competitive-weight refresh sweep.
         for (id, ts) in &snap.cw_refresh_ts {
@@ -1476,7 +1627,13 @@ impl FullSnapshot {
         Ok(snap)
     }
 
-    fn load_inner(path: &Path) -> Result<Self> {
+    fn load_inner(path: &Path) -> Result<(Self, bool)> {
+        let mut rebuilt = false;
+        let snap = Self::load_raw(path, &mut rebuilt)?;
+        Ok((snap, rebuilt))
+    }
+
+    fn load_raw(path: &Path, rebuilt: &mut bool) -> Result<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| FieldError::Manifest(e.to_string()))?;
         let mut r = BufReader::with_capacity(1 << 20, SnapshotReader::new(file));
@@ -1493,61 +1650,29 @@ impl FullSnapshot {
             r.read_exact(&mut seq_buf)
                 .map_err(|_| FieldError::Manifest("v23 snapshot too short".to_string()))?;
             let mut snap = FullSnapshot::empty(u64::from_le_bytes(seq_buf));
-            loop {
-                let mut nlen_buf = [0u8; 2];
-                match r.read_exact(&mut nlen_buf) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(FieldError::Io(e)),
-                }
-                let nlen = u16::from_le_bytes(nlen_buf) as usize;
-                let mut name_buf = vec![0u8; nlen];
-                r.read_exact(&mut name_buf)?;
-                let name = String::from_utf8_lossy(&name_buf).into_owned();
-                let mut blen_buf = [0u8; 8];
-                r.read_exact(&mut blen_buf)?;
-                let blen = u64::from_le_bytes(blen_buf);
-                let mut body = Read::take(&mut r, blen);
-                let n = name.as_str();
-                match n {
-                    "payloads"           => snap.payloads           = read_section(&mut body, n)?,
-                    "states"             => snap.states             = read_section(&mut body, n)?,
-                    "assoc_edges"        => snap.assoc_edges        = read_section(&mut body, n)?,
-                    "artifacts"          => snap.artifacts          = read_section(&mut body, n)?,
-                    "artifact_paths"     => snap.artifact_paths     = read_section(&mut body, n)?,
-                    "time_idx"           => snap.time_idx           = read_section(&mut body, n)?,
-                    "keyword_idx"        => snap.keyword_idx        = read_section(&mut body, n)?,
-                    "artifact_idx"       => snap.artifact_idx       = read_section(&mut body, n)?,
-                    "triplet_store"      => snap.triplet_store      = read_section(&mut body, n)?,
-                    "triplets_clean"     => snap.triplet_store.clean = read_section(&mut body, n)?,
-                    "symbol_idx"         => snap.symbol_idx         = read_section(&mut body, n)?,
-                    "call_graph"         => snap.call_graph         = read_section(&mut body, n)?,
-                    "code_files"         => snap.code_files         = read_section(&mut body, n)?,
-                    "semantic_idx"       => snap.semantic_idx       = read_section(&mut body, n)?,
-                    "coactivation_stats" => snap.coactivation_stats = read_section(&mut body, n)?,
-                    "ack_scores"         => snap.ack_scores         = read_section(&mut body, n)?,
-                    "correction_states"  => snap.correction_states  = read_section(&mut body, n)?,
-                    "event_tape"         => snap.event_tape         = read_section(&mut body, n)?,
-                    "decision_tape"      => snap.decision_tape      = read_section(&mut body, n)?,
-                    "turiya_monitor"     => snap.turiya_monitor     = read_section(&mut body, n)?,
-                    "observer_state"     => snap.observer_state     = read_section(&mut body, n)?,
-                    "interaction_ledger" => snap.interaction_ledger = read_section(&mut body, n)?,
-                    "predicate_store"    => snap.predicate_store    = read_section(&mut body, n)?,
-                    "cw_refresh_ts"      => snap.cw_refresh_ts      = read_section(&mut body, n)?,
-                    "recall_provenance"  => snap.recall_provenance  = read_section(&mut body, n)?,
-                    "utility_posteriors" => snap.utility_posteriors = read_section(&mut body, n)?,
-                    "ledger_session_events" => snap.ledger_session_events = read_section(&mut body, n)?,
-                    _ => {
-                        eprintln!(
-                            "[chitta-field] skipping unknown snapshot section '{}' ({} bytes)",
-                            name, blen
-                        );
-                    }
-                }
-                // Drain whatever the deserializer left so the next section
-                // header is read from the right offset.
-                std::io::copy(&mut body, &mut std::io::sink()).map_err(FieldError::Io)?;
+            // SAFETY: committed snapshots are immutable. save() writes a fresh
+            // temporary file and atomically renames it; pruning/unlinking a file
+            // cannot invalidate this open file's mapping. Keep the mapping alive
+            // until every decoding worker has joined; all decoded values own
+            // their data. Legacy formats keep the historical streaming reader.
+            let bytes = unsafe { memmap2::MmapOptions::new().map(&r.get_ref().file)? };
+            if std::env::var_os("CHITTA_PROFILE_SNAPSHOT").is_some() {
+                // Mapping page faults are included in decode timings, not the
+                // explicit read() timer emitted by SnapshotReader.
+                eprintln!("[chitta-field] snapshot mapped_bytes={}", bytes.len());
             }
+            let (sections, table_result) = section_table(&bytes[16..]);
+            let _phase = crate::profile::SnapshotPhase::new("parallel_sections");
+            // Collect every outcome in file order; parallel short-circuiting
+            // would nondeterministically choose between corrupt sections.
+            let mut jobs: Vec<_> = sections.iter().enumerate().collect();
+            jobs.sort_by_key(|(_, section)| std::cmp::Reverse(section.body.len()));
+            let mut decoded: Vec<_> = decode_pool().install(|| jobs.par_iter()
+                .with_max_len(1).map(|(i, section)| (*i, decode_section(section))).collect());
+            decoded.sort_by_key(|(i, _)| *i);
+            for (_, apply) in decoded { apply?(&mut snap); }
+            table_result?;
+            *rebuilt = true;
             for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
         }
@@ -2246,6 +2371,146 @@ impl FullSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn serial_v23(bytes: &[u8]) -> Result<FullSnapshot> {
+        let mut r = bytes;
+        let mut snap = FullSnapshot::empty(0);
+            loop {
+                let mut nlen_buf = [0u8; 2];
+                match r.read_exact(&mut nlen_buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(FieldError::Io(e)),
+                }
+                let nlen = u16::from_le_bytes(nlen_buf) as usize;
+                let mut name_buf = vec![0u8; nlen];
+                r.read_exact(&mut name_buf)?;
+                let name = String::from_utf8_lossy(&name_buf).into_owned();
+                let mut blen_buf = [0u8; 8];
+                r.read_exact(&mut blen_buf)?;
+                let blen = u64::from_le_bytes(blen_buf);
+                let mut body = Read::take(&mut r, blen);
+                let n = name.as_str();
+                match n {
+                    "payloads"           => snap.payloads           = read_section(&mut body, n)?,
+                    "states"             => snap.states             = read_section(&mut body, n)?,
+                    "assoc_edges"        => snap.assoc_edges        = read_section(&mut body, n)?,
+                    "artifacts"          => snap.artifacts          = read_section(&mut body, n)?,
+                    "artifact_paths"     => snap.artifact_paths     = read_section(&mut body, n)?,
+                    "time_idx"           => snap.time_idx           = read_section(&mut body, n)?,
+                    "keyword_idx"        => snap.keyword_idx        = read_section(&mut body, n)?,
+                    "artifact_idx"       => snap.artifact_idx       = read_section(&mut body, n)?,
+                    "triplet_store"      => snap.triplet_store      = read_section(&mut body, n)?,
+                    "triplets_clean"     => snap.triplet_store.clean = read_section(&mut body, n)?,
+                    "symbol_idx"         => snap.symbol_idx         = read_section(&mut body, n)?,
+                    "call_graph"         => snap.call_graph         = read_section(&mut body, n)?,
+                    "code_files"         => snap.code_files         = read_section(&mut body, n)?,
+                    "semantic_idx"       => snap.semantic_idx       = read_section(&mut body, n)?,
+                    "coactivation_stats" => snap.coactivation_stats = read_section(&mut body, n)?,
+                    "ack_scores"         => snap.ack_scores         = read_section(&mut body, n)?,
+                    "correction_states"  => snap.correction_states  = read_section(&mut body, n)?,
+                    "event_tape"         => snap.event_tape         = read_section(&mut body, n)?,
+                    "decision_tape"      => snap.decision_tape      = read_section(&mut body, n)?,
+                    "turiya_monitor"     => snap.turiya_monitor     = read_section(&mut body, n)?,
+                    "observer_state"     => snap.observer_state     = read_section(&mut body, n)?,
+                    "interaction_ledger" => snap.interaction_ledger = read_section(&mut body, n)?,
+                    "predicate_store"    => snap.predicate_store    = read_section(&mut body, n)?,
+                    "cw_refresh_ts"      => snap.cw_refresh_ts      = read_section(&mut body, n)?,
+                    "recall_provenance"  => snap.recall_provenance  = read_section(&mut body, n)?,
+                    "utility_posteriors" => snap.utility_posteriors = read_section(&mut body, n)?,
+                    "ledger_session_events" => snap.ledger_session_events = read_section(&mut body, n)?,
+                    _ => {
+                        eprintln!(
+                            "[chitta-field] skipping unknown snapshot section '{}' ({} bytes)",
+                            name, blen
+                        );
+                    }
+                }
+                // Drain whatever the deserializer left so the next section
+                // header is read from the right offset.
+                std::io::copy(&mut body, &mut std::io::sink()).map_err(FieldError::Io)?;
+            }
+        Ok(snap)
+    }
+
+    fn parallel_v23(bytes: &[u8]) -> Result<FullSnapshot> {
+        let (sections, tail) = section_table(bytes);
+        let mut snap = FullSnapshot::empty(0);
+        let decoded: Vec<_> = decode_pool().install(|| sections.par_iter().map(decode_section).collect());
+        for result in decoded { result?(&mut snap); }
+        tail?;
+        Ok(snap)
+    }
+
+    #[test]
+    fn parallel_sections_preserve_streaming_errors_at_every_truncation() {
+        let mut bytes = Vec::new();
+        write_section(&mut bytes, "ack_scores", &HashMap::from([(7u64, 5i32), (8, 9)])).unwrap();
+        write_section(&mut bytes, "future_section", &vec![1u64, 2, 3]).unwrap();
+        write_section(&mut bytes, "triplets_clean", &true).unwrap();
+        for end in 0..=bytes.len() {
+            let serial = serial_v23(&bytes[..end]);
+            let parallel = parallel_v23(&bytes[..end]);
+            match (serial, parallel) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.ack_scores, b.ack_scores, "end={end}");
+                    assert_eq!(a.triplet_store.clean, b.triplet_store.clean, "end={end}");
+                }
+                (Err(a), Err(b)) => {
+                    assert_eq!(std::mem::discriminant(&a), std::mem::discriminant(&b), "end={end}");
+                    assert_eq!(a.to_string(), b.to_string(), "end={end}");
+                }
+                _ => panic!("different acceptance at end={end}"),
+            }
+        }
+        // An earlier corrupt body wins over either a later corrupt body or header.
+        let mut bad = Vec::new();
+        write_section(&mut bad, "triplets_clean", &2u8).unwrap();
+        write_section(&mut bad, "ack_scores", &0u8).unwrap();
+        bad.extend_from_slice(&[10, 0, b'a']);
+        for _ in 0..20 {
+            assert_eq!(serial_v23(&bad).err().unwrap().to_string(), parallel_v23(&bad).err().unwrap().to_string());
+        }
+    }
+
+    #[test]
+    fn parallel_sections_preserve_duplicate_order_and_short_unknown_body() {
+        let mut bytes = Vec::new();
+        write_section(&mut bytes, "triplets_clean", &true).unwrap();
+        write_section(&mut bytes, "triplet_store", &TripletStore::new()).unwrap();
+        assert!(!parallel_v23(&bytes).unwrap().triplet_store.clean);
+        write_section(&mut bytes, "triplets_clean", &true).unwrap();
+        write_section(&mut bytes, "ack_scores", &HashMap::from([(1u64, 3i32)])).unwrap();
+        write_section(&mut bytes, "ack_scores", &HashMap::from([(2u64, 7i32)])).unwrap();
+        // Both old and new readers allow body padding and a truncated unknown body.
+        bytes.extend_from_slice(&6u16.to_le_bytes());
+        bytes.extend_from_slice(b"future");
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.push(9);
+        let snap = parallel_v23(&bytes).unwrap();
+        assert!(snap.triplet_store.clean);
+        assert_eq!(snap.ack_scores, HashMap::from([(2, 7)]));
+        assert_eq!(serial_v23(&bytes).unwrap().ack_scores, snap.ack_scores);
+    }
+
+    #[test]
+    fn presized_maps_match_bincode_and_bound_corrupt_count() {
+        let entries: Vec<_> = (0u64..40_000).map(|id| (id, id + 1)).collect();
+        // A vector of pairs has the same wire layout as a bincode map. Duplicate
+        // keys remain last-wins, even when the advertised count exceeds unique keys.
+        let mut duplicated = entries.clone();
+        duplicated.push((0, 99));
+        let mut bytes = bincode::serialize(&duplicated).unwrap();
+        bytes.extend_from_slice(b"padding");
+        let expected: HashMap<u64, u64> = read_section(&mut &bytes[..], "test").unwrap();
+        let actual: HashMap<u64, u64> = read_map_section(&bytes, "test").unwrap();
+        assert_eq!(expected, actual);
+        let corrupt = u64::MAX.to_le_bytes();
+        let old = read_section::<_, HashMap<u64, u64>>(&mut &corrupt[..], "test").unwrap_err();
+        let new = read_map_section::<u64, u64>(&corrupt, "test").unwrap_err();
+        assert_eq!(old.to_string(), new.to_string());
+    }
+
 
     #[test]
     fn rsf_sidecar_roundtrip_and_missing() {

@@ -89,3 +89,18 @@ pub(crate) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("CHITTA_RECALL_PROFILE").as_deref() == Ok("1"))
 }
+
+/// Detailed snapshot timings are opt-in; phase names also identify decode jobs.
+pub(crate) struct SnapshotPhase<'a>(&'a str, Option<Instant>);
+impl<'a> SnapshotPhase<'a> {
+    pub(crate) fn new(name: &'a str) -> Self {
+        Self(name, std::env::var_os("CHITTA_PROFILE_SNAPSHOT").is_some().then(Instant::now))
+    }
+}
+impl Drop for SnapshotPhase<'_> {
+    fn drop(&mut self) {
+        if let Some(start) = self.1 {
+            eprintln!("[chitta-field] snapshot section={} decode_ms={}", self.0, start.elapsed().as_millis());
+        }
+    }
+}
