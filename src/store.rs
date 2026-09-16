@@ -1370,9 +1370,11 @@ impl ChittaField {
             }
         }
         let content_str = std::str::from_utf8(content).unwrap_or("").to_string();
-        let observer_canonicals = self.observer.extract(
-            &content_str, memory_id, authored_at_ms, &mut self.observer_state.write(),
-        );
+        let observer_canonicals = if self.ablations.disabled("observer") || self.ablations.disabled("observer_state") {
+            Vec::new()
+        } else {
+            self.observer.extract(&content_str, memory_id, authored_at_ms, &mut self.observer_state.write())
+        };
         let index_text = if observer_canonicals.is_empty() {
             extract_bm25_text(&content_str, self.filter_level())
         } else {
@@ -1391,7 +1393,7 @@ impl ChittaField {
         self.hdc_idx.write().insert(memory_id, &content_str, realm);
 
         // Log structured event to CEC tape; compute surprisal for strength gating.
-        {
+        if !self.ablations.disabled("event_tape") {
             let (sym, turn, last_n, surprisal) = {
                 let mut tape = self.event_tape.write();
                 let context = tape.last_n_syms(8);
@@ -1403,9 +1405,10 @@ impl ChittaField {
                 (s, t, n, surprisal)
             };
             let mut cdawg = self.cdawg.write();
-            cdawg.extend(sym, turn);
+            if !self.ablations.disabled("cdawg") { cdawg.extend(sym, turn); }
             // Phase 15: update FEP model and blend surprisal signal.
-            let fep_free_energy = self.fep_prior.write().observe_packed(sym, &cdawg).free_energy;
+            let fep_free_energy = if self.ablations.disabled("fep_prior") { 0.0 }
+                else { self.fep_prior.write().observe_packed(sym, &cdawg).free_energy };
             // Surprisal-gated burn-in: blend PPM surprisal with FEP free energy.
             // High free_energy (>2.0 nats) OR high PPM surprisal → burn in memory.
             const SURPRISAL_THRESHOLD: f32 = 2.0;
@@ -1461,7 +1464,7 @@ impl ChittaField {
         }
 
         // G6: register process-genome into the QD archive under its (realm, task_type) niche.
-        if kind == "process" {
+        if kind == "process" && !self.ablations.disabled("archive") {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(content) {
                 let genome_realm = v["sampler_config"]["realm"].as_str().unwrap_or("unknown").to_string();
                 let task = v["task_type"].as_str().unwrap_or("unknown").to_string();
@@ -2092,14 +2095,17 @@ impl ChittaField {
     // ── Soul REPL session persistence ──────────────────────────────────────────
 
     pub fn repl_session_get(&self, id: &str) -> Option<String> {
+        if self.ablations.disabled("repl_sessions") { return None; }
         self.repl_sessions.read().get(id).map(|s| s.namespace_json.clone())
     }
 
     pub fn repl_session_set(&self, id: &str, namespace_json: &str, updated_ms: i64) {
+        if self.ablations.disabled("repl_sessions") { return (); }
         self.repl_sessions.write().set(id.to_string(), namespace_json.to_string(), updated_ms);
     }
 
     pub fn repl_session_delete(&self, id: &str) -> bool {
+        if self.ablations.disabled("repl_sessions") { return false; }
         self.repl_sessions.write().delete(id)
     }
 
@@ -2113,6 +2119,7 @@ impl ChittaField {
         socket_path: &str,
         max_output: usize,
     ) -> String {
+        if self.ablations.disabled("repl_sessions") { return String::from("{}"); }
         let initial_ns = if reset {
             None
         } else {
@@ -2147,6 +2154,7 @@ impl ChittaField {
     }
 
     pub fn repl_session_list(&self) -> String {
+        if self.ablations.disabled("repl_sessions") { return String::from("[]"); }
         let store = self.repl_sessions.read();
         let entries: Vec<serde_json::Value> = store.list().iter().map(|s| serde_json::json!({
             "id": s.id,
@@ -2502,6 +2510,7 @@ impl ChittaField {
     /// `outcome`: 0=success 1=fail 2=error 3=partial.
     /// Also pushes TD(λ) eligibility-trace credit for non-synthetic events.
     pub fn log_event(&self, tool: &str, entity: &str, outcome: u8, session_id: u64, ts_ms: i64) {
+        if self.ablations.disabled("event_tape") { return (); }
         let (sym, turn, last_n) = {
             let mut tape = self.event_tape.write();
             let s = tape.log(tool, entity, outcome, session_id, ts_ms);
@@ -2565,6 +2574,7 @@ impl ChittaField {
 
     /// Record an outcome (success/failure) for the most recent action on (tool, entity).
     pub fn record_action_outcome(&self, tool: &str, entity: &str, outcome: u8, success: bool) {
+        if self.ablations.disabled("event_tape") { return (); }
         let sym = self.event_tape.write().symbol_of(tool, entity, outcome);
         self.cdawg.write().record_outcome(&[sym], success);
     }
@@ -2923,12 +2933,14 @@ impl ChittaField {
 
     /// Apply feedback for a recall episode (route learning).
     pub fn feedback(&self, episode_id: u64, reward: f32) -> Result<()> {
+        if self.ablations.disabled("learners") { return Ok(()); }
         self.learners.write().route.feedback(episode_id, reward);
         Ok(())
     }
 
     /// Get recommended window size for a session type.
     pub fn recommended_window(&self, session_type: &str) -> usize {
+        if self.ablations.disabled("learners") { return 0; }
         self.learners
             .read()
             .context
@@ -2937,6 +2949,7 @@ impl ChittaField {
 
     /// Record context outcome for a session type and window size.
     pub fn record_context_outcome(&self, session_type: &str, size: usize, outcome: f32) {
+        if self.ablations.disabled("learners") { return (); }
         self.learners
             .write()
             .context
@@ -2945,6 +2958,7 @@ impl ChittaField {
 
     /// Select a retrieval route using Thompson sampling. Returns (episode_id, route).
     pub fn select_route(&self, query: &str) -> (u64, Route) {
+        if self.ablations.disabled("learners") { return (0, Route::Hybrid); }
         let intent = RouteLearner::detect_intent(query);
         let now_ms = now_ms() as u64;
         self.learners.write().route.select_route(intent, now_ms)
@@ -3190,10 +3204,12 @@ impl ChittaField {
     }
 
     pub fn cortical_count(&self) -> usize {
+        if self.ablations.disabled("cortical_idx") { return 0; }
         self.cortical_idx.read().len()
     }
 
     pub fn prototype_count(&self) -> usize {
+        if self.ablations.disabled("cortical_idx") { return 0; }
         self.cortical_idx.read().prototype_count()
     }
 
@@ -3211,6 +3227,7 @@ impl ChittaField {
         deadline_ms: Option<i64>,
         tags: Vec<String>,
     ) -> Result<u64> {
+        if self.ablations.disabled("agent_protocol_store") { return Ok(0); }
         let now = now_ms();
         let id = self.agent_protocol_store.write().register_task(
             goal.clone(), constraints.clone(), acceptance_criteria.clone(),
@@ -3231,6 +3248,7 @@ impl ChittaField {
         add_intervention_id: Option<u64>,
         add_tag: Option<String>,
     ) -> Result<bool> {
+        if self.ablations.disabled("agent_protocol_store") { return Ok(false); }
         use crate::organ::agent_protocol::TaskStatus;
         let now = now_ms();
         let status_enum = status.map(TaskStatus::from_u8);
@@ -3256,6 +3274,7 @@ impl ChittaField {
         to_agent: String,
         handoff_note: Option<String>,
     ) -> Result<Option<u64>> {
+        if self.ablations.disabled("agent_protocol_store") { return Ok(None); }
         let now = now_ms();
         let opt_id = self.agent_protocol_store.write().add_delegation(
             task_id, from_agent.clone(), to_agent.clone(), handoff_note.clone(), now,
@@ -3276,6 +3295,7 @@ impl ChittaField {
         evidence_kind: u8,
         relevance: f32,
     ) -> Result<Option<u64>> {
+        if self.ablations.disabled("agent_protocol_store") { return Ok(None); }
         use crate::organ::agent_protocol::EvidenceKind;
         let now = now_ms();
         let opt_id = self.agent_protocol_store.write().link_evidence(
@@ -3297,6 +3317,7 @@ impl ChittaField {
         expected_answerer: Option<String>,
         priority: u8,
     ) -> Result<Option<u64>> {
+        if self.ablations.disabled("agent_protocol_store") { return Ok(None); }
         let now = now_ms();
         let opt_id = self.agent_protocol_store.write().add_probe(
             task_id, question.clone(), expected_answerer.clone(), priority, now,
@@ -3315,6 +3336,7 @@ impl ChittaField {
         status: u8,
         answer: Option<String>,
     ) -> Result<bool> {
+        if self.ablations.disabled("agent_protocol_store") { return Ok(false); }
         use crate::organ::agent_protocol::ProbeStatus;
         let now = now_ms();
         let ok = self.agent_protocol_store.write().resolve_probe(
@@ -3335,6 +3357,7 @@ impl ChittaField {
         is_met: bool,
         evidence_note: Option<String>,
     ) -> Result<Option<u64>> {
+        if self.ablations.disabled("agent_protocol_store") { return Ok(None); }
         let now = now_ms();
         let opt_id = self.agent_protocol_store.write().set_criterion(
             task_id, criterion.clone(), is_met, evidence_note.clone(), now,
@@ -3350,6 +3373,7 @@ impl ChittaField {
     pub fn get_task_full(&self, task_id: u64)
         -> Option<crate::organ::agent_protocol::TaskFullView>
     {
+        if self.ablations.disabled("agent_protocol_store") { return None; }
         self.agent_protocol_store.read().get_task_full(task_id)
     }
 
@@ -3361,6 +3385,7 @@ impl ChittaField {
         priority: Option<u8>,
         limit: usize,
     ) -> Vec<crate::organ::agent_protocol::TaskContract> {
+        if self.ablations.disabled("agent_protocol_store") { return Vec::new(); }
         use crate::organ::agent_protocol::TaskStatus;
         self.agent_protocol_store
             .read()
@@ -3375,6 +3400,7 @@ impl ChittaField {
     }
 
     pub fn auto_complete_tasks(&self) -> Result<usize> {
+        if self.ablations.disabled("agent_protocol_store") { return Ok(0); }
         let task_ids = self.agent_protocol_store.read().tasks_with_all_criteria_met();
         let mut completed = 0usize;
         for tid in task_ids {
@@ -3388,6 +3414,7 @@ impl ChittaField {
     // ── Interaction Ledger ──────────────────────────────────────────────────────
 
     pub fn ledger_append(&self, ev: crate::organ::interaction_ledger::InteractionEvent) -> Result<u64> {
+        if self.ablations.disabled("interaction_ledger") { return Ok(0); }
         Ok(self.interaction_ledger.write().append(ev))
     }
 
@@ -3398,6 +3425,7 @@ impl ChittaField {
         since_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<crate::organ::interaction_ledger::InteractionEvent>> {
+        if self.ablations.disabled("interaction_ledger") { return Ok(Vec::new()); }
         Ok(self.interaction_ledger.read()
             .query(kind.as_ref(), session_id, since_ms, limit)
             .into_iter()
@@ -3406,6 +3434,7 @@ impl ChittaField {
     }
 
     pub fn ledger_compile(&self) -> Result<usize> {
+        if self.ablations.disabled("interaction_ledger") { return Ok(0); }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -3417,10 +3446,12 @@ impl ChittaField {
     }
 
     pub fn ledger_contradictions(&self) -> Result<Vec<(String, String, Vec<u64>)>> {
+        if self.ablations.disabled("interaction_ledger") { return Ok(Vec::new()); }
         Ok(self.interaction_ledger.read().contested())
     }
 
     pub fn predicate_attach(&self, memory_id: u64, check_cmd: String) -> Result<u64> {
+        if self.ablations.disabled("predicate_store") { return Ok(0); }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -3431,6 +3462,7 @@ impl ChittaField {
     /// Run all predicates for a memory. Returns JSON with per-predicate results.
     /// Weakens memory confidence by 0.1 for each failing predicate (min 0.1).
     pub fn predicate_run(&self, memory_id: u64) -> Result<String> {
+        if self.ablations.disabled("predicate_store") { return Ok(String::from("[]")); }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -3466,6 +3498,7 @@ impl ChittaField {
     }
 
     pub fn predicate_list(&self, memory_id: u64) -> Result<String> {
+        if self.ablations.disabled("predicate_store") { return Ok(String::from("[]")); }
         let store = self.predicate_store.read();
         let preds = store.for_memory(memory_id);
         let result = serde_json::json!({
@@ -3494,6 +3527,7 @@ impl ChittaField {
         notes: Option<String>,
         timestamp_ms: i64,
     ) -> u64 {
+        if self.ablations.disabled("symbol_event_log") { return 0; }
         let ev = crate::organ::symbol_events::SymbolEvent {
             id: 0,
             symbol_name: symbol_name.clone(),
@@ -3530,6 +3564,7 @@ impl ChittaField {
         file_path: Option<&str>,
         limit: usize,
     ) -> String {
+        if self.ablations.disabled("symbol_event_log") { return String::from("[]"); }
         let log = self.symbol_event_log.read();
         let hits = log.query(symbol_name, file_path, limit);
         let arr: Vec<serde_json::Value> = hits.iter().map(|e| serde_json::json!({

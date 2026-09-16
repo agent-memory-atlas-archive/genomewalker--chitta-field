@@ -795,6 +795,7 @@ impl ChittaField {
     }
 
     pub fn encode_memory(&self, memory_id: MemoryId) -> Result<()> {
+        if self.ablations.disabled("cortical_idx") || self.ablations.disabled("sparse_encoder") { return Ok(()); }
         let embedding = self.embedding_of(memory_id);
         let Some(embedding) = embedding else {
             return Ok(());
@@ -887,7 +888,7 @@ impl ChittaField {
         let path = self
             .data_dir
             .join(format!("cortex.{:08x}.snapshot", self.instance_id));
-        self.cortical_idx.read().save_snapshot(&path, seqno)
+        self.cortical_idx.persisted_read().save_snapshot(&path, seqno)
     }
 
     /// Save full in-memory state to a binary snapshot (chitta.snapshot).
@@ -1119,12 +1120,12 @@ impl ChittaField {
         };
         let ack_scores = self.ack_scores.read().clone();
         let correction_states = self.triplet_store.read().correction_states.clone();
-        let event_tape = self.event_tape.read().clone();
-        let decision_tape = self.decision_tape.read().clone();
-        let turiya_monitor = self.turiya_monitor.read().clone();
-        let observer_state = self.observer_state.read().clone();
-        let interaction_ledger = self.interaction_ledger.read().clone();
-        let predicate_store = self.predicate_store.read().clone();
+        let event_tape = self.event_tape.persisted_read().clone();
+        let decision_tape = self.decision_tape.persisted_read().clone();
+        let turiya_monitor = self.turiya_monitor.persisted_read().clone();
+        let observer_state = self.observer_state.persisted_read().clone();
+        let interaction_ledger = self.interaction_ledger.persisted_read().clone();
+        let predicate_store = self.predicate_store.persisted_read().clone();
         let recall_provenance = self.recall_provenance.read().clone();
         let mut snap = FullSnapshot {
             snapshot_seqno: seqno,
@@ -1153,7 +1154,7 @@ impl ChittaField {
             recall_provenance,
             cw_refresh_ts,
             utility_posteriors,
-            ledger_session_events: self.msg_registry.read().ledger_session_events(),
+            ledger_session_events: self.msg_registry.persisted_read().ledger_session_events(),
         };
         let path = self
             .data_dir
@@ -1241,7 +1242,7 @@ impl ChittaField {
         // Dirty-skipped when the store hasn't mutated since the last write
         // (the sidecar is a lossy cache; a same-content file stays valid).
         {
-            let hdc = self.hdc_idx.read();
+            let hdc = self.hdc_idx.persisted_read();
             let count = hdc.mutation_count();
             let last = self
                 .hdc_sidecar_saved_at
@@ -1641,6 +1642,7 @@ impl ChittaField {
 
     /// Encode all memories that don't yet have a sparse code.
     pub fn encode_all_unindexed(&self) -> Result<usize> {
+        if self.ablations.disabled("cortical_idx") || self.ablations.disabled("sparse_encoder") { return Ok(0); }
         // Collect only memories that CAN encode: skip deleted (payloads
         // outlive soft-delete), empty/foreign-dim embeddings (the stripped-
         // snapshot rehydrator deliberately leaves deleted ones empty), and
@@ -1675,6 +1677,7 @@ impl ChittaField {
     /// Train a ProductQuantizer from the residuals of all encoded memories.
     /// Requires at least 256 memories with sparse codes.
     pub fn train_pq(&self) -> Result<()> {
+        if self.ablations.disabled("cortical_idx") || self.ablations.disabled("sparse_encoder") { return Ok(()); }
         // Collect residuals: for each memory with a sparse code, decode and subtract
         let residuals: Vec<Vec<f32>> = {
             let payloads = self.payloads.read();
@@ -1720,6 +1723,7 @@ impl ChittaField {
 
     /// Encode PQ residual for a single memory. The PQ must already be trained.
     pub fn encode_pq_memory(&self, memory_id: MemoryId) -> Result<()> {
+        if self.ablations.disabled("cortical_idx") || self.ablations.disabled("sparse_encoder") { return Ok(()); }
         let embedding = self.embedding_of(memory_id);
         let Some(embedding) = embedding else {
             return Ok(());
@@ -1769,6 +1773,7 @@ impl ChittaField {
     /// If PQ is not yet trained, trains it first.
     /// Returns the count of memories PQ-encoded.
     pub fn encode_all_pq(&self) -> Result<usize> {
+        if self.ablations.disabled("cortical_idx") || self.ablations.disabled("sparse_encoder") { return Ok(0); }
         if !self.cortical_idx.read().is_pq_trained() {
             self.train_pq()?;
         }
@@ -1793,6 +1798,7 @@ impl ChittaField {
 
     /// Return how many memories have PQ residual codes.
     pub fn pq_count(&self) -> usize {
+        if self.ablations.disabled("cortical_idx") { return 0; }
         self.cortical_idx.read().pq_count()
     }
 

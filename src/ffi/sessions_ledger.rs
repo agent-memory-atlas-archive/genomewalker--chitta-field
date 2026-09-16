@@ -153,6 +153,11 @@ pub extern "C" fn cf_emit_event(
         _ => return handle.err(format!("unknown domain: {}", domain_str)),
     };
 
+    if handle.field.ablations.suppresses(&op) {
+        unsafe { *out_event_id = 0; }
+        return handle.ok();
+    }
+
     let result = handle.field.log.write().append(&op);
     match result {
         Ok(_seqno) => {

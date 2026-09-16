@@ -854,6 +854,7 @@ pub extern "C" fn cf_run_demotion(h: *mut CfHandle, now_ms: i64) -> u64 {
 pub extern "C" fn cf_reconstruction_error(h: *const CfHandle, memory_id: u64) -> f32 {
     if h.is_null() { return -1.0; }
     let handle = unsafe { &*h };
+    if handle.field.ablations.disabled("sparse_encoder") { return 0.0; }
     let embedding = match handle.field.embedding_of(memory_id) {
         Some(e) if e.len() == crate::ops::EMBED_DIM => e,
         _ => return -1.0,
@@ -891,6 +892,7 @@ pub extern "C" fn cf_search_attractor(
         return -1;
     }
     let handle = unsafe { &*h };
+    if handle.field.ablations.disabled("sparse_encoder") || handle.field.ablations.disabled("cortical_idx") { unsafe { *written = 0; } return 0; }
     if dim != crate::ops::EMBED_DIM { return -1; }
     let emb = unsafe { std::slice::from_raw_parts(embedding, dim) };
 

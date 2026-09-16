@@ -363,7 +363,7 @@ impl ChittaField {
                     state,
                     kind: &payload.kind,
                     realm: &payload.realm,
-                    realm_reliability: learners.domain_reliability.reliability(&payload.realm),
+                    realm_reliability: if self.ablations.disabled("learners") { 1.0 } else { learners.domain_reliability.reliability(&payload.realm) },
                     now_ms: now,
                     query_valence,
                     query_arousal,
@@ -524,9 +524,7 @@ impl ChittaField {
                             state,
                             kind: &payload.kind,
                             realm: &payload.realm,
-                            realm_reliability: learners
-                                .domain_reliability
-                                .reliability(&payload.realm),
+                            realm_reliability: if self.ablations.disabled("learners") { 1.0 } else { learners.domain_reliability.reliability(&payload.realm) },
                             now_ms: now,
                             query_valence,
                             query_arousal,
@@ -1257,6 +1255,7 @@ impl ChittaField {
         end_ms: i64,
         limit: usize,
     ) -> Result<Vec<RecallHit>> {
+        if self.ablations.disabled("event_tape") { return Ok(Vec::new()); }
         // Collect unique entity names from EventTape events in [start_ms, end_ms]
         let active_entities: Vec<String> = {
             let tape = self.event_tape.read();
@@ -1294,6 +1293,7 @@ impl ChittaField {
     /// Causal recall: return the last N events matching (tool, entity) as RecallHit stubs.
     /// Content field contains a human-readable description of the event sequence.
     pub fn recall_causal(&self, tool: &str, entity: &str, k: usize) -> Result<Vec<RecallHit>> {
+        if self.ablations.disabled("event_tape") || self.ablations.disabled("cdawg") { return Ok(Vec::new()); }
         let sym = {
             let mut tape = self.event_tape.write();
             tape.symbol_of(tool, entity, 0) // outcome=0 as probe; CDAWG walk ignores outcome bits via partial match
@@ -1352,6 +1352,7 @@ impl ChittaField {
 
     /// Return top-k failure patterns from the CDAWG as RecallHit stubs.
     pub fn recall_failure_pattern(&self, k: usize) -> Result<Vec<RecallHit>> {
+        if self.ablations.disabled("event_tape") || self.ablations.disabled("cdawg") { return Ok(Vec::new()); }
         let tape  = self.event_tape.read();
         let cdawg = self.cdawg.read();
         let patterns = cdawg.failure_patterns(3, k);
@@ -1397,6 +1398,7 @@ impl ChittaField {
     /// PMI-ranked causal antecedents: what actions typically precede (tool, entity)?
     /// Returns RecallHit stubs ranked by pointwise mutual information.
     pub fn recall_causal_antecedent(&self, tool: &str, entity: &str, k: usize) -> Result<Vec<RecallHit>> {
+        if self.ablations.disabled("event_tape") || self.ablations.disabled("cdawg") { return Ok(Vec::new()); }
         let sym = {
             let mut tape = self.event_tape.write();
             tape.symbol_of(tool, entity, 0)
@@ -1465,6 +1467,7 @@ impl ChittaField {
         query_role: &str,
         k: usize,
     ) -> Result<Vec<RecallHit>> {
+        if self.ablations.disabled("episode_hdc") { return Ok(Vec::new()); }
         let results = self.episode_hdc.read().recall_hdcbind(known_role, known_val, query_role, k);
         let hits = results
             .into_iter()
@@ -1513,6 +1516,7 @@ impl ChittaField {
         outcome: u8,
         k:       usize,
     ) -> Result<Vec<RecallHit>> {
+        if self.ablations.disabled("event_tape") || self.ablations.disabled("cdawg") { return Ok(Vec::new()); }
         use crate::organ::cdawg::CounterfactualHit;
         let taken_sym = self.event_tape.write().symbol_of(tool, entity, outcome);
         let context   = self.event_tape.read().last_n_syms(4);
@@ -1664,6 +1668,7 @@ impl ChittaField {
 
     /// Return top-k CDAWG states reachable from (tool, entity) ranked by Q-value.
     pub fn recall_motif_value(&self, tool: &str, entity: &str, k: usize) -> Result<Vec<RecallHit>> {
+        if self.ablations.disabled("event_tape") || self.ablations.disabled("cdawg") { return Ok(Vec::new()); }
         let sym = {
             let mut tape = self.event_tape.write();
             tape.symbol_of(tool, entity, 0)
@@ -1717,6 +1722,7 @@ impl ChittaField {
     pub fn recall_true_counterfactual(
         &self, tool: &str, entity: &str, outcome: u8, k: usize,
     ) -> Result<Vec<RecallHit>> {
+        if self.ablations.disabled("event_tape") || self.ablations.disabled("decision_tape") { return Ok(Vec::new()); }
         let sym = self.event_tape.read().symbol_of_ro(tool, entity, outcome);
         let etape = self.event_tape.read();
         let tape = self.decision_tape.read();
@@ -1816,7 +1822,7 @@ impl ChittaField {
                     state,
                     kind: &payload.kind,
                     realm: &payload.realm,
-                    realm_reliability: learners.domain_reliability.reliability(&payload.realm),
+                    realm_reliability: if self.ablations.disabled("learners") { 1.0 } else { learners.domain_reliability.reliability(&payload.realm) },
                     now_ms: now,
                     query_valence,
                     query_arousal,
@@ -2031,7 +2037,7 @@ impl ChittaField {
         };
         // Snapshot the per-realm reliability learner so the stratify pass can
         // Thompson-sample without holding the learner lock during scoring.
-        let reliability = if stratify {
+        let reliability = if stratify && !self.ablations.disabled("learners") {
             Some(self.learners.read().domain_reliability.clone())
         } else {
             None
@@ -2075,7 +2081,7 @@ impl ChittaField {
                 // Gated by use_cortical (default false) and a non-empty cortical index.
                 // Re-ranker shape: cortical can only reorder merged candidates, never inject new ones.
                 let use_cortical = self.scoring_pipeline.read().config.use_cortical;
-                if use_cortical && !self.cortical_idx.read().is_empty() {
+                if use_cortical && !self.ablations.disabled("sparse_encoder") && !self.cortical_idx.read().is_empty() {
                     let cortical_rrf_k = self.scoring_pipeline.read().config.cortical_rrf_k;
                     let code = self.sparse_encoder.read().encode(query_embedding);
                     if !code.is_empty() {
