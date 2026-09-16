@@ -11701,6 +11701,39 @@ mod tests {
             .unwrap().0
     }
 
+    #[test]
+    fn chaos_unlinked_wal_preserves_n_plus_m_memories() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut ids = Vec::new();
+        {
+            let field = ChittaField::open(data_dir.clone()).unwrap();
+            for n in 0..5 {
+                ids.push(put_test_memory(&field, format!("before unlink {n}").as_bytes()));
+            }
+            field.flush().unwrap();
+            // One writer, one cycle, no snapshot: all N records must come from
+            // the unlinked descriptor, not a snapshot-covered prefix.
+            for entry in std::fs::read_dir(data_dir.join("segments")).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "seg") {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            for n in 0..7 {
+                ids.push(put_test_memory(&field, format!("after unlink {n}").as_bytes()));
+            }
+            field.flush().unwrap();
+        }
+        assert_eq!(ids.iter().copied().collect::<std::collections::HashSet<_>>().len(), 12);
+        let reopened = ChittaField::open(data_dir).unwrap();
+        for (n, id) in ids.into_iter().enumerate() {
+            let text = if n < 5 { format!("before unlink {n}") }
+                       else { format!("after unlink {}", n - 5) };
+            assert_eq!(reopened.get_memory(id).unwrap().content, text.as_bytes());
+        }
+    }
+
     /// Bug fix: UpdateState replay used now_ms=0, corrupting last_accessed_ms and
     /// last_strengthened_ms. After reopen the timestamps must reflect op_ts_ms, not epoch 0.
     #[test]

@@ -203,6 +203,7 @@ impl OpLog {
             if size < MAX_SEGMENT_SIZE && is_chained_segment(last_path) && lineage_ok {
                 let f = OpenOptions::new()
                     .append(true)
+                    .read(true)
                     .open(last_path)?;
                 return Ok(Self {
                     data_dir: data_dir.to_path_buf(),
@@ -252,7 +253,7 @@ impl OpLog {
         // does several appends under the exclusive RPC lock (lockprof 2026-09-15:
         // remember held 450-1100 ms).
         if self.segment_vanished() {
-            eprintln!("[chitta-field] WAL segment {} vanished — opening a fresh segment", self.current_segment_path.display());
+            eprintln!("[chitta-field] WAL segment {} vanished — restoring from open descriptor", self.current_segment_path.display());
             self.recover_segment()?;
             self.recoveries += 1;
         }
@@ -287,7 +288,7 @@ impl OpLog {
         record.extend_from_slice(&payload);
         record.extend_from_slice(&crc.to_be_bytes());
         if let Err(e) = self.current_segment.write_all(&record).and_then(|_| self.current_segment.flush()) {
-            eprintln!("[chitta-field] WAL append failed on {}: {} — opening a fresh segment", self.current_segment_path.display(), e);
+            eprintln!("[chitta-field] WAL append failed on {}: {} — restoring accepted WAL prefix", self.current_segment_path.display(), e);
             self.recover_segment()?;
             self.current_segment.write_all(&record)?;
             self.current_segment.flush()?;
@@ -310,7 +311,7 @@ impl OpLog {
     /// Force fsync — call after critical mutations (put_memory, forget, etc.)
     pub fn sync(&mut self) -> Result<()> {
         if self.segment_vanished() || !self.current_segment_path.exists() {
-            eprintln!("[chitta-field] WAL segment {} vanished — opening a fresh segment", self.current_segment_path.display());
+            eprintln!("[chitta-field] WAL segment {} vanished — restoring from open descriptor", self.current_segment_path.display());
             self.recover_segment()?;
             self.recoveries += 1;
         }
@@ -319,7 +320,7 @@ impl OpLog {
         if let Err(e) = self.current_segment.get_ref().sync_data() {
             // A stale/deleted segment cannot become durable; move to a fresh one
             // so the next appends are, and surface it once per recovery.
-            eprintln!("[chitta-field] WAL sync failed on {}: {} — opening a fresh segment", self.current_segment_path.display(), e);
+            eprintln!("[chitta-field] WAL sync failed on {}: {} — restoring accepted WAL prefix", self.current_segment_path.display(), e);
             self.recover_segment()?;
             self.recoveries += 1;
         }
@@ -328,7 +329,7 @@ impl OpLog {
         Ok(())
     }
 
-    /// Number of times the writer had to abandon a segment file.
+    /// Number of detected segment recoveries.
     pub fn recovery_count(&self) -> u64 { self.recoveries }
 
 
@@ -341,14 +342,32 @@ impl OpLog {
         }
     }
 
-    /// Abandon the current segment file (deleted or stale underneath us) and
-    /// start a new one at the next seqno; the hash chain continues unbroken.
+    /// Restore the complete accepted prefix from the open descriptor. The old
+    /// inode remains readable after unlink (including NFS silly-renames). Copy
+    /// in bounded chunks; do not copy a failed append's partial/torn record or
+    /// flush its BufWriter again. Keep the original header, name and hash chain.
     fn recover_segment(&mut self) -> Result<()> {
-        let new_path = segment_path(&self.data_dir, self.instance_id, self.next_seqno);
-        let f = create_segment_v3(&new_path, self.next_seqno, &self.chain_head, self.vector_space_id)?;
-        self.current_segment = BufWriter::new(f);
-        self.current_segment_path = new_path;
-        self.current_segment_size = V3_HEADER_SIZE as u64;
+        use std::os::unix::fs::FileExt;
+        let tmp = self.current_segment_path.with_extension("recovering");
+        let mut f = OpenOptions::new().read(true).write(true).create(true)
+            .truncate(true).open(&tmp)?;
+        let mut offset = 0;
+        let mut buf = [0u8; 64 * 1024];
+        while offset < self.current_segment_size {
+            let count = (self.current_segment_size - offset).min(buf.len() as u64) as usize;
+            self.current_segment.get_ref().read_exact_at(&mut buf[..count], offset)?;
+            f.write_all(&buf[..count])?;
+            offset += count as u64;
+        }
+        f.sync_all()?;
+        fs::rename(&tmp, &self.current_segment_path)?;
+        File::open(self.current_segment_path.parent().unwrap())?.sync_all()?;
+        // into_parts discards any buffered bytes from a failed append, rather
+        // than retrying them on drop after the accepted prefix was restored.
+        let old = std::mem::replace(&mut self.current_segment, BufWriter::new(f));
+        let _ = old.into_parts();
+        eprintln!("[chitta-field] recovered WAL segment {}: {} bytes",
+                  self.current_segment_path.display(), offset);
         Ok(())
     }
 
@@ -543,6 +562,7 @@ fn create_segment_v2(path: &Path, first_seqno: u64, chain_head: &ChainHash) -> R
 
 fn create_segment_v3(path: &Path, first_seqno: u64, chain_head: &ChainHash, vector_space_id: u64) -> Result<File> {
     let mut f = OpenOptions::new()
+        .read(true)
         .write(true)
         .create(true)
         .truncate(true)
@@ -1031,13 +1051,17 @@ mod tests {
     }
 
     #[test]
-    fn chaos_unlinked_segment_recovers_durable_suffix() {
+    fn chaos_unlinked_segment_recovers_full_prefix_and_suffix() {
         let tmp = ScratchDir::new("unlinked-segment");
         let mut log = OpLog::open(tmp.path(), 0x7788, 0).unwrap();
-        log.append(&make_op(1)).unwrap();
+        for id in 1..=5 { log.append(&make_op(id)).unwrap(); }
         log.sync().unwrap();
+        let next = log.next_seqno;
+        let chain = log.chain_head;
+        drop(log);
+        let mut log = OpLog::open_with_chain(tmp.path(), 0x7788, next, chain).unwrap();
         fs::remove_file(&log.current_segment_path).unwrap();
-        for id in 2..=8 { log.append(&make_op(id)).unwrap(); }
+        for id in 6..=12 { log.append(&make_op(id)).unwrap(); }
         log.sync().unwrap();
         assert_eq!(log.recovery_count(), 1);
         drop(log);
@@ -1048,7 +1072,7 @@ mod tests {
                 if let Op::UpdateState(s) = op { seen.push(s.memory_id); }
                 Ok(())
             }).unwrap();
-            assert_eq!(seen, (2..=8).collect::<Vec<_>>());
+            assert_eq!(seen, (1..=12).collect::<Vec<_>>());
         }
     }
 

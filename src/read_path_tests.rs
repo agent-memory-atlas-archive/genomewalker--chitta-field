@@ -118,7 +118,8 @@ fn append_recovers_when_the_segment_is_deleted_underneath() {
     drop(field);
     let reopened = ChittaField::open(tmp.path().to_path_buf()).unwrap();
     assert!(reopened.get_memory(second_id).is_ok(), "op written after recovery must replay");
-    assert!(reopened.get_memory(first_id).is_err(), "the op in the deleted segment is gone, by construction");
+    assert_eq!(reopened.get_memory(first_id).unwrap().content, b"before deletion",
+               "the deleted segment's readable prefix must survive recovery");
 }
 
 #[test]
