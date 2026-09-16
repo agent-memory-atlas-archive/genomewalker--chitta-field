@@ -79,6 +79,7 @@ fn valid_abs(p: &str) -> bool {
 
 /// Extract identity atoms (paths / stable ids) from memory content.
 pub fn extract_artifact_paths(content: &str) -> Vec<String> {
+    let content = content.split(crate::anchors::MARKER).next().unwrap_or(content);
     use std::collections::BTreeSet;
     let mut set: BTreeSet<String> = BTreeSet::new();
     for cap in kv_re().captures_iter(content) {

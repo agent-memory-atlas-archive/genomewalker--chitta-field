@@ -345,6 +345,7 @@ pub struct ChittaField {
     /// query that bypasses the fuzzy retriever. Derived from live payloads and
     /// rebuilt on load (no snapshot-format change, migration-free, rollback-safe).
     pub(crate) prov_key_idx: RwLock<HashMap<String, MemoryId>>,
+    pub(crate) anchors: RwLock<crate::anchors::AnchorIndex>,
     /// Correction keyed lane (capability #2, durable corrections with override).
     /// Distinctive bigram of a `[correction]` record's corrected-mistake phrase
     /// -> ALL live correction ids carrying that trigger (multi-valued). A single
@@ -731,6 +732,7 @@ impl ChittaField {
             content_prov_idx, prov_key_idx, correction_key_idx, task_key_idx,
         } = opening::rebuild_keyed_indexes(&payloads, &states);
         crate::replication::rebuild(&payloads, &triplet_store, &mut states);
+        let anchors = crate::anchors::AnchorIndex::rebuild(&payloads);
         Ok(Self {
             instance_lock,
             data_dir,
@@ -800,6 +802,7 @@ impl ChittaField {
             chunk_hash_idx: RwLock::new(chunk_hash_idx),
             content_prov_idx: RwLock::new(content_prov_idx),
             prov_key_idx: RwLock::new(prov_key_idx),
+            anchors: RwLock::new(anchors),
             correction_key_idx: RwLock::new(correction_key_idx),
             task_key_idx: RwLock::new(task_key_idx),
             realm_members: RwLock::new(realm_members),
@@ -1056,6 +1059,7 @@ impl ChittaField {
         }
 
         crate::replication::rebuild(&payloads, &triplet_store, &mut states);
+        *self.anchors.write() = crate::anchors::AnchorIndex::rebuild(&payloads);
         if count > 0 {
             self.persist_seen_offsets();
             self.pld_mutations
