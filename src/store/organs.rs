@@ -92,6 +92,7 @@ impl ChittaField {
         realm: Option<&str>,
         k: usize,
     ) -> Vec<(String, u8, u32, i64, String, String, u32, f32, Vec<u64>)> {
+        if self.ablations.disabled("span_store") { return Vec::new(); }
         self.span_store
             .write()
             .query(query, realm, k)
@@ -105,6 +106,7 @@ impl ChittaField {
     /// Forward edge: the verbatim atoms a recalled memory's text references.
     /// Returns (text, class, count, realm) tuples, most-distinctive first.
     pub fn span_for_memory(&self, memory_id: u64, k: usize) -> Vec<(String, u8, u32, String)> {
+        if self.ablations.disabled("span_store") { return Vec::new(); }
         self.span_store
             .read()
             .spans_for_memory(memory_id, k)
@@ -116,6 +118,7 @@ impl ChittaField {
     /// Link one memory's text into the span store (idempotent by content hash),
     /// persisting immediately. For write hot paths use span_link_memory instead.
     pub fn span_ingest_memory(&self, memory_id: u64, text: &str, realm: &str) -> u64 {
+        if self.ablations.disabled("span_store") { return 0; }
         let mut s = self.span_store.write();
         let stats = s.ingest_memory(memory_id, text, realm);
         s.save_if_dirty();
@@ -125,12 +128,14 @@ impl ChittaField {
     /// Deferred-persistence memory link for write hot paths (put_memory /
     /// content update): links in RAM only; span_flush persists periodically.
     pub fn span_link_memory(&self, memory_id: u64, text: &str, realm: &str) {
+        if self.ablations.disabled("span_store") { return (); }
         self.span_store.write().ingest_memory(memory_id, text, realm);
     }
 
     /// Persist the span store iff it has unsaved changes. Called periodically
     /// by the queue processor and on daemon shutdown. Returns true iff saved.
     pub fn span_flush(&self) -> bool {
+        if self.ablations.disabled("span_store") { return false; }
         self.span_store.write().save_if_dirty()
     }
 
@@ -138,6 +143,7 @@ impl ChittaField {
     /// memory whose text is unchanged since last link is skipped. Returns
     /// (memories_linked, new_spans).
     pub fn span_backfill_memories(&self) -> (u64, u64) {
+        if self.ablations.disabled("span_store") { return Default::default(); }
         // Snapshot (id, realm, text) under the payloads read-lock, then release it
         // before taking the span_store write-lock to avoid holding both at once.
         let snapshot: Vec<(u64, String, String)> = {
@@ -172,11 +178,13 @@ impl ChittaField {
     /// In-RAM only (called from the queue thread on register/distill); the
     /// periodic span_flush persists spans and watermark together.
     pub fn span_ingest_transcript(&self, path: &std::path::Path) -> u64 {
+        if self.ablations.disabled("span_store") { return 0; }
         self.span_store.write().ingest_transcript(path).new_spans
     }
 
     /// Full backfill over a projects dir. Returns (unique_total, new, redacted).
     pub fn span_backfill(&self, projects_dir: &std::path::Path) -> (usize, u64, u64) {
+        if self.ablations.disabled("span_store") { return Default::default(); }
         let mut s = self.span_store.write();
         let stats = s.ingest_dir(projects_dir);
         (s.len(), stats.new_spans, stats.redacted)
@@ -184,12 +192,14 @@ impl ChittaField {
 
     /// (unique_total, on_disk_bytes, redacted_total).
     pub fn span_stats(&self) -> (usize, u64, u64) {
+        if self.ablations.disabled("span_store") { return Default::default(); }
         let s = self.span_store.read();
         (s.len(), s.on_disk_bytes(), s.redacted_total())
     }
 
     /// Preview the top-k rules that consolidation_pass would promote (no writes).
     pub fn consolidation_preview(&self, k: usize) -> Vec<(String, u32)> {
+        if self.ablations.disabled("event_tape") { return Vec::new(); }
         use crate::organ::sequitur::run_sequitur;
         let tape = self.event_tape.read();
         let rules = run_sequitur(&tape, 5);
@@ -199,6 +209,7 @@ impl ChittaField {
     /// Sequitur consolidation: find frequent bigrams in EventTape, promote to triplet KG.
     /// Returns (rules_found, rules_promoted).
     pub fn consolidation_pass(&self) -> Result<(usize, usize)> {
+        if self.ablations.disabled("event_tape") { return Ok((0, 0)); }
         use crate::organ::sequitur::run_sequitur;
         const MIN_SUPPORT: u32 = 5;
 
@@ -350,15 +361,18 @@ impl ChittaField {
 
     /// Return the current Turīya health vector as a JSON string.
     pub fn turiya_status(&self) -> String {
+        if self.ablations.disabled("turiya_monitor") { return String::from("[]"); }
         self.turiya_monitor.read().status_json()
     }
 
     /// Return EventTape statistics including compression totals.
     pub fn fep_status(&self) -> String {
+        if self.ablations.disabled("fep_prior") { return String::from("[]"); }
         self.fep_prior.read().status_json()
     }
 
     pub fn tape_stats(&self) -> String {
+        if self.ablations.disabled("event_tape") { return String::from("[]"); }
         let tombstoned = self.tape_tombstoned.load(std::sync::atomic::Ordering::Relaxed);
         self.event_tape.read().stats_json(tombstoned)
     }
@@ -369,6 +383,7 @@ impl ChittaField {
     /// for each rule whose probe_value > 0.4 AND refutation_ratio < 0.3 (safety gate).
     /// Returns JSON: {"queued": N, "skipped_refuted": M, "skipped_certain": L}
     pub fn queue_experiments(&self, k: usize) -> String {
+        if self.ablations.disabled("cec_policy_store") || self.ablations.disabled("hypothesis_market") { return String::from("{}"); }
         use crate::organ::intervention_store::InterventionKind;
         let probes = {
             let market = self.hypothesis_market.read();
@@ -407,6 +422,7 @@ impl ChittaField {
 
     /// Phase 13 — Return top-k verbalized Sequitur rules ranked by support.
     pub fn verbalize_rules(&self, k: usize) -> String {
+        if self.ablations.disabled("event_tape") { return String::from("[]"); }
         use crate::organ::sequitur::run_sequitur;
         const MIN_SUPPORT: u32 = 3;
         let tape = self.event_tape.read();
@@ -528,6 +544,7 @@ impl ChittaField {
     }
 
     pub fn seed_hdc_geometry(&self, json_path: &str) -> String {
+        if self.ablations.disabled("hdc_idx") { return String::from("[]"); }
         let result = self.hdc_idx.write().seed_from_geometry(json_path);
         match result {
             Ok(n) => {
@@ -545,6 +562,7 @@ impl ChittaField {
 
     /// Return top-k rules by refute_ratio as a plain-text summary.
     pub fn refutation_stats(&self, k: usize) -> String {
+        if self.ablations.disabled("refutation_ledger") { return String::from("[]"); }
         let tape   = self.event_tape.read();
         let ledger = self.refutation_ledger.read();
         ledger.stats_json(&tape, k)
@@ -552,6 +570,7 @@ impl ChittaField {
 
     /// Promote eligible shadow policies, demote drifted ones, return JSON summary.
     pub fn executor_flush(&self) -> String {
+        if self.ablations.disabled("cec_policy_store") { return String::from("{}"); }
         let ledger = self.refutation_ledger.read();
         let mut store = self.cec_policy_store.write();
         let promoted = store.promote_eligible();
@@ -565,6 +584,7 @@ impl ChittaField {
 
     /// List intervention policies as JSON.
     pub fn list_policies(&self, active_only: bool) -> String {
+        if self.ablations.disabled("cec_policy_store") { return String::from("[]"); }
         self.cec_policy_store.read().list_json(active_only)
     }
 
@@ -589,6 +609,7 @@ impl ChittaField {
         session_id: u64, ts_ms: i64,
         token_cost: u32, latency_ms: u32, retry_count: u8,
     ) {
+        if self.ablations.disabled("event_tape") { return (); }
         const ALPHA_COST:    f32 = 0.001;
         const BETA_LATENCY:  f32 = 0.00001;
         const GAMMA_RETRIES: f32 = 0.1;
@@ -617,6 +638,7 @@ impl ChittaField {
 
     /// Top-k rules by expected information gain (Wilson probe_value). Highest = most uncertain.
     pub fn hypothesis_probes(&self, k: usize) -> String {
+        if self.ablations.disabled("hypothesis_market") { return String::from("[]"); }
         self.hypothesis_market.read().stats_json(k)
     }
 
@@ -653,6 +675,7 @@ impl ChittaField {
     }
 
     pub fn retract_constraint(&self, fact_id: u64) -> Result<bool> {
+        if self.ablations.disabled("constraint_store") { return Ok(false); }
         let now = now_ms();
         let ok = self.constraint_store.write().retract(fact_id, now);
         if ok {
@@ -671,6 +694,7 @@ impl ChittaField {
         object: Option<&str>,
         scope: Option<&str>,
     ) -> Vec<crate::organ::constraint::Constraint> {
+        if self.ablations.disabled("constraint_store") { return Vec::new(); }
         self.constraint_store.read().query_unify(subject, predicate, object, scope)
             .into_iter().cloned().collect()
     }
@@ -678,15 +702,18 @@ impl ChittaField {
     pub fn query_constraint_chain(
         &self, subject: &str, predicates: &[&str], max_depth: usize,
     ) -> Vec<Vec<crate::organ::constraint::Constraint>> {
+        if self.ablations.disabled("constraint_store") { return Vec::new(); }
         self.constraint_store.read().query_chain(subject, predicates, max_depth)
             .into_iter().map(|v| v.into_iter().cloned().collect()).collect()
     }
 
     pub fn explain_constraint(&self, fact_id: u64) -> Option<crate::organ::constraint::Explanation> {
+        if self.ablations.disabled("constraint_store") { return None; }
         self.constraint_store.read().explain(fact_id)
     }
 
     pub fn create_constraint_branch(&self, parent_id: u64, scope: String) -> Result<u64> {
+        if self.ablations.disabled("constraint_store") { return Ok(0); }
         let now = now_ms();
         let branch_id = self.constraint_store.write().create_branch(parent_id, scope.clone(), now);
         let op = Op::CreateBranch(crate::ops::CreateBranchOp {
@@ -697,6 +724,7 @@ impl ChittaField {
     }
 
     pub fn resolve_constraint_branch(&self, winner_id: u64, loser_id: u64) -> Result<bool> {
+        if self.ablations.disabled("constraint_store") { return Ok(false); }
         let now = now_ms();
         let ok = self.constraint_store.write().resolve_branch(winner_id, loser_id, now);
         if ok {
@@ -709,6 +737,7 @@ impl ChittaField {
     }
 
     pub fn constraint_stats(&self) -> (usize, usize) {
+        if self.ablations.disabled("constraint_store") { return Default::default(); }
         let store = self.constraint_store.read();
         (store.count(), store.branch_count())
     }
@@ -726,6 +755,7 @@ impl ChittaField {
         realm: String,
         source_session: Option<String>,
     ) -> Result<u64> {
+        if self.ablations.disabled("trigger_store") { return Ok(0); }
         let now = now_ms();
         let id = self.trigger_store.write().add_trigger(
             name, condition.clone(), action.clone(),
@@ -741,6 +771,7 @@ impl ChittaField {
     }
 
     pub fn fire_trigger(&self, trigger_id: u64) -> Result<Option<crate::organ::trigger::FireResult>> {
+        if self.ablations.disabled("trigger_store") { return Ok(None); }
         let now = now_ms();
         let result = self.trigger_store.write().fire(trigger_id, now);
         if result.is_some() {
@@ -753,6 +784,7 @@ impl ChittaField {
     }
 
     pub fn dismiss_trigger(&self, trigger_id: u64) -> Result<bool> {
+        if self.ablations.disabled("trigger_store") { return Ok(false); }
         let now = now_ms();
         let ok = self.trigger_store.write().dismiss(trigger_id, now);
         if ok {
@@ -765,10 +797,12 @@ impl ChittaField {
     }
 
     pub fn list_triggers(&self) -> Vec<crate::organ::trigger::TriggerAutomaton> {
+        if self.ablations.disabled("trigger_store") { return Vec::new(); }
         self.trigger_store.read().list_all().to_vec()
     }
 
     pub fn evaluate_triggers(&self) -> Result<Vec<crate::organ::trigger::FireResult>> {
+        if self.ablations.disabled("trigger_store") { return Ok(Vec::new()); }
         let now = now_ms();
         let ready_ids = self.trigger_store.read().evaluate_time_triggers(now);
         let mut results = Vec::new();
@@ -781,21 +815,25 @@ impl ChittaField {
     }
 
     pub fn trigger_stats(&self) -> usize {
+        if self.ablations.disabled("trigger_store") { return 0; }
         self.trigger_store.read().count_armed()
     }
 
     // ── Layer 3: Predictive Memory ──────────────────────────────────────
 
     pub fn predict_needed(&self, k: usize) -> Vec<(MemoryId, f32)> {
+        if self.ablations.disabled("predictor") { return Vec::new(); }
         self.predictor.read().predict(k)
     }
 
     pub fn retrain_predictor(&self) {
+        if self.ablations.disabled("predictor") { return (); }
         let now = now_ms();
         self.predictor.write().retrain(now);
     }
 
     pub fn predictor_stats(&self) -> (u64, usize, usize) {
+        if self.ablations.disabled("predictor") { return Default::default(); }
         let p = self.predictor.read();
         (p.total_transitions(), p.transition_count(), p.recent_access_len())
     }
@@ -814,6 +852,7 @@ impl ChittaField {
         session_id: Option<String>,
         source_memory_id: Option<u64>,
     ) -> Result<u64> {
+        if self.ablations.disabled("surprise_store") { return Ok(0); }
         let now = now_ms();
         let event_id = {
             let mut store = self.surprise_store.write();
@@ -841,7 +880,7 @@ impl ChittaField {
         self.log.write().append(&op)?;
 
         // ── Move 1: auto-strengthen/weaken via surprise credit ────────
-        if let Some(source_id) = source_memory_id {
+        if let Some(source_id) = source_memory_id.filter(|_| !self.ablations.disabled("surprise_learning")) {
             // source_memory_id was the "expected" memory → weaken direction
             let credit_result = self.surprise_learning.write().update_credit(
                 source_id, event_id, surprise_magnitude, -1, now,
@@ -883,7 +922,7 @@ impl ChittaField {
         }
 
         // ── Move 2: auto-feed integration kernel ──────────────────────
-        {
+        if !self.ablations.disabled("surprise_learning") {
             let should_neg = self.surprise_learning.read()
                 .should_send_negative_feedback(&domain_ref, "semantic", surprise_magnitude);
             if should_neg {
@@ -958,6 +997,7 @@ impl ChittaField {
         since_ms: Option<i64>,
         limit: usize,
     ) -> Vec<crate::organ::surprise::SurpriseEvent> {
+        if self.ablations.disabled("surprise_store") { return Vec::new(); }
         self.surprise_store
             .read()
             .query(domain, realm, min_magnitude, since_ms, limit)
@@ -971,6 +1011,7 @@ impl ChittaField {
         realm: Option<&str>,
         limit: usize,
     ) -> Vec<crate::organ::surprise::BlindSpot> {
+        if self.ablations.disabled("surprise_store") { return Vec::new(); }
         self.surprise_store.read().get_blind_spots(realm, limit)
     }
 
@@ -990,6 +1031,7 @@ impl ChittaField {
         realm: String,
         source_session: Option<String>,
     ) -> Result<u64> {
+        if self.ablations.disabled("epistemic_debt_store") { return Ok(0); }
         let now = now_ms();
         let debt_id = {
             let mut store = self.epistemic_debt_store.write();
@@ -1015,6 +1057,7 @@ impl ChittaField {
     }
 
     pub fn resolve_debt(&self, debt_id: u64, resolution: String) -> Result<bool> {
+        if self.ablations.disabled("epistemic_debt_store") { return Ok(false); }
         let now = now_ms();
         let ok = self.epistemic_debt_store.write().resolve(debt_id, resolution.clone(), now);
         if ok {
@@ -1030,6 +1073,7 @@ impl ChittaField {
     }
 
     pub fn defer_debt(&self, debt_id: u64) -> Result<bool> {
+        if self.ablations.disabled("epistemic_debt_store") { return Ok(false); }
         let ok = self.epistemic_debt_store.write().defer(debt_id);
         if ok {
             let op = Op::UpdateDebt(crate::ops::UpdateDebtOp {
@@ -1051,6 +1095,7 @@ impl ChittaField {
         min_fragility: Option<f32>,
         limit: usize,
     ) -> Vec<crate::organ::epistemic_debt::EpistemicDebt> {
+        if self.ablations.disabled("epistemic_debt_store") { return Vec::new(); }
         self.epistemic_debt_store
             .read()
             .query(status, domain, realm, min_fragility, limit)
@@ -1064,6 +1109,7 @@ impl ChittaField {
         threshold: f32,
         limit: usize,
     ) -> Vec<crate::organ::epistemic_debt::EpistemicDebt> {
+        if self.ablations.disabled("epistemic_debt_store") { return Vec::new(); }
         self.epistemic_debt_store
             .read()
             .get_fragile_decisions(threshold, limit)
@@ -1084,6 +1130,12 @@ impl ChittaField {
         source: &str,
         was_useful: bool,
     ) -> Result<crate::organ::integration::SourceWeight> {
+        if self.ablations.disabled("integration_kernel") {
+            return Ok(crate::organ::integration::SourceWeight {
+                source: String::new(), query_domain: String::new(), weight: 1.0,
+                success_count: 0, total_count: 0,
+            });
+        }
         let sw = self.integration_kernel.write().record_feedback(query_domain, source, was_useful);
         let op = Op::RecordFeedback(crate::ops::RecordFeedbackOp {
             source: sw.source.clone(),
@@ -1101,6 +1153,7 @@ impl ChittaField {
         &self,
         domain: Option<&str>,
     ) -> Vec<crate::organ::integration::SourceWeight> {
+        if self.ablations.disabled("integration_kernel") { return Vec::new(); }
         self.integration_kernel
             .read()
             .get_source_weights(domain)
@@ -1115,6 +1168,7 @@ impl ChittaField {
         domain: &str,
         weight: f32,
     ) -> Result<bool> {
+        if self.ablations.disabled("integration_kernel") { return Ok(false); }
         let ok = self.integration_kernel.write().update_source_weight(source, domain, weight);
         let op = Op::UpdateSourceWeight(crate::ops::UpdateSourceWeightOp {
             source: source.to_string(),
@@ -1150,6 +1204,7 @@ impl ChittaField {
         mean_surprise: f32,
         promotion_score: f32,
     ) -> Result<u64> {
+        if self.ablations.disabled("wisdom_promotion") { return Ok(0); }
         let now = now_ms();
         let candidate_id = {
             let mut store = self.wisdom_promotion.write();
@@ -1184,6 +1239,7 @@ impl ChittaField {
         memory_id: Option<u64>,
         contradiction_count: u32,
     ) -> Result<bool> {
+        if self.ablations.disabled("wisdom_promotion") { return Ok(false); }
         let now = now_ms();
         let old_state = self.wisdom_promotion.read()
             .get(candidate_id)
@@ -1212,6 +1268,7 @@ impl ChittaField {
         domain: Option<&str>,
         limit: usize,
     ) -> Vec<crate::organ::wisdom_promotion::WisdomCandidate> {
+        if self.ablations.disabled("wisdom_promotion") { return Vec::new(); }
         self.wisdom_promotion
             .read()
             .query(lifecycle, domain, limit)
@@ -1233,6 +1290,7 @@ impl ChittaField {
         confidence: f32,
         note: Option<String>,
     ) -> Result<bool> {
+        if self.ablations.disabled("epistemic_debt_store") { return Ok(false); }
         let now = now_ms();
         let ok = self.epistemic_debt_store.write().attach_evidence(
             debt_id, evidence_memory_ids.clone(), confidence, note.clone(), now,
@@ -1252,6 +1310,7 @@ impl ChittaField {
 
     /// Auto-resolve debts with sufficient evidence. Returns count resolved.
     pub fn auto_resolve_debts(&self, threshold: f32) -> Result<usize> {
+        if self.ablations.disabled("epistemic_debt_store") { return Ok(0); }
         let open_ids: Vec<u64> = self.epistemic_debt_store.read()
             .open_debts_with_evidence()
             .iter()
@@ -1287,6 +1346,7 @@ impl ChittaField {
         mean_loss: f32,
         outcome_count: u64,
     ) -> Result<()> {
+        if self.ablations.disabled("learned_scorer") { return Ok(()); }
         let now = now_ms();
         self.learned_scorer.write().apply_update(
             &weights_json, model_version, mean_loss, outcome_count, now,
@@ -1308,6 +1368,7 @@ impl ChittaField {
     }
 
     pub fn effective_scorer_weight(&self, factor_name: &str, baseline: f32) -> f32 {
+        if self.ablations.disabled("learned_scorer") { return baseline; }
         self.learned_scorer.read().effective_weight(factor_name, baseline)
     }
 
@@ -1328,6 +1389,7 @@ impl ChittaField {
         expected_observables: Vec<String>,
         reversal_cost: crate::organ::intervention::ReversalCost,
     ) -> Result<u64> {
+        if self.ablations.disabled("intervention_store") { return Ok(0); }
         let now = now_ms();
         let id = self.intervention_store.write().start_intervention(
             realm.clone(), session_id.clone(), task_id, agent_id.clone(),
@@ -1353,6 +1415,7 @@ impl ChittaField {
         summary: String,
         confidence: f32,
     ) -> Result<Option<u64>> {
+        if self.ablations.disabled("intervention_store") { return Ok(None); }
         let now = now_ms();
         let obs_id = self.intervention_store.write().add_observation(
             intervention_id, kind, evidence_refs.clone(), summary.clone(), confidence, now,
@@ -1373,6 +1436,7 @@ impl ChittaField {
         intervention_id: u64,
         status: crate::organ::intervention::InterventionStatus,
     ) -> Result<bool> {
+        if self.ablations.disabled("intervention_store") { return Ok(false); }
         use crate::organ::intervention::InterventionStatus;
         use crate::organ::wisdom_lineage::{SUPPORT_DELTA_HIT, CONTRADICTION_DELTA_HIT};
         let now = now_ms();
@@ -1460,6 +1524,7 @@ impl ChittaField {
         skill_memory_ids: Vec<u64>,
         note: Option<String>,
     ) -> Result<bool> {
+        if self.ablations.disabled("intervention_store") { return Ok(false); }
         let now = now_ms();
         // Look up intervention domain before releasing write lock
         let domain = {
@@ -1534,6 +1599,7 @@ impl ChittaField {
     pub fn get_intervention(
         &self, id: u64,
     ) -> Option<crate::organ::intervention::InterventionRecord> {
+        if self.ablations.disabled("intervention_store") { return None; }
         self.intervention_store.read().get(id).cloned()
     }
 
@@ -1544,6 +1610,7 @@ impl ChittaField {
         status: Option<crate::organ::intervention::InterventionStatus>,
         limit: usize,
     ) -> Vec<crate::organ::intervention::InterventionRecord> {
+        if self.ablations.disabled("intervention_store") { return Vec::new(); }
         self.intervention_store.read()
             .query(realm, session_id, status, limit)
             .into_iter().cloned().collect()
@@ -1552,6 +1619,7 @@ impl ChittaField {
     pub fn list_open_interventions(
         &self,
     ) -> Vec<crate::organ::intervention::InterventionRecord> {
+        if self.ablations.disabled("intervention_store") { return Vec::new(); }
         self.intervention_store.read().list_open().into_iter().cloned().collect()
     }
 
@@ -1560,6 +1628,7 @@ impl ChittaField {
     }
 
     pub fn close_stale_interventions(&self, threshold_ms: i64) -> Result<usize> {
+        if self.ablations.disabled("intervention_store") { return Ok(0); }
         let now = now_ms();
         let stale_ids = self.intervention_store.read().stale_open(threshold_ms, now);
         let mut closed = 0usize;
@@ -1596,6 +1665,7 @@ impl ChittaField {
         ancestor_lineage_id: Option<u64>,
         derivation_relation: Option<String>,
     ) -> Result<u64> {
+        if self.ablations.disabled("wisdom_lineage_store") { return Ok(0); }
         use crate::organ::wisdom_lineage::ApplicabilityEnvelope;
         let now = now_ms();
         let envelope: ApplicabilityEnvelope =
@@ -1633,6 +1703,7 @@ impl ChittaField {
         reason: String,
         rederive_task_id: Option<u64>,
     ) -> Result<bool> {
+        if self.ablations.disabled("wisdom_lineage_store") { return Ok(false); }
         use crate::organ::wisdom_lineage::LineageState;
         let now = now_ms();
         let old_state = self.wisdom_lineage_store.read()
@@ -1659,6 +1730,7 @@ impl ChittaField {
         fork_claim: Option<String>,
         fork_lineage_id: Option<u64>,
     ) -> Result<()> {
+        if self.ablations.disabled("wisdom_lineage_store") { return Ok(()); }
         use crate::organ::wisdom_lineage::{ApplicabilityEnvelope, RederiveAction};
         let now = now_ms();
         let new_envelope = new_envelope_json.as_deref()
@@ -1682,6 +1754,7 @@ impl ChittaField {
         domain: Option<&str>,
         limit: usize,
     ) -> Vec<crate::organ::wisdom_lineage::WisdomLineage> {
+        if self.ablations.disabled("wisdom_lineage_store") { return Vec::new(); }
         use crate::organ::wisdom_lineage::LineageState;
         let state_filter = state_str.and_then(|s| match s {
             "trusted" => Some(LineageState::Trusted),
@@ -1698,6 +1771,7 @@ impl ChittaField {
     pub fn get_wisdom_lineage(
         &self, id: u64,
     ) -> Option<crate::organ::wisdom_lineage::WisdomLineage> {
+        if self.ablations.disabled("wisdom_lineage_store") { return None; }
         self.wisdom_lineage_store.read().get(id).cloned()
     }
 
@@ -1707,6 +1781,7 @@ impl ChittaField {
 
     /// Grow staleness on stale lineages and return IDs that transitioned.
     pub fn tick_lineage_staleness(&self) -> Result<Vec<u64>> {
+        if self.ablations.disabled("wisdom_lineage_store") { return Ok(Vec::new()); }
         let now = now_ms();
         let transitioned = self.wisdom_lineage_store.write().tick_staleness(now);
         for &lineage_id in &transitioned {
@@ -1739,6 +1814,7 @@ impl ChittaField {
 
     /// Return IDs of Inflamed lineages whose re-derive TTL has expired.
     pub fn lineage_expiry_check(&self) -> Vec<u64> {
+        if self.ablations.disabled("wisdom_lineage_store") { return Vec::new(); }
         self.wisdom_lineage_store.read().expiry_check(now_ms())
     }
 }

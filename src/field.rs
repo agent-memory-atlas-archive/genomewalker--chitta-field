@@ -261,6 +261,7 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::F
 }
 
 pub struct ChittaField {
+    pub(crate) ablations: crate::ablation::Ablations,
     /// Exclusive advisory lock on `<data_dir>/.instance.lock`, held for the life
     /// of this instance. A second instance on the same directory would compact
     /// away this one's live WAL segment (2026-09-14: the CLI auto-started a
@@ -301,33 +302,33 @@ pub struct ChittaField {
     pub(crate) code_files: RwLock<CodeFileIndex>,
     pub(crate) symbol_id_alloc: Arc<TripletIdAllocator>,
     pub(crate) code_file_id_alloc: Arc<TripletIdAllocator>,
-    pub(crate) learners: RwLock<LearnerSet>,
-    pub(crate) sparse_encoder: RwLock<SparseEncoder>,
-    pub(crate) cortical_idx: RwLock<CorticalIndex>,
+    pub(crate) learners: crate::ablation::Organ<LearnerSet>,
+    pub(crate) sparse_encoder: crate::ablation::Organ<SparseEncoder>,
+    pub(crate) cortical_idx: crate::ablation::Organ<CorticalIndex>,
     pub(crate) event_id_alloc: Arc<AtomicU64>,
-    pub(crate) session_registry: RwLock<SessionRegistry>,
-    pub(crate) transcript_registry: RwLock<TranscriptRegistry>,
-    pub(crate) task_registry: RwLock<TaskRegistry>,
-    pub(crate) user_model_registry: RwLock<UserModelRegistry>,
-    pub(crate) theme_organ: RwLock<ThemeOrgan>,
-    pub(crate) analytics_registry: RwLock<AnalyticsRegistry>,
-    pub(crate) msg_registry: RwLock<MsgRegistry>,
-    pub(crate) skill_registry: RwLock<SkillRegistry>,
-    pub(crate) agent_registry: RwLock<AgentRegistry>,
-    pub(crate) constraint_store: RwLock<ConstraintStore>,
-    pub(crate) trigger_store: RwLock<TriggerStore>,
-    pub(crate) predictor: RwLock<AccessPredictor>,
-    pub(crate) surprise_store: RwLock<SurpriseStore>,
-    pub(crate) epistemic_debt_store: RwLock<EpistemicDebtStore>,
-    pub(crate) integration_kernel: RwLock<IntegrationKernel>,
-    pub(crate) surprise_learning: RwLock<SurpriseLearningStore>,
-    pub(crate) wisdom_promotion: RwLock<WisdomPromotionStore>,
-    pub(crate) learned_scorer: RwLock<LearnedScoringModel>,
-    pub(crate) intervention_store: RwLock<InterventionStore>,
-    pub(crate) agent_protocol_store: RwLock<AgentProtocolStore>,
-    pub(crate) wisdom_lineage_store: RwLock<WisdomLineageStore>,
-    pub(crate) symbol_event_log: RwLock<SymbolEventLog>,
-    pub(crate) lite_encoder: RwLock<Option<LiteEncoder>>,
+    pub(crate) session_registry: crate::ablation::Organ<SessionRegistry>,
+    pub(crate) transcript_registry: crate::ablation::Organ<TranscriptRegistry>,
+    pub(crate) task_registry: crate::ablation::Organ<TaskRegistry>,
+    pub(crate) user_model_registry: crate::ablation::Organ<UserModelRegistry>,
+    pub(crate) theme_organ: crate::ablation::Organ<ThemeOrgan>,
+    pub(crate) analytics_registry: crate::ablation::Organ<AnalyticsRegistry>,
+    pub(crate) msg_registry: crate::ablation::Organ<MsgRegistry>,
+    pub(crate) skill_registry: crate::ablation::Organ<SkillRegistry>,
+    pub(crate) agent_registry: crate::ablation::Organ<AgentRegistry>,
+    pub(crate) constraint_store: crate::ablation::Organ<ConstraintStore>,
+    pub(crate) trigger_store: crate::ablation::Organ<TriggerStore>,
+    pub(crate) predictor: crate::ablation::Organ<AccessPredictor>,
+    pub(crate) surprise_store: crate::ablation::Organ<SurpriseStore>,
+    pub(crate) epistemic_debt_store: crate::ablation::Organ<EpistemicDebtStore>,
+    pub(crate) integration_kernel: crate::ablation::Organ<IntegrationKernel>,
+    pub(crate) surprise_learning: crate::ablation::Organ<SurpriseLearningStore>,
+    pub(crate) wisdom_promotion: crate::ablation::Organ<WisdomPromotionStore>,
+    pub(crate) learned_scorer: crate::ablation::Organ<LearnedScoringModel>,
+    pub(crate) intervention_store: crate::ablation::Organ<InterventionStore>,
+    pub(crate) agent_protocol_store: crate::ablation::Organ<AgentProtocolStore>,
+    pub(crate) wisdom_lineage_store: crate::ablation::Organ<WisdomLineageStore>,
+    pub(crate) symbol_event_log: crate::ablation::Organ<SymbolEventLog>,
+    pub(crate) lite_encoder: crate::ablation::Organ<Option<LiteEncoder>>,
     /// Byte offsets for each foreign segment file, used by sync_foreign().
     pub(crate) seen_offsets: RwLock<HashMap<PathBuf, u64>>,
     /// Foreign ops read off disk by sync_foreign_collect(), awaiting sync_foreign_apply().
@@ -411,32 +412,32 @@ pub struct ChittaField {
     /// Ack/nack usage scores — persisted in FullSnapshot.ack_scores (v9+).
     pub(crate) ack_scores: RwLock<HashMap<MemoryId, i32>>,
     /// Soul REPL session namespaces — persisted to repl_sessions.json (not in snapshot).
-    pub(crate) repl_sessions: RwLock<crate::repl_sessions::ReplSessionStore>,
+    pub(crate) repl_sessions: crate::ablation::Organ<crate::repl_sessions::ReplSessionStore>,
     /// Span Lane — verbatim transcript atoms; persisted to spans.bin (not in
     /// snapshot; rebuilt on write, decay-immune by construction).
-    pub(crate) span_store: RwLock<crate::organ::span_store::SpanStore>,
+    pub(crate) span_store: crate::ablation::Organ<crate::organ::span_store::SpanStore>,
     /// Hyperdimensional Computing index — O(n) Hamming recall, no floats.
-    pub(crate) hdc_idx:    RwLock<crate::hdc::HdcStore>,
-    pub(crate) event_tape:   RwLock<crate::organ::event_tape::EventTape>,
-    pub(crate) cdawg:        RwLock<crate::organ::cdawg::CdawgOrgan>,
-    pub(crate) episode_hdc:        RwLock<crate::hdc::EpisodeHdcStore>,
-    pub(crate) refutation_ledger:  RwLock<crate::organ::refutation_ledger::RefutationLedger>,
-    pub(crate) cec_policy_store:   RwLock<crate::organ::intervention_store::InterventionStore>,
-    pub(crate) decision_tape:      RwLock<crate::organ::decision_tape::DecisionTape>,
+    pub(crate) hdc_idx:    crate::ablation::Organ<crate::hdc::HdcStore>,
+    pub(crate) event_tape:   crate::ablation::Organ<crate::organ::event_tape::EventTape>,
+    pub(crate) cdawg:        crate::ablation::Organ<crate::organ::cdawg::CdawgOrgan>,
+    pub(crate) episode_hdc:        crate::ablation::Organ<crate::hdc::EpisodeHdcStore>,
+    pub(crate) refutation_ledger:  crate::ablation::Organ<crate::organ::refutation_ledger::RefutationLedger>,
+    pub(crate) cec_policy_store:   crate::ablation::Organ<crate::organ::intervention_store::InterventionStore>,
+    pub(crate) decision_tape:      crate::ablation::Organ<crate::organ::decision_tape::DecisionTape>,
     /// Ephemeral — rebuilt from refutation_ledger after each consolidation_pass.
-    pub(crate) hypothesis_market:  RwLock<crate::organ::hypothesis_market::HypothesisMarket>,
+    pub(crate) hypothesis_market:  crate::ablation::Organ<crate::organ::hypothesis_market::HypothesisMarket>,
     /// CEC Phase 11 — Turīya Monitor: read-only organ that watches CEC organ health.
     /// Serialized in snapshot (rolling 100-sample window persists across sessions).
-    pub(crate) turiya_monitor:     RwLock<crate::organ::turiya_monitor::TuriyaMonitor>,
+    pub(crate) turiya_monitor:     crate::ablation::Organ<crate::organ::turiya_monitor::TuriyaMonitor>,
     /// Ephemeral — rebuilt from EventTape alongside CDAWG at load.
-    pub(crate) fep_prior:          RwLock<crate::organ::fep_prior::FepPriorOrgan>,
+    pub(crate) fep_prior:          crate::ablation::Organ<crate::organ::fep_prior::FepPriorOrgan>,
     /// CEC Phase 12 — cumulative count of events tombstoned by temporal compression.
     /// Ephemeral (not in snapshot) — lifetime of this daemon process.
     pub(crate) tape_tombstoned:    std::sync::atomic::AtomicU64,
     pub(crate) observer:           crate::organ::observer::Observer,
-    pub(crate) observer_state:     RwLock<crate::organ::observer::ObserverState>,
-    pub(crate) interaction_ledger: RwLock<crate::organ::interaction_ledger::InteractionLedger>,
-    pub(crate) predicate_store:    RwLock<crate::organ::predicate_store::PredicateStore>,
+    pub(crate) observer_state:     crate::ablation::Organ<crate::organ::observer::ObserverState>,
+    pub(crate) interaction_ledger: crate::ablation::Organ<crate::organ::interaction_ledger::InteractionLedger>,
+    pub(crate) predicate_store:    crate::ablation::Organ<crate::organ::predicate_store::PredicateStore>,
     /// In-flight competitive_weight refresh reservations: memory_id -> reservation_ts_ms.
     /// Prevents thundering-herd when multiple sessions refresh simultaneously.
     pub(crate) cw_refresh_inflight: RwLock<std::collections::HashMap<crate::ids::MemoryId, i64>>,
@@ -514,6 +515,10 @@ impl ChittaField {
     }
 
     fn open_with_lock(data_dir: PathBuf, lock: bool) -> Result<Self> {
+        Self::open_with_ablations(data_dir, lock, crate::ablation::Ablations::from_env()?)
+    }
+
+    pub(crate) fn open_with_ablations(data_dir: PathBuf, lock: bool, ablations: crate::ablation::Ablations) -> Result<Self> {
         #[cfg(feature = "deadlock-detection")]
         {
             static CHECKER: std::sync::Once = std::sync::Once::new();
@@ -542,6 +547,7 @@ impl ChittaField {
 
         // Open this instance's write log.
         let mut log = OpLog::open(&data_dir, instance_id, 1)?;
+        log.ablations = ablations.clone();
 
         // Allocators are partitioned by instance_id — no collision with other instances.
         let id_alloc = Arc::new(MemoryIdAllocator::with_instance(instance_id));
@@ -594,6 +600,8 @@ impl ChittaField {
             snap_decision_tape,
             snap_interaction_ledger,
             snap_predicate_store,
+            snap_turiya_monitor,
+            snap_observer_state,
             snapshot_seqno,
             full_snapshot_seqno,
             best_full_path,
@@ -735,6 +743,7 @@ impl ChittaField {
         crate::replication::rebuild(&payloads, &triplet_store, &mut states);
         let anchors = crate::anchors::AnchorIndex::rebuild(&payloads);
         Ok(Self {
+            ablations: ablations.clone(),
             instance_lock,
             data_dir,
             instance_id,
@@ -771,33 +780,33 @@ impl ChittaField {
             code_files: RwLock::new("code_files", code_files),
             symbol_id_alloc,
             code_file_id_alloc,
-            learners: RwLock::new("learners", LearnerSet::new()),
-            sparse_encoder: RwLock::new("sparse_encoder", SparseEncoder::new()),
-            cortical_idx: RwLock::new("cortical_idx", cortical_idx),
+            learners: crate::ablation::Organ::new("learners", LearnerSet::new(), LearnerSet::new, ablations.disabled("learners")),
+            sparse_encoder: crate::ablation::Organ::new("sparse_encoder", SparseEncoder::new(), SparseEncoder::new, ablations.disabled("sparse_encoder")),
+            cortical_idx: crate::ablation::Organ::new("cortical_idx", cortical_idx, CorticalIndex::new, ablations.disabled("cortical_idx")),
             event_id_alloc: Arc::new(AtomicU64::new(1)),
-            session_registry: RwLock::new("session_registry", session_registry),
-            transcript_registry: RwLock::new("transcript_registry", transcript_registry),
-            task_registry: RwLock::new("task_registry", task_registry),
-            user_model_registry: RwLock::new("user_model_registry", user_model_registry),
-            theme_organ: RwLock::new("theme_organ", theme_organ),
-            analytics_registry: RwLock::new("analytics_registry", analytics_registry),
-            msg_registry: RwLock::new("msg_registry", msg_registry),
-            skill_registry: RwLock::new("skill_registry", skill_registry),
-            agent_registry: RwLock::new("agent_registry", agent_registry),
-            constraint_store: RwLock::new("constraint_store", constraint_store),
-            trigger_store: RwLock::new("trigger_store", trigger_store),
-            predictor: RwLock::new("predictor", predictor),
-            surprise_store: RwLock::new("surprise_store", surprise_store),
-            epistemic_debt_store: RwLock::new("epistemic_debt_store", epistemic_debt_store),
-            integration_kernel: RwLock::new("integration_kernel", integration_kernel),
-            surprise_learning: RwLock::new("surprise_learning", surprise_learning),
-            wisdom_promotion: RwLock::new("wisdom_promotion", wisdom_promotion),
-            learned_scorer: RwLock::new("learned_scorer", learned_scorer),
-            intervention_store: RwLock::new("intervention_store", intervention_store),
-            agent_protocol_store: RwLock::new("agent_protocol_store", agent_protocol_store),
-            wisdom_lineage_store: RwLock::new("wisdom_lineage_store", wisdom_lineage_store),
-            symbol_event_log: RwLock::new("symbol_event_log", symbol_event_log),
-            lite_encoder: RwLock::new("lite_encoder", loaded_lite_encoder),
+            session_registry: crate::ablation::Organ::new("session_registry", session_registry, SessionRegistry::new, ablations.disabled("session_registry")),
+            transcript_registry: crate::ablation::Organ::new("transcript_registry", transcript_registry, TranscriptRegistry::new, ablations.disabled("transcript_registry")),
+            task_registry: crate::ablation::Organ::new("task_registry", task_registry, TaskRegistry::new, ablations.disabled("task_registry")),
+            user_model_registry: crate::ablation::Organ::new("user_model_registry", user_model_registry, UserModelRegistry::new, ablations.disabled("user_model_registry")),
+            theme_organ: crate::ablation::Organ::new("theme_organ", theme_organ, ThemeOrgan::new, ablations.disabled("theme_organ")),
+            analytics_registry: crate::ablation::Organ::new("analytics_registry", analytics_registry, AnalyticsRegistry::new, ablations.disabled("analytics_registry")),
+            msg_registry: crate::ablation::Organ::new("msg_registry", msg_registry, MsgRegistry::new, ablations.disabled("msg_registry")),
+            skill_registry: crate::ablation::Organ::new("skill_registry", skill_registry, SkillRegistry::new, ablations.disabled("skill_registry")),
+            agent_registry: crate::ablation::Organ::new("agent_registry", agent_registry, AgentRegistry::new, ablations.disabled("agent_registry")),
+            constraint_store: crate::ablation::Organ::new("constraint_store", constraint_store, ConstraintStore::new, ablations.disabled("constraint_store")),
+            trigger_store: crate::ablation::Organ::new("trigger_store", trigger_store, TriggerStore::new, ablations.disabled("trigger_store")),
+            predictor: crate::ablation::Organ::new("predictor", predictor, AccessPredictor::new, ablations.disabled("predictor")),
+            surprise_store: crate::ablation::Organ::new("surprise_store", surprise_store, SurpriseStore::new, ablations.disabled("surprise_store")),
+            epistemic_debt_store: crate::ablation::Organ::new("epistemic_debt_store", epistemic_debt_store, EpistemicDebtStore::new, ablations.disabled("epistemic_debt_store")),
+            integration_kernel: crate::ablation::Organ::new("integration_kernel", integration_kernel, IntegrationKernel::new, ablations.disabled("integration_kernel")),
+            surprise_learning: crate::ablation::Organ::new("surprise_learning", surprise_learning, SurpriseLearningStore::new, ablations.disabled("surprise_learning")),
+            wisdom_promotion: crate::ablation::Organ::new("wisdom_promotion", wisdom_promotion, WisdomPromotionStore::new, ablations.disabled("wisdom_promotion")),
+            learned_scorer: crate::ablation::Organ::new("learned_scorer", learned_scorer, || LearnedScoringModel::new("v5.14".to_string()), ablations.disabled("learned_scorer")),
+            intervention_store: crate::ablation::Organ::new("intervention_store", intervention_store, InterventionStore::new, ablations.disabled("intervention_store")),
+            agent_protocol_store: crate::ablation::Organ::new("agent_protocol_store", agent_protocol_store, AgentProtocolStore::new, ablations.disabled("agent_protocol_store")),
+            wisdom_lineage_store: crate::ablation::Organ::new("wisdom_lineage_store", wisdom_lineage_store, WisdomLineageStore::new, ablations.disabled("wisdom_lineage_store")),
+            symbol_event_log: crate::ablation::Organ::new("symbol_event_log", symbol_event_log, SymbolEventLog::new, ablations.disabled("symbol_event_log")),
+            lite_encoder: crate::ablation::Organ::new("lite_encoder", loaded_lite_encoder, || None, ablations.disabled("lite_encoder")),
             seen_offsets: RwLock::new("seen_offsets", loaded_seen_offsets),
             pending_foreign: RwLock::new("pending_foreign", PendingForeign::default()),
             chunk_hash_idx: RwLock::new("chunk_hash_idx", chunk_hash_idx),
@@ -824,8 +833,8 @@ impl ChittaField {
             realm_stats: RwLock::new("realm_stats", HashMap::new()),
             kind_stats:  RwLock::new("kind_stats", HashMap::new()),
             ack_scores:  RwLock::new("ack_scores", snap_ack_scores),
-            repl_sessions: RwLock::new("repl_sessions", loaded_repl_sessions),
-            span_store: RwLock::new("span_store", loaded_span_store),
+            repl_sessions: crate::ablation::Organ::new("repl_sessions", loaded_repl_sessions, crate::repl_sessions::ReplSessionStore::new, ablations.disabled("repl_sessions")),
+            span_store: crate::ablation::Organ::new("span_store", loaded_span_store, crate::organ::span_store::SpanStore::new, ablations.disabled("span_store")),
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             backfill_plan_stage: Mutex::new(None),
             coactivation_stats: RwLock::new("coactivation_stats", {
@@ -841,21 +850,21 @@ impl ChittaField {
             hopfield: RwLock::new("hopfield", HopfieldNetwork::new()),
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             scoring_pipeline: RwLock::new("scoring_pipeline", crate::scoring::ScoringPipeline::new(scoring_config)),
-            hdc_idx:    RwLock::new("hdc_idx", hdc_store),
-            event_tape:   RwLock::new("event_tape", event_tape),
-            cdawg:        RwLock::new("cdawg", cdawg),
-            episode_hdc:        RwLock::new("episode_hdc", episode_hdc),
-            refutation_ledger:  RwLock::new("refutation_ledger", refutation_ledger),
-            cec_policy_store:   RwLock::new("cec_policy_store", cec_policy_store),
-            decision_tape:      RwLock::new("decision_tape", decision_tape),
-            hypothesis_market:  RwLock::new("hypothesis_market", hypothesis_market),
-            turiya_monitor:     RwLock::new("turiya_monitor", turiya_monitor),
-            fep_prior:          RwLock::new("fep_prior", fep_prior),
+            hdc_idx:    crate::ablation::Organ::new("hdc_idx", hdc_store, crate::hdc::HdcStore::new, ablations.disabled("hdc_idx")),
+            event_tape:   crate::ablation::Organ::new("event_tape", event_tape, crate::organ::event_tape::EventTape::new, ablations.disabled("event_tape")),
+            cdawg:        crate::ablation::Organ::new("cdawg", cdawg, crate::organ::cdawg::CdawgOrgan::new, ablations.disabled("cdawg")),
+            episode_hdc:        crate::ablation::Organ::new("episode_hdc", episode_hdc, crate::hdc::EpisodeHdcStore::new, ablations.disabled("episode_hdc")),
+            refutation_ledger:  crate::ablation::Organ::new("refutation_ledger", refutation_ledger, crate::organ::refutation_ledger::RefutationLedger::new, ablations.disabled("refutation_ledger")),
+            cec_policy_store:   crate::ablation::Organ::new("cec_policy_store", cec_policy_store, crate::organ::intervention_store::InterventionStore::new, ablations.disabled("cec_policy_store")),
+            decision_tape:      crate::ablation::Organ::new("decision_tape", decision_tape, crate::organ::decision_tape::DecisionTape::new, ablations.disabled("decision_tape")),
+            hypothesis_market:  crate::ablation::Organ::new("hypothesis_market", hypothesis_market, crate::organ::hypothesis_market::HypothesisMarket::new, ablations.disabled("hypothesis_market")),
+            turiya_monitor:     crate::ablation::Organ::new("turiya_monitor", if ablations.disabled("turiya_monitor") { snap_turiya_monitor } else { turiya_monitor }, crate::organ::turiya_monitor::TuriyaMonitor::new, ablations.disabled("turiya_monitor")),
+            fep_prior:          crate::ablation::Organ::new("fep_prior", fep_prior, crate::organ::fep_prior::FepPriorOrgan::new, ablations.disabled("fep_prior")),
             tape_tombstoned:    std::sync::atomic::AtomicU64::new(0),
             observer:           crate::organ::observer::Observer::new(),
-            observer_state:     RwLock::new("observer_state", crate::organ::observer::ObserverState::default()),
-            interaction_ledger: RwLock::new("interaction_ledger", snap_interaction_ledger),
-            predicate_store:    RwLock::new("predicate_store", snap_predicate_store),
+            observer_state:     crate::ablation::Organ::new("observer_state", if ablations.disabled("observer_state") { snap_observer_state } else { crate::organ::observer::ObserverState::default() }, crate::organ::observer::ObserverState::default, ablations.disabled("observer_state")),
+            interaction_ledger: crate::ablation::Organ::new("interaction_ledger", snap_interaction_ledger, crate::organ::interaction_ledger::InteractionLedger::default, ablations.disabled("interaction_ledger")),
+            predicate_store:    crate::ablation::Organ::new("predicate_store", snap_predicate_store, crate::organ::predicate_store::PredicateStore::default, ablations.disabled("predicate_store")),
             cw_refresh_inflight: RwLock::new("cw_refresh_inflight", std::collections::HashMap::new()),
             wal_coverage: RwLock::new("wal_coverage", wal_coverage),
             idx_sidecars_saved_at: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -978,28 +987,28 @@ impl ChittaField {
         let mut symbol_idx = self.symbol_idx.write();
         let mut call_graph = self.call_graph.write();
         let mut code_files = self.code_files.write();
-        let mut cortical_idx = self.cortical_idx.write();
-        let mut session_reg = self.session_registry.write();
-        let mut transcript_reg = self.transcript_registry.write();
-        let mut task_reg = self.task_registry.write();
-        let mut user_model_reg = self.user_model_registry.write();
-        let mut theme_organ = self.theme_organ.write();
-        let mut analytics_reg = self.analytics_registry.write();
-        let mut msg_reg = self.msg_registry.write();
-        let mut skill_reg = self.skill_registry.write();
-        let mut agent_reg = self.agent_registry.write();
-        let mut constraint_reg = self.constraint_store.write();
-        let mut trigger_reg = self.trigger_store.write();
-        let mut surprise_reg = self.surprise_store.write();
-        let mut epistemic_debt_reg = self.epistemic_debt_store.write();
-        let mut integration_reg = self.integration_kernel.write();
-        let mut surprise_learning_reg = self.surprise_learning.write();
-        let mut wisdom_promotion_reg = self.wisdom_promotion.write();
-        let mut learned_scorer_reg = self.learned_scorer.write();
-        let mut intervention_store_reg = self.intervention_store.write();
-        let mut agent_protocol_store_reg = self.agent_protocol_store.write();
-        let mut wisdom_lineage_store_reg = self.wisdom_lineage_store.write();
-        let mut symbol_event_log_reg = self.symbol_event_log.write();
+        let mut cortical_idx = self.cortical_idx.replay_write();
+        let mut session_reg = self.session_registry.replay_write();
+        let mut transcript_reg = self.transcript_registry.replay_write();
+        let mut task_reg = self.task_registry.replay_write();
+        let mut user_model_reg = self.user_model_registry.replay_write();
+        let mut theme_organ = self.theme_organ.replay_write();
+        let mut analytics_reg = self.analytics_registry.replay_write();
+        let mut msg_reg = self.msg_registry.replay_write();
+        let mut skill_reg = self.skill_registry.replay_write();
+        let mut agent_reg = self.agent_registry.replay_write();
+        let mut constraint_reg = self.constraint_store.replay_write();
+        let mut trigger_reg = self.trigger_store.replay_write();
+        let mut surprise_reg = self.surprise_store.replay_write();
+        let mut epistemic_debt_reg = self.epistemic_debt_store.replay_write();
+        let mut integration_reg = self.integration_kernel.replay_write();
+        let mut surprise_learning_reg = self.surprise_learning.replay_write();
+        let mut wisdom_promotion_reg = self.wisdom_promotion.replay_write();
+        let mut learned_scorer_reg = self.learned_scorer.replay_write();
+        let mut intervention_store_reg = self.intervention_store.replay_write();
+        let mut agent_protocol_store_reg = self.agent_protocol_store.replay_write();
+        let mut wisdom_lineage_store_reg = self.wisdom_lineage_store.replay_write();
+        let mut symbol_event_log_reg = self.symbol_event_log.replay_write();
         let mut chunk_hash_idx = self.chunk_hash_idx.write();
         let mut realm_members = self.realm_members.write();
         let mut kind_members  = self.kind_members.write();
@@ -1231,6 +1240,7 @@ impl ChittaField {
     /// Train the lite encoder from all memories with sparse codes.
     /// Returns the number of training examples used.
     pub fn train_lite_encoder(&self) -> Result<usize> {
+        if self.ablations.disabled("lite_encoder") || self.ablations.disabled("cortical_idx") { return Ok(0); }
         let payloads = self.payloads.read();
         let cortical_idx = self.cortical_idx.read();
 
@@ -1258,11 +1268,13 @@ impl ChittaField {
 
     /// Encode text via lite encoder. Returns None if not trained or no words match vocab.
     pub fn encode_lite(&self, text: &str) -> Option<SparseCode> {
+        if self.ablations.disabled("lite_encoder") { return None; }
         self.lite_encoder.read().as_ref()?.encode(text)
     }
 
     /// Save lite encoder to <data_dir>/lite_encoder.bin
     pub fn save_lite_encoder(&self) -> Result<()> {
+        if self.ablations.disabled("lite_encoder") { return Ok(()); }
         let guard = self.lite_encoder.read();
         let enc = guard.as_ref().ok_or_else(|| {
             crate::error::FieldError::Manifest("lite encoder not trained".to_string())
@@ -1277,6 +1289,7 @@ impl ChittaField {
 
     /// Check if the lite encoder is trained and ready.
     pub fn lite_encoder_ready(&self) -> bool {
+        if self.ablations.disabled("lite_encoder") { return false; }
         self.lite_encoder.read().is_some()
     }
 }

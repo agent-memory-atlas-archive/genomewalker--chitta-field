@@ -151,6 +151,7 @@ fn op_type_byte(op: &Op) -> u8 {
 }
 
 pub struct OpLog {
+    pub(crate) ablations: crate::ablation::Ablations,
     data_dir: PathBuf,
     instance_id: InstanceId,
     current_segment: BufWriter<File>,
@@ -206,6 +207,7 @@ impl OpLog {
                     .read(true)
                     .open(last_path)?;
                 return Ok(Self {
+                    ablations: crate::ablation::Ablations::default(),
                     data_dir: data_dir.to_path_buf(),
                     instance_id,
                     current_segment: BufWriter::new(f),
@@ -227,6 +229,7 @@ impl OpLog {
         let f = create_segment_v3(&path, next_seqno, &chain_head, vector_space_id)?;
         let header_size = V3_HEADER_SIZE as u64;
         Ok(Self {
+            ablations: crate::ablation::Ablations::default(),
             data_dir: data_dir.to_path_buf(),
             instance_id,
             current_segment: BufWriter::new(f),
@@ -246,6 +249,7 @@ impl OpLog {
     /// Append an op, returning its assigned seqno.
     /// V2 format: [payload_len:4][seqno:8][op_type:1][prev_hash:32][payload:N][crc32:4]
     pub fn append(&mut self, op: &Op) -> Result<u64> {
+        if self.ablations.suppresses(op) { return Ok(0); }
         // A local filesystem lets writes to an unlinked file succeed silently;
         // NFS fails them with ESTALE. Detect deletion through the open handle
         // (fstat, attribute-cached on NFS) rather than a path lookup per append:

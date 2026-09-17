@@ -46,6 +46,8 @@ pub(super) struct LoadedSnapshot {
     pub(super) snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats>,
     pub(super) snap_ack_scores: HashMap<MemoryId, i32>,
     pub(super) snap_correction_states: HashMap<u64, crate::organ::triplet::CorrectionState>,
+    pub(super) snap_turiya_monitor: crate::organ::turiya_monitor::TuriyaMonitor,
+    pub(super) snap_observer_state: crate::organ::observer::ObserverState,
     pub(super) snap_event_tape: crate::organ::event_tape::EventTape,
     pub(super) snap_decision_tape: crate::organ::decision_tape::DecisionTape,
     pub(super) snap_interaction_ledger: crate::organ::interaction_ledger::InteractionLedger,
@@ -103,6 +105,8 @@ pub(super) fn load_snapshots(data_dir: &std::path::Path) -> Result<LoadedSnapsho
     let mut snapshot_coactivation_stats: HashMap<(MemoryId, MemoryId), CoActivationStats> = HashMap::new();
     let mut snap_ack_scores: HashMap<MemoryId, i32> = HashMap::new();
     let mut snap_correction_states: HashMap<u64, crate::organ::triplet::CorrectionState> = HashMap::new();
+    let mut snap_turiya_monitor = crate::organ::turiya_monitor::TuriyaMonitor::new();
+    let mut snap_observer_state = crate::organ::observer::ObserverState::default();
     let mut snap_event_tape    = crate::organ::event_tape::EventTape::new();
     let mut snap_decision_tape = crate::organ::decision_tape::DecisionTape::new();
     let mut snap_interaction_ledger = crate::organ::interaction_ledger::InteractionLedger::default();
@@ -396,6 +400,8 @@ pub(super) fn load_snapshots(data_dir: &std::path::Path) -> Result<LoadedSnapsho
                 snapshot_coactivation_stats = snap.coactivation_stats;
                 snap_ack_scores = snap.ack_scores;
                 snap_correction_states = snap.correction_states;
+                snap_turiya_monitor     = snap.turiya_monitor;
+                snap_observer_state     = snap.observer_state;
                 snap_event_tape         = snap.event_tape;
                 snap_decision_tape      = snap.decision_tape;
                 snap_interaction_ledger = snap.interaction_ledger;
@@ -519,6 +525,8 @@ pub(super) fn load_snapshots(data_dir: &std::path::Path) -> Result<LoadedSnapsho
         snap_decision_tape,
         snap_interaction_ledger,
         snap_predicate_store,
+        snap_turiya_monitor,
+        snap_observer_state,
         snapshot_seqno,
         full_snapshot_seqno,
         best_full_path,
