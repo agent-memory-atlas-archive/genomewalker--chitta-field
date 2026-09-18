@@ -1003,6 +1003,7 @@ impl ChittaField {
         self.drain_pending_recall_effects()?;
         self.sync_wal()?;
         let seqno = self.log.read().last_seqno();
+        let snapshot_coverage = self.wal_coverage.read().clone();
         // Compact the delta into the base under a BRIEF write so the snapshot clone below
         // is canonical (delta empty). Decoupled from the sidecar disk writes, which now run
         // lock-free off the clone (see the sidecar block further down). Previously the merge
@@ -1348,7 +1349,7 @@ impl ChittaField {
                 // in-memory state contains (open replay ⊔ sync_foreign) plus
                 // our own ops up to this save.
                 let covered: std::collections::BTreeMap<String, u64> = {
-                    let mut cov = self.wal_coverage.read().clone();
+                    let mut cov = snapshot_coverage.clone();
                     let own = cov.entry(self.instance_id).or_insert(0);
                     if seqno > *own { *own = seqno; }
                     cov.iter().map(|(i, s)| (format!("{:08x}", i), *s)).collect()
@@ -1410,13 +1411,22 @@ impl ChittaField {
         // scalar rule (first_seqno < snapshot_seqno) compared seqnos across
         // writers, which can delete a concurrent writer's UNCOVERED ops:
         // overlapping seqno ranges make a foreign segment look covered.
-        let mut covered = self.wal_coverage.read().clone();
-        let own = covered.entry(self.instance_id).or_insert(0);
-        let last = self.log.read().last_seqno();
-        if last > *own { *own = last; }
-
+        let manifest = crate::manifest::Manifest::load(&self.data_dir)?
+            .ok_or_else(|| FieldError::Manifest("WAL pruning requires committed coverage".into()))?;
+        let family = manifest.families.get(&format!("{:08x}", self.instance_id))
+            .ok_or_else(|| FieldError::Manifest("WAL pruning requires writer snapshot family".into()))?;
+        for file in std::iter::once(&family.snapshot).chain(family.sidecars.iter()) {
+            if std::fs::metadata(self.data_dir.join(&file.name))?.len() != file.size_bytes {
+                return Err(FieldError::Manifest("WAL pruning family failed validation".into()));
+            }
+        }
+        let covered = family.covered.iter().filter_map(|(i, s)|
+            u32::from_str_radix(i, 16).ok().map(|i| (i, *s))).collect();
+        // Hold the writer lock across selection/unlink: rotation cannot change
+        // the descriptor protected by this pass.
+        let log = self.log.read();
         let seg_dir = self.data_dir.join("segments");
-        let deleted = prune_covered_segments(&seg_dir, &covered, self.instance_id);
+        let deleted = prune_covered_segments(&seg_dir, &covered, self.instance_id, log.writer_path());
         Ok(deleted)
     }
 

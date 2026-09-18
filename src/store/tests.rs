@@ -618,67 +618,35 @@ fn reopen_applies_uncovered_foreign_ops_with_overlapping_seqnos() {
     );
 }
 
-/// THEORY.md §4: prune only segments the coverage vector dominates; an
-/// instance's open-ended last segment is never pruned. Header-only (empty)
-/// segments of a dead instance are prunable by size regardless of coverage.
 #[test]
 fn prune_covered_segments_respects_coverage_vector() {
     let tmp = TempDir::new().unwrap();
+    let mut dead = crate::log::OpLog::open(tmp.path(), 0x2000_0002, 1).unwrap();
+    dead.append(&theory_content_op(1, "one", 0)).unwrap();
+    dead.append(&theory_content_op(2, "two", 0)).unwrap();
+    dead.sync().unwrap();
+    let old = dead.writer_path().to_path_buf();
+    drop(dead);
+    std::fs::File::open(&old).unwrap().set_times(std::fs::FileTimes::new()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)).unwrap();
+    let live = 0x1000_0001;
+    let mut writer = crate::log::OpLog::open(tmp.path(), live, 1).unwrap();
+    writer.append(&theory_content_op(3, "three", 0)).unwrap();
+    let current = writer.writer_path().to_path_buf();
     let seg_dir = tmp.path().join("segments");
-    std::fs::create_dir_all(&seg_dir).unwrap();
-    // Op-bearing segments must exceed the header size, else the empty-segment
-    // rule would reclaim them; write header + a byte of "op" payload.
-    let ops = vec![0u8; crate::log::V3_HEADER_SIZE + 1];
-    for name in [
-        "10000001_000000000001.seg",
-        "10000001_000000000050.seg",
-        "20000002_000000000001.seg",
-    ] {
-        std::fs::write(seg_dir.join(name), &ops).unwrap();
-    }
-
-    // Instance 1 is the LIVE writer here: its open tail (…_50) is never pruned.
-    let live = 0x1000_0001u32;
-
-    // Not covered far enough: nothing prunable.
-    let mut covered = std::collections::BTreeMap::new();
-    covered.insert(0x1000_0001u32, 10u64);
-    assert_eq!(prune_covered_segments(&seg_dir, &covered, live), 0);
-
-    // Covered through the first segment's end (next_first - 1 = 49):
-    // only instance 1's first segment goes; the live tail + the dead
-    // instance-2 segment (absent from `covered`) stay.
-    covered.insert(0x1000_0001, 49);
-    assert_eq!(prune_covered_segments(&seg_dir, &covered, live), 1);
-    assert!(!seg_dir.join("10000001_000000000001.seg").exists());
-    assert!(seg_dir.join("10000001_000000000050.seg").exists());
-    assert!(
-        seg_dir.join("20000002_000000000001.seg").exists(),
-        "a foreign writer's segment must never be pruned without coverage"
-    );
-
-    // A DEAD instance's final segment IS prunable once it appears in the
-    // coverage vector (fully folded into the snapshot). This is the common
-    // one-segment-per-lifetime case the interior windows(2) rule can't reach.
-    covered.insert(0x2000_0002, 1);
-    assert_eq!(prune_covered_segments(&seg_dir, &covered, live), 1);
-    assert!(!seg_dir.join("20000002_000000000001.seg").exists());
-    // The live instance's tail still survives — never pruned even when covered.
-    assert!(seg_dir.join("10000001_000000000050.seg").exists());
-
-    // Header-only (empty) segments: a dead instance's empty segment is
-    // reclaimed WITHOUT any coverage entry (coverage is op-derived and can
-    // never prove it); the live instance's empty segment is preserved.
-    let empty = vec![0u8; crate::log::V3_HEADER_SIZE];
-    std::fs::write(seg_dir.join("30000003_000000000001.seg"), &empty).unwrap(); // dead, empty
-    std::fs::write(seg_dir.join("10000001_000000000999.seg"), &empty).unwrap(); // live, empty
-    let empty_cov = std::collections::BTreeMap::new(); // no coverage at all
-    assert_eq!(prune_covered_segments(&seg_dir, &empty_cov, live), 1);
-    assert!(!seg_dir.join("30000003_000000000001.seg").exists());
-    assert!(
-        seg_dir.join("10000001_000000000999.seg").exists(),
-        "the live instance's freshly-opened (header-only) segment must survive"
-    );
+    // A later resurrected/empty filename must not turn the OPEN file into
+    // an interior deletion candidate, even with an excessive watermark.
+    std::fs::write(seg_dir.join("10000001_000000000999.seg"), []).unwrap();
+    let mut covered = std::collections::BTreeMap::from([(live, u64::MAX), (0x2000_0002, 1)]);
+    assert_eq!(prune_covered_segments(&seg_dir, &covered, live, &current), 0);
+    assert!(old.exists(), "partial foreign coverage cannot delete its tail");
+    covered.insert(0x2000_0002, 2);
+    assert_eq!(prune_covered_segments(&seg_dir, &covered, live, &current), 1);
+    assert!(!old.exists());
+    assert!(current.exists());
+    writer.append(&theory_content_op(4, "four", 0)).unwrap();
+    writer.sync().unwrap();
+    assert_eq!(writer.recovery_count(), 0);
 }
 
 fn theory_content_op(memory_id: u64, content: &str, ts: i64) -> crate::ops::Op {
@@ -1969,8 +1937,16 @@ fn test_compact_wal_guard_allows_large_store() {
             )
             .unwrap();
     }
+    let current = field.log.read().writer_path().to_path_buf();
+    let phantom = current.parent().unwrap().join(format!("{:08x}_{:012}.seg", field.instance_id, 2));
+    std::fs::write(&phantom, []).unwrap();
     let result = field.compact_wal();
     assert!(result.is_ok(), "compact_wal should succeed with 100+ memories, got: {:?}", result);
+    assert!(current.exists(), "compaction removed the open writer segment");
+    field.put_memory("wisdom", "test", b"after compaction", &embedding,
+        0.9, 0.001, 0, vec![], None, None).unwrap();
+    field.sync_wal().unwrap();
+    assert_eq!(field.log.read().recovery_count(), 0);
 }
 
 #[test]

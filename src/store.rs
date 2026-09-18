@@ -421,36 +421,21 @@ fn stratify_recall_hits(
     keep
 }
 
-/// Delete old snapshot families from `data_dir`, keeping the `keep` most recent.
-/// Identifies families by `chitta.*.snapshot` mtime order; removes all sidecar
-/// extensions for each stale stem.
-/// Delete WAL segments fully dominated by the coverage vector (THEORY.md §4).
-/// Segment file names are `{instance:08x}_{first_seqno:012}.seg`.
-///
-/// An interior segment (one with a later sibling from the same instance) is
-/// prunable iff covered[instance] >= its end (the next sibling's first_seqno-1).
-///
-/// The final segment of an instance is open-ended — its end can't be read from
-/// filenames — so it is pruned only for a DEAD instance (`inst != live`): that
-/// segment is closed forever and covered[inst] is its exact fold watermark
-/// (replay walks the whole segment and records its max seqno; log.rs coverage),
-/// so presence in `covered` proves full domination. The LIVE instance's tail
-/// may still grow and is never pruned. Absence from `covered` (e.g. a
-/// lineage-fenced foreign-vsid segment, never folded) also keeps the segment.
-/// Without this, a daemon whose every lifetime writes a single segment (one
-/// instance-id each) accumulates them unboundedly — windows(2) is empty so the
-/// interior rule alone never fires. Returns deleted count.
+/// Audit destructive maintenance and make the directory update durable on NFS.
 pub(crate) fn audited_remove(path: impl AsRef<std::path::Path>, reason: &str) -> std::io::Result<()> {
     let path = path.as_ref();
     let result = std::fs::remove_file(path);
     eprintln!("[chitta-field] unlink path={} reason={} result={:?}", path.display(), reason, result);
-    result
+    result?;
+    std::fs::File::open(path.parent().unwrap())?.sync_all()
 }
 
+/// Prune only fully scanned, committed coverage older than the pinned writer.
 fn prune_covered_segments(
     seg_dir: &std::path::Path,
     covered: &std::collections::BTreeMap<crate::ids::InstanceId, u64>,
     live_instance: crate::ids::InstanceId,
+    writer_path: &std::path::Path,
 ) -> usize {
     let mut per_instance: std::collections::BTreeMap<u32, Vec<(u64, std::path::PathBuf)>> =
         std::collections::BTreeMap::new();
@@ -472,46 +457,38 @@ fn prune_covered_segments(
             }
         }
     }
+    // Pin the actual descriptor's path, not the directory's apparent last sibling.
+    // NFS can expose later empty/resurrected names while an older inode is open.
+    let writer_first = writer_path.file_stem().and_then(|s| s.to_str())
+        .and_then(|s| s.split_once('_')).and_then(|(_, n)| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let writer_modified = std::fs::metadata(writer_path).and_then(|m| m.modified()).ok();
     let mut deleted = 0usize;
-    for (inst, mut segs) in per_instance {
-        segs.sort();
-        // Empty segments (size <= header, zero ops) of a DEAD instance hold no
-        // memories by construction — a daemon lifetime that opened a segment and
-        // appended nothing before exiting. Coverage is op-derived (log.rs records
-        // it per replayed op) so it can NEVER prove an empty segment; prune them
-        // directly by size. Excludes the live instance, whose freshly-opened
-        // segment is also header-sized (V3_HEADER_SIZE) until its first op.
-        if inst != live_instance {
-            segs.retain(|(_, path)| {
-                let empty = std::fs::metadata(path)
-                    .map(|m| m.len() <= crate::log::V3_HEADER_SIZE as u64)
-                    .unwrap_or(false);
-                if empty && audited_remove(path, "wal-dead-empty").is_ok() {
-                    deleted += 1;
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-        let max_covered = covered.get(&inst).copied().unwrap_or(0);
-        for w in segs.windows(2) {
-            let (_, ref path) = w[0];
-            let (next_first, _) = w[1];
-            let seg_end = next_first.saturating_sub(1);
-            if max_covered >= seg_end && audited_remove(path, "wal-covered").is_ok() {
-                deleted += 1;
+    for (inst, segs) in per_instance {
+        let Some(&max_covered) = covered.get(&inst) else { continue };
+        for (first, path) in segs {
+            if path == writer_path || (inst == live_instance && first >= writer_first) {
+                continue;
             }
-        }
-        // The instance's final (open-ended) segment: prune only for a dead
-        // instance present in `covered` (fully folded). Never the live tail.
-        if inst != live_instance {
-            if let Some((first, path)) = segs.last() {
-                if covered.get(&inst).is_some_and(|&c| c >= *first)
-                    && audited_remove(path, "wal-covered").is_ok()
-                {
-                    deleted += 1;
+            if inst != live_instance {
+                let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                if !matches!((modified, writer_modified), (Some(a), Some(b)) if a < b) {
+                    continue;
                 }
+            }
+            // Filename boundaries and presence in coverage do not prove the
+            // entire file is covered. Verify every complete record, including
+            // foreign tails, and keep malformed/torn files for investigation.
+            let Ok(len) = std::fs::metadata(&path).map(|m| m.len()) else { continue };
+            let mut dominated = true;
+            let end = crate::log::replay_from_offset(&path, 0, |seqno, _| {
+                dominated &= seqno <= max_covered;
+                Ok(())
+            });
+            if dominated && matches!(end, Ok(n) if n == len && n >= crate::log::V3_HEADER_SIZE as u64)
+                && audited_remove(&path, "wal-committed-covered-older-than-writer").is_ok()
+            {
+                deleted += 1;
             }
         }
     }

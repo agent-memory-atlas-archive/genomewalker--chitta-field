@@ -157,6 +157,11 @@ pub struct OpLog {
     current_segment: BufWriter<File>,
     current_segment_path: PathBuf,
     recoveries: u64,
+    // Accepted bytes of only the active segment; ESTALE can make the old fd
+    // unreadable. Rotation drops this bounded recovery copy.
+    accepted_prefix: Vec<u8>,
+    #[cfg(test)]
+    fail_next_write: bool,
     current_segment_size: u64,
     next_seqno: u64,
     ops_since_sync: u64,
@@ -213,6 +218,9 @@ impl OpLog {
                     current_segment: BufWriter::new(f),
                     current_segment_path: last_path.clone(),
             recoveries: 0,
+                    accepted_prefix: fs::read(&last_path)?,
+                    #[cfg(test)]
+                    fail_next_write: false,
                     current_segment_size: size,
                     next_seqno,
                     ops_since_sync: 0,
@@ -227,6 +235,7 @@ impl OpLog {
 
         let path = segment_path(data_dir, instance_id, next_seqno);
         let f = create_segment_v3(&path, next_seqno, &chain_head, vector_space_id)?;
+        let accepted_prefix = fs::read(&path)?;
         let header_size = V3_HEADER_SIZE as u64;
         Ok(Self {
             ablations: crate::ablation::Ablations::default(),
@@ -235,6 +244,9 @@ impl OpLog {
             current_segment: BufWriter::new(f),
             current_segment_path: path,
             recoveries: 0,
+            accepted_prefix,
+            #[cfg(test)]
+            fail_next_write: false,
             current_segment_size: header_size,
             next_seqno,
             ops_since_sync: 0,
@@ -257,9 +269,8 @@ impl OpLog {
         // does several appends under the exclusive RPC lock (lockprof 2026-09-15:
         // remember held 450-1100 ms).
         if self.segment_vanished() {
-            eprintln!("[chitta-field] WAL segment {} vanished — restoring from open descriptor", self.current_segment_path.display());
+            eprintln!("[chitta-field] WAL segment {} vanished — restoring accepted prefix on fresh descriptor", self.current_segment_path.display());
             self.recover_segment()?;
-            self.recoveries += 1;
         }
         self.rotate_if_needed()?;
 
@@ -291,12 +302,14 @@ impl OpLog {
         record.extend_from_slice(&prev_hash);
         record.extend_from_slice(&payload);
         record.extend_from_slice(&crc.to_be_bytes());
-        if let Err(e) = self.current_segment.write_all(&record).and_then(|_| self.current_segment.flush()) {
+        if let Err(e) = self.write_record(&record) {
             eprintln!("[chitta-field] WAL append failed on {}: {} — restoring accepted WAL prefix", self.current_segment_path.display(), e);
             self.recover_segment()?;
             self.current_segment.write_all(&record)?;
             self.current_segment.flush()?;
         }
+
+        self.accepted_prefix.extend_from_slice(&record);
 
         // Advance chain head
         self.chain_head = compute_record_hash(seqno, op_type, &prev_hash, &payload);
@@ -315,9 +328,8 @@ impl OpLog {
     /// Force fsync — call after critical mutations (put_memory, forget, etc.)
     pub fn sync(&mut self) -> Result<()> {
         if self.segment_vanished() || !self.current_segment_path.exists() {
-            eprintln!("[chitta-field] WAL segment {} vanished — restoring from open descriptor", self.current_segment_path.display());
+            eprintln!("[chitta-field] WAL segment {} vanished — restoring accepted prefix on fresh descriptor", self.current_segment_path.display());
             self.recover_segment()?;
-            self.recoveries += 1;
         }
         self.current_segment.flush()?;
         self.sync_count += 1;
@@ -326,7 +338,6 @@ impl OpLog {
             // so the next appends are, and surface it once per recovery.
             eprintln!("[chitta-field] WAL sync failed on {}: {} — restoring accepted WAL prefix", self.current_segment_path.display(), e);
             self.recover_segment()?;
-            self.recoveries += 1;
         }
         self.ops_since_sync = 0;
         self.last_sync = Instant::now();
@@ -346,35 +357,36 @@ impl OpLog {
         }
     }
 
-    /// Restore the complete accepted prefix from the open descriptor. The old
-    /// inode remains readable after unlink (including NFS silly-renames). Copy
-    /// in bounded chunks; do not copy a failed append's partial/torn record or
-    /// flush its BufWriter again. Keep the original header, name and hash chain.
+    /// Install a fresh inode from accepted bytes, never from a possibly stale fd.
+    /// Preserve the header/name/chain so acknowledged records remain replayable.
     fn recover_segment(&mut self) -> Result<()> {
-        use std::os::unix::fs::FileExt;
-        let tmp = self.current_segment_path.with_extension("recovering");
-        let mut f = OpenOptions::new().read(true).write(true).create(true)
-            .truncate(true).open(&tmp)?;
-        let mut offset = 0;
-        let mut buf = [0u8; 64 * 1024];
-        while offset < self.current_segment_size {
-            let count = (self.current_segment_size - offset).min(buf.len() as u64) as usize;
-            self.current_segment.get_ref().read_exact_at(&mut buf[..count], offset)?;
-            f.write_all(&buf[..count])?;
-            offset += count as u64;
-        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_nanos();
+        let tmp = self.current_segment_path.with_extension(format!("recovering.{nonce}"));
+        let mut f = OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
+        f.write_all(&self.accepted_prefix)?;
         f.sync_all()?;
         eprintln!("[chitta-field] rename from={} to={} reason=wal-prefix-recovery", tmp.display(), self.current_segment_path.display());
         fs::rename(&tmp, &self.current_segment_path)?;
         File::open(self.current_segment_path.parent().unwrap())?.sync_all()?;
-        // into_parts discards any buffered bytes from a failed append, rather
-        // than retrying them on drop after the accepted prefix was restored.
         let old = std::mem::replace(&mut self.current_segment, BufWriter::new(f));
-        let _ = old.into_parts();
-        eprintln!("[chitta-field] recovered WAL segment {}: {} bytes",
-                  self.current_segment_path.display(), offset);
+        let _ = old.into_parts(); // discard failed append bytes, including on drop
+        self.recoveries += 1;
+        eprintln!("[chitta-field] recovered WAL segment {}: {} accepted bytes on fresh descriptor",
+                  self.current_segment_path.display(), self.accepted_prefix.len());
         Ok(())
     }
+
+    fn write_record(&mut self, record: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_write) {
+            return Err(std::io::Error::from_raw_os_error(116));
+        }
+        self.current_segment.write_all(record)?;
+        self.current_segment.flush()
+    }
+
+    pub(crate) fn writer_path(&self) -> &Path { &self.current_segment_path }
 
     pub fn pending_sync_count(&self) -> u64 { self.ops_since_sync }
     pub fn sync_count(&self) -> u64 { self.sync_count }
@@ -518,7 +530,9 @@ impl OpLog {
         self.sync()?; // propagate failure before rotating the hash chain
         let new_path = segment_path(&self.data_dir, self.instance_id, self.next_seqno);
         let f = create_segment_v3(&new_path, self.next_seqno, &self.chain_head, self.vector_space_id)?;
+        let accepted_prefix = fs::read(&new_path)?;
         self.current_segment = BufWriter::new(f);
+        self.accepted_prefix = accepted_prefix;
         self.current_segment_path = new_path;
         self.current_segment_size = V3_HEADER_SIZE as u64;
         Ok(())
@@ -569,14 +583,14 @@ fn create_segment_v3(path: &Path, first_seqno: u64, chain_head: &ChainHash, vect
     let mut f = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path)?;
     f.write_all(SEGMENT_MAGIC_V3)?;
     f.write_all(&first_seqno.to_be_bytes())?;
     f.write_all(chain_head)?;
     f.write_all(&vector_space_id.to_be_bytes())?;
     f.sync_all()?;
+    File::open(path.parent().unwrap())?.sync_all()?;
     Ok(f)
 }
 
@@ -1053,6 +1067,30 @@ mod tests {
         segs.sort();
         assert_eq!(segs.len(), 1, "expected exactly one segment");
         segs.pop().unwrap()
+    }
+
+    #[test]
+    fn stale_write_recovers_without_reading_old_descriptor() {
+        let tmp = ScratchDir::new("stale-write");
+        let mut log = OpLog::open(tmp.path(), 0x7788, 1).unwrap();
+        for id in 1..=5 { log.append(&make_op(id)).unwrap(); }
+        // Replace the old fd with a write-only descriptor. Recovery cannot read
+        // this fd (as with ESTALE), and the injected write returns NFS errno 116.
+        let fd = OpenOptions::new().write(true).open(log.writer_path()).unwrap();
+        let old = std::mem::replace(&mut log.current_segment, BufWriter::new(fd));
+        let _ = old.into_parts();
+        log.fail_next_write = true;
+        for id in 6..=12 { log.append(&make_op(id)).unwrap(); }
+        log.sync().unwrap();
+        assert_eq!(log.recovery_count(), 1);
+        drop(log);
+        let mut reopened = OpLog::open(tmp.path(), 0x8899, 1).unwrap();
+        let mut seen = Vec::new();
+        reopened.replay(0, |_, _, op| {
+            if let Op::UpdateState(s) = op { seen.push(s.memory_id); }
+            Ok(())
+        }).unwrap();
+        assert_eq!(seen, (1..=12).collect::<Vec<_>>());
     }
 
     #[test]
