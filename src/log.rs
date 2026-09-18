@@ -364,6 +364,7 @@ impl OpLog {
             offset += count as u64;
         }
         f.sync_all()?;
+        eprintln!("[chitta-field] rename from={} to={} reason=wal-prefix-recovery", tmp.display(), self.current_segment_path.display());
         fs::rename(&tmp, &self.current_segment_path)?;
         File::open(self.current_segment_path.parent().unwrap())?.sync_all()?;
         // into_parts discards any buffered bytes from a failed append, rather

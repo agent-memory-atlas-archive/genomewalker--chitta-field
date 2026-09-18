@@ -440,6 +440,13 @@ fn stratify_recall_hits(
 /// Without this, a daemon whose every lifetime writes a single segment (one
 /// instance-id each) accumulates them unboundedly — windows(2) is empty so the
 /// interior rule alone never fires. Returns deleted count.
+pub(crate) fn audited_remove(path: impl AsRef<std::path::Path>, reason: &str) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let result = std::fs::remove_file(path);
+    eprintln!("[chitta-field] unlink path={} reason={} result={:?}", path.display(), reason, result);
+    result
+}
+
 fn prune_covered_segments(
     seg_dir: &std::path::Path,
     covered: &std::collections::BTreeMap<crate::ids::InstanceId, u64>,
@@ -479,7 +486,7 @@ fn prune_covered_segments(
                 let empty = std::fs::metadata(path)
                     .map(|m| m.len() <= crate::log::V3_HEADER_SIZE as u64)
                     .unwrap_or(false);
-                if empty && std::fs::remove_file(path).is_ok() {
+                if empty && audited_remove(path, "wal-dead-empty").is_ok() {
                     deleted += 1;
                     false
                 } else {
@@ -492,7 +499,7 @@ fn prune_covered_segments(
             let (_, ref path) = w[0];
             let (next_first, _) = w[1];
             let seg_end = next_first.saturating_sub(1);
-            if max_covered >= seg_end && std::fs::remove_file(path).is_ok() {
+            if max_covered >= seg_end && audited_remove(path, "wal-covered").is_ok() {
                 deleted += 1;
             }
         }
@@ -501,7 +508,7 @@ fn prune_covered_segments(
         if inst != live_instance {
             if let Some((first, path)) = segs.last() {
                 if covered.get(&inst).is_some_and(|&c| c >= *first)
-                    && std::fs::remove_file(path).is_ok()
+                    && audited_remove(path, "wal-covered").is_ok()
                 {
                     deleted += 1;
                 }
@@ -561,10 +568,10 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     for (_, stem) in families.iter().skip(keep) {
         for ext in SIDECAR_EXTS {
             let p = data_dir.join(format!("{}.{}", stem, ext));
-            if std::fs::remove_file(&p).is_ok() { removed += 1; }
+            if audited_remove(&p, "snapshot-family-prune").is_ok() { removed += 1; }
         }
         let p = data_dir.join(format!("{}.{}", stem, delta_ext));
-        if std::fs::remove_file(&p).is_ok() { removed += 1; }
+        if audited_remove(&p, "snapshot-family-prune").is_ok() { removed += 1; }
     }
 
     // Delete orphaned sidecars (chitta.* files with no corresponding .snapshot).
@@ -579,7 +586,7 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
                 || name.ends_with(&format!(".{}", delta_ext));
             if is_sidecar {
                 let p = data_dir.join(&name);
-                if std::fs::remove_file(&p).is_ok() { removed += 1; }
+                if audited_remove(&p, "snapshot-family-prune").is_ok() { removed += 1; }
             }
         }
     }
@@ -595,7 +602,7 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
         }).collect();
         cortex.sort_by(|a, b| b.0.cmp(&a.0));
         for (_, p) in cortex.iter().skip(keep) {
-            if std::fs::remove_file(p).is_ok() { removed += 1; }
+            if audited_remove(p, "snapshot-family-prune").is_ok() { removed += 1; }
         }
     }
 
@@ -609,7 +616,7 @@ fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
             if !name.ends_with(".emb.tmp") { continue; }
             let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
             if mtime < threshold {
-                if std::fs::remove_file(entry.path()).is_ok() { removed += 1; }
+                if audited_remove(entry.path(), "snapshot-family-prune").is_ok() { removed += 1; }
             }
         }
     }
@@ -721,7 +728,7 @@ fn janitor_sweep(data_dir: &std::path::Path, own_instance: crate::ids::InstanceI
         };
         if kill {
             freed += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            if std::fs::remove_file(p).is_ok() {
+            if audited_remove(p, "janitor-aged-orphan").is_ok() {
                 deleted.push(name.to_string());
             }
         }
