@@ -372,7 +372,7 @@ impl OpLog {
         let old = std::mem::replace(&mut self.current_segment, BufWriter::new(f));
         let _ = old.into_parts(); // discard failed append bytes, including on drop
         self.recoveries += 1;
-        eprintln!("[chitta-field] recovered WAL segment {}: {} accepted bytes on fresh descriptor",
+        eprintln!("[chitta-field] recovered WAL segment {}: {} bytes from accepted prefix on fresh descriptor",
                   self.current_segment_path.display(), self.accepted_prefix.len());
         Ok(())
     }
