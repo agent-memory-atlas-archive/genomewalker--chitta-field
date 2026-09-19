@@ -157,6 +157,7 @@ pub struct OpLog {
     current_segment: BufWriter<File>,
     current_segment_path: PathBuf,
     recoveries: u64,
+    replay_inventory: Vec<crate::manifest::SegmentInfo>,
     // Accepted bytes of only the active segment; ESTALE can make the old fd
     // unreadable. Rotation drops this bounded recovery copy.
     accepted_prefix: Vec<u8>,
@@ -218,6 +219,7 @@ impl OpLog {
                     current_segment: BufWriter::new(f),
                     current_segment_path: last_path.clone(),
             recoveries: 0,
+            replay_inventory: Vec::new(),
                     accepted_prefix: fs::read(&last_path)?,
                     #[cfg(test)]
                     fail_next_write: false,
@@ -244,6 +246,7 @@ impl OpLog {
             current_segment: BufWriter::new(f),
             current_segment_path: path,
             recoveries: 0,
+            replay_inventory: Vec::new(),
             accepted_prefix,
             #[cfg(test)]
             fail_next_write: false,
@@ -444,6 +447,7 @@ impl OpLog {
     {
         let seg_dir = self.data_dir.join("segments");
         let segments = collect_all_segments(&seg_dir)?;
+        self.replay_inventory.clear();
         // Conservative ordering rule: skip a writer only when ALL its segments
         // are certified. Otherwise decode its prefix too, retaining timestamp
         // carry-forward and chain continuity for the uncovered tail.
@@ -465,11 +469,15 @@ impl OpLog {
                 let writer = path.file_name().and_then(|n| n.to_str())
                     .and_then(|n| n.split_once('_')).map(|(w, _)| w).unwrap_or("");
                 if writers.get(writer) == Some(&true) {
-                    if let Some(entry) = entries.get(path) { skipped.insert(path.clone(), entry.last_seqno); }
+                    if let Some(entry) = entries.get(path) {
+                        skipped.insert(path.clone(), entry.last_seqno);
+                        self.replay_inventory.push((*entry).clone());
+                    }
                 }
             }
         }
         if !skipped.is_empty() { eprintln!("[chitta-field] WAL certified skip: {} segments", skipped.len()); }
+        eprintln!("[chitta-field] WAL replay inventory: files_opened={} certified_skipped={}", segments.len() - skipped.len(), skipped.len());
         let mut chain_head = ZERO_HASH;
         let mut current_instance: Option<String> = None;
         let own_prefix = format!("{:08x}", self.instance_id);
@@ -510,7 +518,9 @@ impl OpLog {
                 .as_deref()
                 .and_then(|p| InstanceId::from_str_radix(p, 16).ok())
                 .unwrap_or(0);
-            chain_head = replay_segment_chained(seg_path, 0, chain_head, &mut |seqno, op| {
+            coverage.entry(inst_id).or_insert(0);
+            let mut certificate = None;
+            chain_head = replay_segment_inventoried(seg_path, 0, chain_head, &mut certificate, &mut |seqno, op| {
                 // Carry-forward effective timestamp: monotone per writer.
                 let prev = last_ts.get(&inst_id).copied().unwrap_or(0);
                 let eff = crate::ops::op_timestamp(&op).unwrap_or(prev).max(prev);
@@ -520,6 +530,7 @@ impl OpLog {
                 buf.push((eff, inst_id, seqno, op));
                 Ok(())
             })?;
+            if let Some(entry) = certificate { self.replay_inventory.push(entry); }
             if current_instance.as_deref() == Some(own_prefix.as_str()) {
                 own_chain_head = chain_head;
             }
@@ -536,6 +547,11 @@ impl OpLog {
             f(inst, seqno, op)?;
         }
         Ok(coverage)
+    }
+
+    pub(crate) fn segment_inventory(&self) -> Vec<crate::manifest::SegmentInfo> {
+        crate::wal_certificate::inventory(&self.data_dir, self.writer_path(),
+            self.vector_space_id, &self.replay_inventory)
     }
 
     /// Current chain tip hash. Zero if only V1 data exists.
@@ -873,7 +889,20 @@ fn truncate_torn_tail(path: &Path, good_offset: u64, seqno: u64) -> Result<()> {
 fn replay_segment_chained<F>(
     path: &Path,
     start_seqno: u64,
+    chain_head: ChainHash,
+    f: &mut F,
+) -> Result<ChainHash>
+where
+    F: FnMut(u64, Op) -> Result<()>,
+{
+    replay_segment_inventoried(path, start_seqno, chain_head, &mut None, f)
+}
+
+fn replay_segment_inventoried<F>(
+    path: &Path,
+    start_seqno: u64,
     mut chain_head: ChainHash,
+    certificate: &mut Option<crate::manifest::SegmentInfo>,
     f: &mut F,
 ) -> Result<ChainHash>
 where
@@ -881,7 +910,12 @@ where
 {
     use std::io::Seek;
     let raw = File::open(path)?;
-    let file_len = raw.metadata()?.len();
+    let before = raw.metadata()?;
+    let file_len = before.len();
+    let mut first = None;
+    let mut last = None;
+    let mut ordered = true;
+
     // NFS must not service a read for every record field. Bound buffering per
     // reader while retaining CRC, chain checks and exact torn-tail offsets.
     let mut file = BufReader::with_capacity(64 * 1024, raw);
@@ -924,6 +958,8 @@ where
         }
     }
 
+    let mut decoded_end = file.stream_position()?;
+    let header_first = u64::from_be_bytes(_first_seqno_buf);
     loop {
         // Offset of this record's start — the truncation point if the record
         // turns out to be torn. An EOF mid-record can only be the file tail,
@@ -1041,7 +1077,23 @@ where
             });
         }
 
+        ordered &= last.map(|previous| seqno > previous).unwrap_or(true);
+        first.get_or_insert(seqno);
+        last = Some(seqno);
         f(seqno, op)?;
+        decoded_end = file.stream_position()?;
+    }
+    if start_seqno == 0 && ordered && decoded_end == file_len {
+        if let (Some(last_seqno), Ok(after)) = (last.or_else(|| header_first.checked_sub(1)), std::fs::metadata(path)) {
+            let first_seqno = first.unwrap_or(header_first);
+            if after.len() == file_len && before.modified().ok().zip(after.modified().ok()).is_some_and(|(a,b)| a == b) {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    *certificate = Some(crate::manifest::SegmentInfo {
+                        path: format!("segments/{name}"), first_seqno, last_seqno, size_bytes: file_len,
+                    });
+                }
+            }
+        }
     }
     Ok(chain_head)
 }

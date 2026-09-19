@@ -1370,9 +1370,8 @@ impl ChittaField {
                 std::fs::File::open(&self.data_dir)?.sync_all()?;
                 let cortical = file_ref(&cortical_path).ok_or_else(||
                     FieldError::Manifest("missing committed cortical snapshot".into()))?;
-                let writer_path = self.log.read().writer_path().to_path_buf();
                 let lineage = crate::snapshot::StoreHeader::compiled_vector_space_id();
-                let segments = crate::wal_certificate::inventory(&self.data_dir, &writer_path, lineage);
+                let segments = self.log.read().segment_inventory();
                 manifest.segments = segments.clone();
                 let family = CheckpointSet {
                     segments,

@@ -75,7 +75,7 @@ pub(crate) fn scan_sealed_segment(
     Some(SegmentInfo {
         path: format!("segments/{name}"),
         first_seqno,
-        last_seqno: last_seqno?, // Empty files carry no useful certificate.
+        last_seqno: last_seqno.or_else(|| first_seqno.checked_sub(1))?,
         size_bytes: end,
     })
 }
@@ -97,7 +97,7 @@ pub(crate) fn covered_segment(
     let Some((writer, first)) = segment_identity(name) else {
         return false;
     };
-    if first != entry.first_seqno || entry.last_seqno < first {
+    if first != entry.first_seqno || entry.last_seqno < first.saturating_sub(1) {
         return false;
     }
     let (Some(full), Some(cortical)) = (full.get(&writer), cortical.get(&writer)) else {
@@ -122,11 +122,18 @@ pub(crate) fn sealed_candidate(path: &Path, writer_path: &Path) -> bool {
         std::fs::metadata(writer_path).and_then(|m| m.modified())), (Ok(a), Ok(b)) if a < b)
 }
 
-pub(crate) fn inventory(data_dir: &Path, writer_path: &Path, lineage: u64) -> Vec<SegmentInfo> {
+pub(crate) fn inventory(data_dir: &Path, writer_path: &Path, lineage: u64, cached: &[SegmentInfo]) -> Vec<SegmentInfo> {
     let Ok(entries) = std::fs::read_dir(data_dir.join("segments")) else { return Vec::new() };
+    let cached: std::collections::HashMap<_, _> = cached.iter().map(|e| (e.path.as_str(), e)).collect();
     entries.flatten().filter_map(|e| {
         let p = e.path();
         if !sealed_candidate(&p, writer_path) { return None; }
+        let relative = format!("segments/{}", p.file_name()?.to_str()?);
+        if let Some(entry) = cached.get(relative.as_str()) {
+            if std::fs::metadata(&p).ok()?.len() == entry.size_bytes {
+                return Some((*entry).clone());
+            }
+        }
         scan_sealed_segment(&p, writer_path, lineage)
     }).collect()
 }
@@ -171,6 +178,26 @@ mod tests {
             cortical: None, segments: vec![entry],
             vector_space_id: Some(crate::snapshot::StoreHeader::compiled_vector_space_id()),
         }
+    }
+
+    #[test]
+    fn replay_inventory_certifies_empty_writers_without_opening_them_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = OpLog::open(dir.path(), 0x12345678, 1).unwrap();
+        let path = empty.writer_path().to_path_buf();
+        drop(empty);
+        let mut reader = OpLog::open(dir.path(), 0x87654321, 1).unwrap();
+        let coverage = reader.replay(0, |_, _, _| panic!("empty WAL")).unwrap();
+        assert_eq!(coverage.get(&0x12345678), Some(&0));
+        let entry = reader.segment_inventory().into_iter()
+            .find(|e| e.path.ends_with("12345678_000000000001.seg")).unwrap();
+        assert_eq!((entry.first_seqno, entry.last_seqno, entry.size_bytes), (1, 0, 56));
+        let mut cp = family(entry);
+        cp.covered.insert("12345678".into(), 0);
+        cp.cortical_covered = cp.covered.clone();
+        // Same-length invalid bytes prove the certified segment is never opened.
+        std::fs::write(&path, [0u8; 56]).unwrap();
+        reader.replay_certified(Some(&cp), |_, _, _| panic!("empty WAL")).unwrap();
     }
 
     #[test]

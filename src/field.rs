@@ -165,7 +165,20 @@ pub(crate) struct PendingForeign {
 /// Take an exclusive, non-blocking advisory lock on `<data_dir>/.instance.lock`.
 /// Fails fast when another live instance holds it. flock() works on NFS via the
 /// lock daemon and is released automatically when the holder exits.
-fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::File>> {
+#[derive(Debug)]
+pub(crate) struct InstanceLock(std::fs::File);
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // Explicit unlock also handles descriptors inherited by child processes.
+        if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            eprintln!("[field] instance unlock failed: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
+fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<InstanceLock>> {
     if std::env::var("CHITTA_STORE_LOCK").map(|v| v == "0").unwrap_or(false) {
         return Ok(None);
     }
@@ -209,7 +222,7 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::F
             if warned {
                 eprintln!("[chitta-field] instance lock {} acquired after waiting", path.display());
             }
-            return Ok(Some(file));
+            return Ok(Some(InstanceLock(file)));
         }
         let err = std::io::Error::last_os_error();
         let would_block = err.raw_os_error() == Some(libc::EWOULDBLOCK)
@@ -222,6 +235,11 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<std::fs::F
         let mut parts = holder.split_whitespace();
         let holder_pid: Option<u32> = parts.next().and_then(|p| p.parse().ok());
         let holder_host = parts.next().unwrap_or("");
+        if holder_pid == Some(std::process::id()) && holder_host == hostname {
+            return Err(FieldError::Manifest(format!(
+                "instance lock self-holder bug at {} (recorded holder: {})",
+                path.display(), holder.trim())));
+        }
         let stale = !replaced_stale
             && !hostname.is_empty()
             && holder_host == hostname
@@ -268,7 +286,7 @@ pub struct ChittaField {
     /// second chittad on ~/.claude/mind and 15 minutes of appends went to a
     /// deleted file). `CHITTA_STORE_LOCK=0` disables the check.
     #[allow(dead_code)]
-    pub(crate) instance_lock: Option<std::fs::File>,
+    pub(crate) instance_lock: Option<InstanceLock>,
     #[allow(dead_code)]
     pub(crate) data_dir: PathBuf,
     #[allow(dead_code)]
@@ -479,6 +497,7 @@ impl Drop for ChittaField {
         if let Err(e) = self.flush().and_then(|_| self.sync_wal()) {
             eprintln!("[field] shutdown flush failed: {e}");
         }
+        drop(self.instance_lock.take());
     }
 }
 
@@ -1935,7 +1954,7 @@ mod chaos_tests {
         let path = tmp.0.join(".instance.lock");
         let held = acquire_instance_lock(&tmp.0).unwrap().unwrap();
         let error = acquire_instance_lock(&tmp.0).unwrap_err().to_string();
-        assert!(error.contains("recorded holder:"), "{error}");
+        assert!(error.contains("self-holder bug"), "{error}");
         assert!(error.contains(&std::process::id().to_string()), "{error}");
         drop(held);
         // Hold the inode to model the NFS server retaining a departed holder's lock.
@@ -1954,8 +1973,25 @@ mod chaos_tests {
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
         std::fs::write(&path, format!("{} {}", dead_pid, host)).unwrap();
         let recovered = acquire_instance_lock(&tmp.0).unwrap().unwrap();
-        assert_ne!(recovered.metadata().unwrap().ino(), old_inode);
+        assert_ne!(recovered.0.metadata().unwrap().ino(), old_inode);
         assert!(std::fs::read_to_string(&path).unwrap().starts_with(&format!("{} ", std::process::id())));
+    }
+
+    #[test]
+    fn instance_lock_drop_unlocks_duplicate_descriptors_and_failed_open() {
+        let tmp = Scratch::new("unlock");
+        let held = acquire_instance_lock(&tmp.0).unwrap().unwrap();
+        let duplicate = held.0.try_clone().unwrap();
+        drop(held);
+        let next = acquire_instance_lock(&tmp.0).unwrap().unwrap();
+        drop(next);
+        drop(duplicate);
+        // A malformed WAL fails after lock acquisition. The next acquisition
+        // must succeed immediately, without treating our own PID as stale.
+        std::fs::create_dir_all(tmp.0.join("segments")).unwrap();
+        std::fs::write(tmp.0.join("segments/12345678_000000000001.seg"), b"badmagic12345678").unwrap();
+        assert!(ChittaField::open(tmp.0.clone()).is_err());
+        assert!(acquire_instance_lock(&tmp.0).unwrap().is_some());
     }
 
     #[test]
