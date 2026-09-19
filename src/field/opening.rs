@@ -582,6 +582,7 @@ pub(super) fn replay_wal(
     // timestamp order, so collection order is application order.
     let mut orphan_deltas: Vec<crate::ops::StateDeltaOp> = Vec::new();
     let mut orphan_accesses = Vec::new();
+    let mut apply_profile = crate::profile::ReplayApplyProfile::new();
     let wal_replay_phase = crate::profile::LoadPhase::new("wal_replay");
     let replayed_coverage = log.replay(0, |inst, seqno, op| {
         if seqno > max_replayed_seqno { max_replayed_seqno = seqno; }
@@ -609,6 +610,7 @@ pub(super) fn replay_wal(
                 return Ok(());
             }
         }
+        let _apply_timer = apply_profile.begin(&op);
         if let Op::RecordRecallBatch(b) = &op {
             for mid in &b.memory_ids {
                 let set = recall_provenance.entry(*mid).or_default();
@@ -637,12 +639,14 @@ pub(super) fn replay_wal(
         Ok(())
     })?;
     for d in orphan_deltas {
+        let _apply_timer = apply_profile.named("UpdateStateDeferred");
         if let Some(state) = ctx.states.get_mut(&d.memory_id) {
             let replay_now = if d.op_ts_ms > 0 { d.op_ts_ms } else { state.created_at_ms };
             state.apply_delta(&d, replay_now);
         }
     }
     for d in orphan_accesses {
+        let _apply_timer = apply_profile.named("UpdateStateBatchDeferred");
         if let Some(state) = ctx.states.get_mut(&d.memory_id) { apply_access_delta(state, &d); }
     }
     // State coverage = snapshot coverage ⊔ walked WAL maxima (per-writer

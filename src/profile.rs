@@ -250,3 +250,115 @@ impl Drop for SnapshotPhase<'_> {
         }
     }
 }
+
+/// Opt-in replay application timing. Coverage skips and decoding are excluded.
+/// Deferred orphan retries are reported separately from their source records.
+pub(crate) struct ReplayApplyProfile {
+    kinds: Option<std::collections::BTreeMap<&'static str, (u64, u128)>>,
+}
+impl ReplayApplyProfile {
+    pub(crate) fn new() -> Self {
+        Self { kinds: (std::env::var("CHITTA_PROFILE_REPLAY").as_deref() == Ok("1"))
+            .then(std::collections::BTreeMap::new) }
+    }
+    pub(crate) fn begin(&mut self, op: &crate::ops::Op) -> Option<ReplayApplyTimer<'_>> {
+        self.kinds.as_ref()?;
+        let kind = match op {
+            crate::ops::Op::PutPayload(..) => "PutPayload",
+            crate::ops::Op::UpdateState(..) => "UpdateState",
+            crate::ops::Op::UpdateStateBatch(..) => "UpdateStateBatch",
+            crate::ops::Op::DeleteMemory(..) => "DeleteMemory",
+            crate::ops::Op::AddAssocEdge(..) => "AddAssocEdge",
+            crate::ops::Op::UpsertArtifact(..) => "UpsertArtifact",
+            crate::ops::Op::AddTriplet(..) => "AddTriplet",
+            crate::ops::Op::InvalidateTriplet(..) => "InvalidateTriplet",
+            crate::ops::Op::UpsertSymbol(..) => "UpsertSymbol",
+            crate::ops::Op::RemoveSymbol(..) => "RemoveSymbol",
+            crate::ops::Op::AddSymCallEdge(..) => "AddSymCallEdge",
+            crate::ops::Op::RemoveSymCallEdge(..) => "RemoveSymCallEdge",
+            crate::ops::Op::UpsertCodeFile(..) => "UpsertCodeFile",
+            crate::ops::Op::UpdateSparseCode(..) => "UpdateSparseCode",
+            crate::ops::Op::DemoteMemory(..) => "DemoteMemory",
+            crate::ops::Op::TrainPQ(..) => "TrainPQ",
+            crate::ops::Op::UpdateResidualPQ(..) => "UpdateResidualPQ",
+            crate::ops::Op::SessionEvent(..) => "SessionEvent",
+            crate::ops::Op::TranscriptEvent(..) => "TranscriptEvent",
+            crate::ops::Op::TaskEvent(..) => "TaskEvent",
+            crate::ops::Op::UserModelEvent(..) => "UserModelEvent",
+            crate::ops::Op::ThemeEvent(..) => "ThemeEvent",
+            crate::ops::Op::AnalyticsEvent(..) => "AnalyticsEvent",
+            crate::ops::Op::ClearProject(..) => "ClearProject",
+            crate::ops::Op::UpdateSymbolDescription(..) => "UpdateSymbolDescription",
+            crate::ops::Op::UpdateMemoryContent(..) => "UpdateMemoryContent",
+            crate::ops::Op::RecordRecallBatch(..) => "RecordRecallBatch",
+            crate::ops::Op::StrengthenAssocEdge(..) => "StrengthenAssocEdge",
+            crate::ops::Op::MsgEvent(..) => "MsgEvent",
+            crate::ops::Op::SkillUpload(..) => "SkillUpload",
+            crate::ops::Op::SkillDeprecate(..) => "SkillDeprecate",
+            crate::ops::Op::AgentUpsert(..) => "AgentUpsert",
+            crate::ops::Op::AgentDisable(..) => "AgentDisable",
+            crate::ops::Op::AssertConstraint(..) => "AssertConstraint",
+            crate::ops::Op::RetractConstraint(..) => "RetractConstraint",
+            crate::ops::Op::CreateBranch(..) => "CreateBranch",
+            crate::ops::Op::ResolveBranch(..) => "ResolveBranch",
+            crate::ops::Op::AddTrigger(..) => "AddTrigger",
+            crate::ops::Op::UpdateTrigger(..) => "UpdateTrigger",
+            crate::ops::Op::FireTrigger(..) => "FireTrigger",
+            crate::ops::Op::RecordSurprise(..) => "RecordSurprise",
+            crate::ops::Op::RegisterDebt(..) => "RegisterDebt",
+            crate::ops::Op::UpdateDebt(..) => "UpdateDebt",
+            crate::ops::Op::UpdateSourceWeight(..) => "UpdateSourceWeight",
+            crate::ops::Op::RecordFeedback(..) => "RecordFeedback",
+            crate::ops::Op::UpdateSurpriseCredit(..) => "UpdateSurpriseCredit",
+            crate::ops::Op::UpsertWisdomCandidate(..) => "UpsertWisdomCandidate",
+            crate::ops::Op::UpdateWisdomLifecycle(..) => "UpdateWisdomLifecycle",
+            crate::ops::Op::UpdateScorerModel(..) => "UpdateScorerModel",
+            crate::ops::Op::AttachDebtEvidence(..) => "AttachDebtEvidence",
+            crate::ops::Op::StartIntervention(..) => "StartIntervention",
+            crate::ops::Op::AddObservation(..) => "AddObservation",
+            crate::ops::Op::CloseIntervention(..) => "CloseIntervention",
+            crate::ops::Op::RecordAttribution(..) => "RecordAttribution",
+            crate::ops::Op::RegisterTask(..) => "RegisterTask",
+            crate::ops::Op::UpdateTask(..) => "UpdateTask",
+            crate::ops::Op::AddDelegation(..) => "AddDelegation",
+            crate::ops::Op::LinkEvidence(..) => "LinkEvidence",
+            crate::ops::Op::AddProbe(..) => "AddProbe",
+            crate::ops::Op::ResolveProbe(..) => "ResolveProbe",
+            crate::ops::Op::SetCriterion(..) => "SetCriterion",
+            crate::ops::Op::UpsertWisdomLineage(..) => "UpsertWisdomLineage",
+            crate::ops::Op::AdjudicateLineage(..) => "AdjudicateLineage",
+            crate::ops::Op::TransitionLineage(..) => "TransitionLineage",
+            crate::ops::Op::RecordChallenger(..) => "RecordChallenger",
+            crate::ops::Op::CloseRederive(..) => "CloseRederive",
+            crate::ops::Op::InvalidateTripletsBySourceFile(..) => "InvalidateTripletsBySourceFile",
+            crate::ops::Op::UpdateMemoryKind(..) => "UpdateMemoryKind",
+            crate::ops::Op::SymbolEvent(..) => "SymbolEvent",
+            crate::ops::Op::SupersedeTriplet(..) => "SupersedeTriplet",
+            crate::ops::Op::RecordOutcome(..) => "RecordOutcome",
+        };
+        self.named(kind)
+    }
+    pub(crate) fn named(&mut self, kind: &'static str) -> Option<ReplayApplyTimer<'_>> {
+        let totals = self.kinds.as_mut()?.entry(kind).or_default();
+        Some(ReplayApplyTimer { totals, started: Instant::now() })
+    }
+}
+pub(crate) struct ReplayApplyTimer<'a> {
+    totals: &'a mut (u64, u128),
+    started: Instant,
+}
+impl Drop for ReplayApplyTimer<'_> {
+    fn drop(&mut self) {
+        self.totals.0 += 1;
+        self.totals.1 += self.started.elapsed().as_nanos();
+    }
+}
+impl Drop for ReplayApplyProfile {
+    fn drop(&mut self) {
+        if let Some(kinds) = &self.kinds {
+            for (kind, (records, apply_ns)) in kinds {
+                eprintln!("[chitta-field] replay_apply kind={} records={} apply_ns={}", kind, records, apply_ns);
+            }
+        }
+    }
+}
