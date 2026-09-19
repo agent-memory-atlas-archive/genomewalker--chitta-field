@@ -147,6 +147,14 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                         let touch_interval = std::time::Duration::from_secs(
                             std::env::var("CHITTA_TOUCH_FLUSH_S").ok().and_then(|s| s.parse().ok()).unwrap_or(5).max(1));
                         let min_mutations = std::env::var("CHITTA_TURBO_REBUILD_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+                        let checkpoint_bytes = std::env::var("CHITTA_CHECKPOINT_WAL_MB")
+                            .ok().and_then(|s| s.parse::<u64>().ok()).filter(|n| *n > 0)
+                            .unwrap_or(16).saturating_mul(1024 * 1024);
+                        let checkpoint_records = std::env::var("CHITTA_WAL_SNAPSHOT_RECORDS")
+                            .ok().and_then(|s| s.parse::<u64>().ok()).filter(|n| *n > 0)
+                            .unwrap_or(20_000);
+                        let mut last_checkpoint_check = std::time::Instant::now();
+                        let mut last_checkpoint_attempt = None::<std::time::Instant>;
                         let mut last_touch = std::time::Instant::now();
                         while matches!(stopped.recv_timeout(interval), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
                             if wal_only {
@@ -161,6 +169,24 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                                         eprintln!("[field] touch drain failed: {e}");
                                     }
                                     last_touch = std::time::Instant::now();
+                                }
+                                if last_checkpoint_check.elapsed() >= std::time::Duration::from_secs(1) {
+                                    // Never hold a log guard across the family writer. Failed saves
+                                    // keep their watermark and retry with backoff, not every tick.
+                                    let now = std::time::Instant::now();
+                                    let due = {
+                                        let log = field.log.read();
+                                        log.checkpoint_ready(now)
+                                            && log.checkpoint_due(checkpoint_bytes, checkpoint_records)
+                                            && last_checkpoint_attempt.is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(60))
+                                    };
+                                    if due {
+                                        let begin = std::time::Instant::now();
+                                        last_checkpoint_attempt = Some(begin);
+                                        let result = field.save_full_snapshot();
+                                        eprintln!("[checkpoint] reason=wal_budget duration_ms={} result={result:?}", begin.elapsed().as_millis());
+                                    }
+                                    last_checkpoint_check = std::time::Instant::now();
                                 }
                                 let plan = field.semantic_idx.read().plan_turbo_rebuild(min_mutations);
                                 if let Some(plan) = plan {
@@ -201,6 +227,10 @@ pub extern "C" fn cf_close(h: *mut CfHandle) {
         }
         // Persist any span links deferred off the write hot path.
         b.field.span_flush();
+        if let Err(e) = b.field.flush().and_then(|_| b.field.sync_wal()) {
+            eprintln!("[field] shutdown flush failed: {e}");
+        }
+        eprintln!("[checkpoint] shutdown_wal_tail_records={}", b.field.log.read().checkpoint_tail_records());
         drop(b);
     }
 }

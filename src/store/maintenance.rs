@@ -1007,7 +1007,10 @@ impl ChittaField {
         self.drain_pending_touches_locked()?;
         self.drain_pending_recall_effects()?;
         self.sync_wal()?;
-        let seqno = self.log.read().last_seqno();
+        let (seqno, checkpoint_position) = {
+            let log = self.log.read();
+            (log.last_seqno(), log.checkpoint_position())
+        };
         let snapshot_coverage = self.wal_coverage.read().clone();
         // Compact the delta into the base under a BRIEF write so the snapshot clone below
         // is canonical (delta empty). Decoupled from the sidecar disk writes, which now run
@@ -1393,13 +1396,9 @@ impl ChittaField {
                     .families
                     .insert(format!("{:08x}", self.instance_id), family.clone());
                 manifest.checkpoints = Some(family);
-                if let Err(e) = manifest.save(&self.data_dir) {
-                    eprintln!(
-                        "[chitta-field] WARNING: manifest commit failed (snapshot itself is durable): {e}"
-                    );
-                } else {
-                    pruned = self.prune_certified_wal()?;
-                }
+                manifest.save(&self.data_dir)?;
+                self.log.write().mark_checkpoint(checkpoint_position);
+                pruned = self.prune_certified_wal()?;
             }
         }
         // Prune old families ONLY after the new snapshot + .pld are durably written

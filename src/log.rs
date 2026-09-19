@@ -164,6 +164,10 @@ pub struct OpLog {
     #[cfg(test)]
     fail_next_write: bool,
     current_segment_size: u64,
+    appended_bytes: u64,
+    appended_records: u64,
+    checkpoint_position: (u64, u64),
+    last_checkpoint: Instant,
     next_seqno: u64,
     ops_since_sync: u64,
     sync_count: u64,
@@ -178,6 +182,29 @@ pub struct OpLog {
 }
 
 impl OpLog {
+    /// Monotonic across segment rotations, including writes racing a family save.
+    pub(crate) fn checkpoint_position(&self) -> (u64, u64) {
+        (self.appended_bytes, self.appended_records)
+    }
+
+    pub(crate) fn mark_checkpoint(&mut self, position: (u64, u64)) {
+        self.checkpoint_position = position;
+        self.last_checkpoint = Instant::now();
+    }
+
+    pub(crate) fn checkpoint_ready(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_checkpoint) >= Duration::from_secs(60)
+    }
+
+    pub(crate) fn checkpoint_tail_records(&self) -> u64 {
+        self.appended_records.saturating_sub(self.checkpoint_position.1)
+    }
+
+    pub(crate) fn checkpoint_due(&self, bytes: u64, records: u64) -> bool {
+        self.appended_bytes.saturating_sub(self.checkpoint_position.0) >= bytes
+            || self.appended_records.saturating_sub(self.checkpoint_position.1) >= records
+    }
+
     /// Open the write log for a specific instance.
     /// Finds this instance's last segment to continue appending, or creates a new one.
     pub fn open(data_dir: &Path, instance_id: InstanceId, next_seqno: u64) -> Result<Self> {
@@ -220,6 +247,10 @@ impl OpLog {
                     current_segment_path: last_path.clone(),
             recoveries: 0,
             replay_inventory: Vec::new(),
+            appended_bytes: 0,
+            appended_records: 0,
+            checkpoint_position: (0, 0),
+            last_checkpoint: Instant::now(),
                     accepted_prefix: fs::read(&last_path)?,
                     #[cfg(test)]
                     fail_next_write: false,
@@ -247,6 +278,10 @@ impl OpLog {
             current_segment_path: path,
             recoveries: 0,
             replay_inventory: Vec::new(),
+            appended_bytes: 0,
+            appended_records: 0,
+            checkpoint_position: (0, 0),
+            last_checkpoint: Instant::now(),
             accepted_prefix,
             #[cfg(test)]
             fail_next_write: false,
@@ -323,6 +358,8 @@ impl OpLog {
         // V2 entry: 4 + 8 + 1 + 32 + payload_len + 4
         let entry_size = 4 + 8 + 1 + 32 + payload.len() as u64 + 4;
         self.current_segment_size += entry_size;
+        self.appended_bytes += entry_size;
+        self.appended_records += 1;
         self.next_seqno += 1;
 
         Ok(seqno)
@@ -547,6 +584,21 @@ impl OpLog {
         // to write prev_hash = <foreign tip>, triggering a warning on every
         // subsequent restart when the boundary reset sets chain_head back to zero.
         self.chain_head = own_chain_head;
+
+        // Charge the recovered tail to the next checkpoint too. Counting a whole
+        // partially covered segment is conservative and avoids re-encoding ops.
+        let full = family.map(|cp| crate::wal_certificate::vector(&cp.covered)).unwrap_or_default();
+        let cortical = family.map(|cp| crate::wal_certificate::vector(&cp.cortical_covered)).unwrap_or_default();
+        let covered = |writer: &InstanceId| full.get(writer).copied().unwrap_or(0)
+            .min(cortical.get(writer).copied().unwrap_or(0));
+        let recovered_records = buf.iter().filter(|(_, writer, seqno, _)| *seqno > covered(writer)).count() as u64;
+        let recovered_bytes = self.replay_inventory.iter().filter(|entry| {
+            let writer = std::path::Path::new(&entry.path).file_name().and_then(|n| n.to_str())
+                .and_then(|n| n.split_once('_')).and_then(|(w, _)| InstanceId::from_str_radix(w, 16).ok());
+            writer.is_some_and(|w| entry.last_seqno > covered(&w))
+        }).map(|entry| entry.size_bytes).sum::<u64>();
+        self.appended_bytes = self.appended_bytes.max(recovered_bytes);
+        self.appended_records = self.appended_records.max(recovered_records);
 
         // Apply in merge order.
         buf.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
@@ -1380,6 +1432,42 @@ mod group_commit_tests {
 
     fn op(id: u64) -> Op {
         Op::DeleteMemory(crate::ops::DeleteMemoryOp { memory_id: id, deleted_at_ms: id as i64 })
+    }
+
+    #[test]
+    fn checkpoint_budget_keeps_racing_writes_and_survives_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = OpLog::open(dir.path(), 42, 1).unwrap();
+        log.append(&op(1)).unwrap();
+        let cut = log.checkpoint_position();
+        assert!(log.checkpoint_due(cut.0, u64::MAX));
+        log.current_segment_size = MAX_SEGMENT_SIZE;
+        log.append(&op(2)).unwrap();
+        log.mark_checkpoint(cut);
+        let committed_at = log.last_checkpoint;
+        assert!(!log.checkpoint_ready(committed_at + Duration::from_secs(59)));
+        assert!(log.checkpoint_ready(committed_at + Duration::from_secs(60)));
+        assert!(log.checkpoint_due(u64::MAX, 1), "snapshot must retain later writes as debt");
+        let committed = log.checkpoint_position();
+        log.mark_checkpoint(committed);
+        assert!(!log.checkpoint_due(1, 1));
+        log.append(&op(3)).unwrap();
+        assert!(log.checkpoint_due(1, u64::MAX));
+    }
+
+    #[test]
+    fn checkpoint_budget_counts_recovered_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut log = OpLog::open(dir.path(), 42, 1).unwrap();
+            for id in 1..=3 { log.append(&op(id)).unwrap(); }
+            log.sync().unwrap();
+        }
+        let mut log = OpLog::open(dir.path(), 43, 1).unwrap();
+        log.replay_certified(None, |_, _, _| Ok(())).unwrap();
+        assert!(log.checkpoint_due(u64::MAX, 3));
+        assert!(log.checkpoint_due(1, u64::MAX));
+        assert!(!log.checkpoint_due(u64::MAX, 4));
     }
 
     #[test]
