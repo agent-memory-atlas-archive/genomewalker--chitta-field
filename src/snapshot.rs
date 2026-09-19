@@ -1322,6 +1322,8 @@ struct MappedSnapshot {
     bytes: memmap2::Mmap,
     sections: Vec<(String, std::ops::Range<usize>, u64)>,
     decoded: Vec<Option<Result<ApplySection>>>,
+    published: Vec<bool>,
+    failed: bool,
     table_result: Result<()>,
     seqno: u64,
 }
@@ -1336,12 +1338,13 @@ impl MappedSnapshot {
             (section.name, start..start + section.body.len(), section.declared_len)
         }).collect();
         let decoded = (0..sections.len()).map(|_| None).collect();
-        Self { bytes, sections, decoded, table_result, seqno }
+        let published = vec![false; sections.len()];
+        Self { bytes, sections, decoded, published, failed: false, table_result, seqno }
     }
 
     fn decode_selected(&mut self, select: impl Fn(&str) -> bool) {
         let mut jobs: Vec<_> = self.sections.iter().enumerate()
-            .filter(|(i, (name, _, _))| self.decoded[*i].is_none() && select(name))
+            .filter(|(i, (name, _, _))| !self.published[*i] && self.decoded[*i].is_none() && select(name))
             .collect();
         jobs.sort_by_key(|(_, (_, range, _))| std::cmp::Reverse(range.len()));
         let bytes = &self.bytes;
@@ -1355,16 +1358,55 @@ impl MappedSnapshot {
         for (i, result) in decoded { self.decoded[i] = Some(result); }
     }
 
-    fn finish(mut self) -> Result<FullSnapshot> {
-        self.decode_selected(|_| true);
-        let mut snap = FullSnapshot::empty(self.seqno);
-        for result in self.decoded {
-            result.expect("all snapshot sections decoded")?(&mut snap);
+    /// Publish a whole selected group once, in file order. Validate all decoded
+    /// bodies before changing the destination: a corrupt duplicate must not
+    /// leave half a group visible. The owner still must withhold mutations and
+    /// checkpoints until finish_into validates the remaining sections/table.
+    ///
+    /// The triplet marker and body share a destination and therefore form one
+    /// group even when the caller selects only one of their section names.
+    fn publish_selected(&mut self, snap: &mut FullSnapshot, select: impl Fn(&str) -> bool) -> Result<()> {
+        if self.failed {
+            return Err(FieldError::Manifest("snapshot publication already failed".into()));
         }
+        let triplets = select("triplet_store") || select("triplets_clean");
+        let selected = |name: &str| select(name)
+            || (triplets && matches!(name, "triplet_store" | "triplets_clean"));
+        self.decode_selected(&selected);
+        let indices: Vec<_> = self.sections.iter().enumerate()
+            .filter(|(i, (name, _, _))| !self.published[*i] && selected(name))
+            .map(|(i, _)| i).collect();
+        let mut ready = Vec::with_capacity(indices.len());
+        for &i in &indices {
+            match self.decoded[i].take().expect("selected snapshot section decoded") {
+                Ok(apply) => ready.push(apply),
+                Err(error) => {
+                    self.failed = true;
+                    return Err(error);
+                }
+            }
+        }
+        let states_published = indices.iter().any(|&i| self.sections[i].0 == "states");
+        for apply in ready { apply(snap); }
+        if states_published {
+            for state in snap.states.values_mut() { state.sanitize(); }
+        }
+        for i in indices { self.published[i] = true; }
+        Ok(())
+    }
+
+    fn finish_into(mut self, snap: &mut FullSnapshot) -> Result<()> {
+        self.publish_selected(snap, |_| true)?;
         self.table_result?;
-        for state in snap.states.values_mut() { state.sanitize(); }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<FullSnapshot> {
+        let mut snap = FullSnapshot::empty(self.seqno);
+        self.finish_into(&mut snap)?;
         Ok(snap)
     }
+
 }
 
 fn decode_section(section: &Section<'_>) -> Result<ApplySection> {
@@ -2509,6 +2551,63 @@ mod tests {
         assert_eq!(snap.snapshot_seqno, 42);
         assert_eq!(snap.ack_scores, HashMap::from([(7, 9)]));
         assert!(snap.triplet_store.clean);
+    }
+
+    #[test]
+    fn published_sections_never_overwrite_replayed_updates() {
+        let mut bytes = vec![0; 16];
+        write_section(&mut bytes, "ack_scores", &HashMap::from([(7u64, 1i32)])).unwrap();
+        write_section(&mut bytes, "triplets_clean", &true).unwrap();
+        write_section(&mut bytes, "ack_scores", &HashMap::from([(7u64, 9i32)])).unwrap();
+        let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        mapping.copy_from_slice(&bytes);
+        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 42);
+        let mut snap = FullSnapshot::empty(42);
+        pending.publish_selected(&mut snap, |name| name == "ack_scores").unwrap();
+        assert_eq!(snap.ack_scores.get(&7), Some(&9));
+        assert_eq!(pending.published, vec![true, false, true]);
+        // An ordered WAL suffix has now changed a published section.
+        snap.ack_scores.insert(7, 11);
+        pending.decode_selected(|_| true);
+        assert!(pending.decoded[0].is_none() && pending.decoded[2].is_none());
+        pending.publish_selected(&mut snap, |name| name == "ack_scores").unwrap();
+        pending.finish_into(&mut snap).unwrap();
+        assert_eq!(snap.ack_scores.get(&7), Some(&11));
+        assert!(snap.triplet_store.clean);
+    }
+
+    #[test]
+    fn selected_triplet_marker_publishes_body_in_file_order() {
+        for clean_last in [false, true] {
+            let mut bytes = vec![0; 16];
+            write_section(&mut bytes, "triplets_clean", &true).unwrap();
+            write_section(&mut bytes, "triplet_store", &TripletStore::new()).unwrap();
+            if clean_last { write_section(&mut bytes, "triplets_clean", &true).unwrap(); }
+            let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+            mapping.copy_from_slice(&bytes);
+            let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0);
+            let mut snap = FullSnapshot::empty(0);
+            pending.publish_selected(&mut snap, |name| name == "triplets_clean").unwrap();
+            assert_eq!(snap.triplet_store.clean, clean_last);
+            assert!(pending.published.iter().all(|done| *done));
+        }
+    }
+
+    #[test]
+    fn corrupt_selected_group_is_never_partially_published() {
+        let mut bytes = vec![0; 16];
+        write_section(&mut bytes, "ack_scores", &HashMap::from([(7u64, 9i32)])).unwrap();
+        write_section(&mut bytes, "ack_scores", &0u8).unwrap();
+        let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        mapping.copy_from_slice(&bytes);
+        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0);
+        let mut snap = FullSnapshot::empty(0);
+        snap.ack_scores.insert(7, 11);
+        assert!(pending.publish_selected(&mut snap, |_| true).is_err());
+        assert_eq!(snap.ack_scores.get(&7), Some(&11));
+        assert!(pending.published.iter().all(|done| !done));
+        assert!(pending.publish_selected(&mut snap, |_| true).is_err());
+        assert!(pending.finish_into(&mut snap).is_err());
     }
 
     #[test]
