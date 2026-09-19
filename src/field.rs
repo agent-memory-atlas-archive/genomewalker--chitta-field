@@ -1097,7 +1097,7 @@ mod sync_foreign_split_tests {
             "episode",
             "test",
             content.as_bytes(),
-            &[0.1f32; 768],
+            &[0.1f32; crate::ops::EMBED_DIM],
             1.0,
             0.0,
             0,
