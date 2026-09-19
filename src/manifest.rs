@@ -39,6 +39,15 @@ pub struct CheckpointSet {
     /// it dominates. Empty for pre-v2.2 manifests (scalar-seqno fallback).
     #[serde(default)]
     pub covered: std::collections::BTreeMap<String, u64>,
+    /// Family-bound WAL certificates; absent in legacy manifests.
+    #[serde(default)]
+    pub segments: Vec<SegmentInfo>,
+    #[serde(default)]
+    pub cortical: Option<FileRef>,
+    #[serde(default)]
+    pub cortical_covered: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub vector_space_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

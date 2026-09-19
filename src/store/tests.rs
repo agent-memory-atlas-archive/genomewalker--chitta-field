@@ -2353,3 +2353,32 @@ fn measurement_recall_preserves_competitive_weights_and_refresh_timestamps() {
     field.recall_semantic(&queries[0], 24, Some("readonly")).unwrap();
     assert_ne!(before, snapshot());
 }
+
+#[test]
+fn family_commit_certifies_both_snapshots_and_prunes_only_sealed_wal() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    write_instance_segment(&data_dir, 0xF000_000F,
+        &[theory_put_op(777, 5_000, "certified foreign memory")]);
+    let segment = std::fs::read_dir(data_dir.join("segments")).unwrap()
+        .next().unwrap().unwrap().path();
+    std::fs::File::open(&segment).unwrap().set_times(std::fs::FileTimes::new()
+        .set_modified(std::time::UNIX_EPOCH)).unwrap();
+    {
+        let field = ChittaField::open(data_dir.clone()).unwrap();
+        assert!(field.states.read().contains_key(&777));
+        let pinned = field.log.read().writer_path().to_path_buf();
+        field.save_full_snapshot().unwrap();
+        let manifest = crate::manifest::Manifest::load(&data_dir).unwrap().unwrap();
+        let family = manifest.families.get(&format!("{:08x}", field.instance_id)).unwrap();
+        assert_eq!(family.covered, family.cortical_covered);
+        assert!(family.segments.iter().any(|entry| entry.path.ends_with(
+            segment.file_name().unwrap().to_str().unwrap())));
+        assert!(data_dir.join(&family.cortical.as_ref().unwrap().name).is_file());
+        assert!(!segment.exists(), "committed covered sealed segment should be pruned");
+        assert!(pinned.is_file(), "the open writer must never be pruned");
+    }
+    let reopened = ChittaField::open(data_dir).unwrap();
+    assert!(reopened.states.read().contains_key(&777));
+}

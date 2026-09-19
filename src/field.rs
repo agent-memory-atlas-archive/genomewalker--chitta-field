@@ -607,6 +607,7 @@ impl ChittaField {
             best_full_path,
             loaded_manifest,
             loaded_snapshot_name,
+            certified_cortical,
             loaded_header,
             migrate_reembed,
             reindex_mode,
@@ -668,7 +669,7 @@ impl ChittaField {
         };
         let wal_coverage = opening::replay_wal(
             &mut log, ctx, &mut recall_provenance,
-            snapshot_seqno, full_snapshot_seqno, &loaded_manifest, &loaded_snapshot_name,
+            snapshot_seqno, full_snapshot_seqno, &loaded_manifest, &loaded_snapshot_name, certified_cortical,
         )?;
         opening::reconcile_embeddings(
             &mut semantic_idx, &payloads, &mut states, &best_full_path, &data_dir,

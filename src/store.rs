@@ -497,7 +497,7 @@ fn prune_covered_segments(
 
 fn prune_old_snapshots(data_dir: &std::path::Path, keep: usize) {
     const SIDECAR_EXTS: &[&str] = &[
-        "snapshot", "hdc", "emb", "bin", "mu", "shdr", "hnsw", "realm_hnsw", "pld", "sup.json", "rsf",
+        "snapshot", "cortex", "hdc", "emb", "bin", "mu", "shdr", "hnsw", "realm_hnsw", "pld", "sup.json", "rsf",
     ];
     let delta_ext = "delta.hnsw";
 

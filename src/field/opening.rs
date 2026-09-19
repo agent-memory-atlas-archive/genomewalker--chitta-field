@@ -57,6 +57,7 @@ pub(super) struct LoadedSnapshot {
     pub(super) best_full_path: Option<PathBuf>,
     pub(super) loaded_manifest: Option<crate::manifest::Manifest>,
     pub(super) loaded_snapshot_name: Option<String>,
+    pub(super) certified_cortical: bool,
     pub(super) loaded_header: Option<crate::snapshot::StoreHeader>,
     pub(super) migrate_reembed: bool,
     pub(super) reindex_mode: bool,
@@ -478,7 +479,29 @@ pub(super) fn load_snapshots(data_dir: &std::path::Path) -> Result<LoadedSnapsho
         }
     }
 
+    // Prefer the cortex bound to the actual loaded full family. A failed load
+    // never authorizes a certificate, even when a legacy scalar watermark matches.
+    let mut certified_cortical = false;
+    if let Some(family) = loaded_manifest.as_ref().zip(loaded_snapshot_name.as_ref())
+        .and_then(|(m, name)| m.families.values().chain(m.checkpoints.iter())
+            .find(|cp| &cp.snapshot.name == name)) {
+        if family.vector_space_id == Some(crate::snapshot::StoreHeader::compiled_vector_space_id()) {
+            if let Some(file) = &family.cortical {
+                let path = data_dir.join(&file.name);
+                if std::fs::metadata(&path).is_ok_and(|m| m.len() == file.size_bytes) {
+                    if let Ok((loaded, seqno)) = CorticalIndex::load_snapshot(&path) {
+                        if seqno == family.snapshot_seqno {
+                            cortical_idx = loaded;
+                            snapshot_seqno = seqno;
+                            certified_cortical = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(LoadedSnapshot {
+        certified_cortical,
         payloads,
         retrieval_surfaces,
         recall_provenance,
@@ -546,6 +569,7 @@ pub(super) fn replay_wal(
     full_snapshot_seqno: u64,
     loaded_manifest: &Option<crate::manifest::Manifest>,
     loaded_snapshot_name: &Option<String>,
+    certified_cortical: bool,
 ) -> Result<std::collections::BTreeMap<u32, u64>> {
     // WAL coverage of the loaded snapshot (THEORY.md §4): per-writer max
     // seqno the snapshot provably contains, from its manifest family.
@@ -584,7 +608,11 @@ pub(super) fn replay_wal(
     let mut orphan_accesses = Vec::new();
     let mut apply_profile = crate::profile::ReplayApplyProfile::new();
     let wal_replay_phase = crate::profile::LoadPhase::new("wal_replay");
-    let replayed_coverage = log.replay(0, |inst, seqno, op| {
+    let certificate = loaded_manifest.as_ref().zip(loaded_snapshot_name.as_ref())
+        .and_then(|(m, name)| m.families.values().chain(m.checkpoints.iter())
+            .find(|cp| &cp.snapshot.name == name))
+        .filter(|_| certified_cortical);
+    let replayed_coverage = log.replay_certified(certificate, |inst, seqno, op| {
         if seqno > max_replayed_seqno { max_replayed_seqno = seqno; }
         if covered_by_full(inst, seqno) {
             // This op is covered by the full snapshot.

@@ -111,6 +111,30 @@ pub(crate) fn covered_segment(
             .unwrap_or(false)
 }
 
+/// Match the existing p21 sealing fence, including the actual open descriptor.
+/// Foreign files newer than our writer may still be receiving writes.
+pub(crate) fn sealed_candidate(path: &Path, writer_path: &Path) -> bool {
+    let identity = |p: &Path| p.file_name().and_then(|n| n.to_str()).and_then(segment_identity);
+    let (Some((writer, first)), Some((live, live_first))) = (identity(path), identity(writer_path)) else { return false };
+    if path == writer_path { return false; }
+    if writer == live { return first < live_first; }
+    matches!((std::fs::metadata(path).and_then(|m| m.modified()),
+        std::fs::metadata(writer_path).and_then(|m| m.modified())), (Ok(a), Ok(b)) if a < b)
+}
+
+pub(crate) fn inventory(data_dir: &Path, writer_path: &Path, lineage: u64) -> Vec<SegmentInfo> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("segments")) else { return Vec::new() };
+    entries.flatten().filter_map(|e| {
+        let p = e.path();
+        if !sealed_candidate(&p, writer_path) { return None; }
+        scan_sealed_segment(&p, writer_path, lineage)
+    }).collect()
+}
+
+pub(crate) fn vector(map: &BTreeMap<String, u64>) -> BTreeMap<u32, u64> {
+    map.iter().filter_map(|(k, v)| u32::from_str_radix(k, 16).ok().map(|k| (k, *v))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +160,51 @@ mod tests {
         let vsid = crate::log::segment_vector_space_id(&path).unwrap();
         let entry = scan_sealed_segment(&path, &active, vsid).unwrap();
         (dir, path, entry)
+    }
+
+    fn family(entry: SegmentInfo) -> crate::manifest::CheckpointSet {
+        crate::manifest::CheckpointSet {
+            snapshot: crate::manifest::FileRef { name: "fixture.snapshot".into(), size_bytes: 0 },
+            sidecars: Vec::new(), snapshot_seqno: 2,
+            covered: BTreeMap::from([("12345678".into(), 2)]),
+            cortical_covered: BTreeMap::from([("12345678".into(), 2)]),
+            cortical: None, segments: vec![entry],
+            vector_space_id: Some(crate::snapshot::StoreHeader::compiled_vector_space_id()),
+        }
+    }
+
+    #[test]
+    fn replay_certificates_skip_only_a_fully_covered_writer() {
+        let (dir, _, entry) = fixture();
+        let mut log = OpLog::open(dir.path(), 0x87654321, 3).unwrap();
+        let mut cp = family(entry);
+        let mut count = 0;
+        let coverage = log.replay_certified(Some(&cp), |_, _, _| { count += 1; Ok(()) }).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(coverage.get(&0x12345678), Some(&2));
+        cp.cortical_covered.insert("12345678".into(), 1);
+        log.replay_certified(Some(&cp), |_, _, _| { count += 1; Ok(()) }).unwrap();
+        assert_eq!(count, 2, "incomplete cortical coverage must decode");
+        cp.cortical_covered.insert("12345678".into(), 2);
+        cp.vector_space_id = Some(0);
+        count = 0;
+        log.replay_certified(Some(&cp), |_, _, _| { count += 1; Ok(()) }).unwrap();
+        assert_eq!(count, 2, "foreign certificate must decode");
+    }
+
+    #[test]
+    fn uncertified_tail_keeps_prefix_timestamp_and_chain_context() {
+        let (dir, _, entry) = fixture();
+        let cp = family(entry);
+        let mut tail = OpLog::open(dir.path(), 0x12345678, 3).unwrap();
+        tail.append(&Op::UpdateMemoryContent(UpdateMemoryContentOp {
+            memory_id: 3, content: b"tail".to_vec(), embedding: Vec::new(), op_ts_ms: 42,
+        })).unwrap();
+        tail.sync().unwrap();
+        let mut reader = OpLog::open(dir.path(), 0x87654321, 4).unwrap();
+        let mut seen = Vec::new();
+        reader.replay_certified(Some(&cp), |_, seq, _| { seen.push(seq); Ok(()) }).unwrap();
+        assert_eq!(seen, vec![1, 2, 3]);
     }
 
     #[test]

@@ -427,13 +427,49 @@ impl OpLog {
     pub fn replay<F>(
         &mut self,
         _start_seqno: u64,
-        mut f: F,
+        f: F,
     ) -> Result<std::collections::BTreeMap<InstanceId, u64>>
     where
         F: FnMut(InstanceId, u64, Op) -> Result<()>,
     {
+        self.replay_certified(None, f)
+    }
+
+    pub(crate) fn replay_certified<F>(
+        &mut self,
+        family: Option<&crate::manifest::CheckpointSet>,
+        mut f: F,
+    ) -> Result<std::collections::BTreeMap<InstanceId, u64>>
+    where F: FnMut(InstanceId, u64, Op) -> Result<()>,
+    {
         let seg_dir = self.data_dir.join("segments");
         let segments = collect_all_segments(&seg_dir)?;
+        // Conservative ordering rule: skip a writer only when ALL its segments
+        // are certified. Otherwise decode its prefix too, retaining timestamp
+        // carry-forward and chain continuity for the uncovered tail.
+        let mut skipped = std::collections::BTreeMap::new();
+        if let Some(cp) = family.filter(|cp| cp.vector_space_id == Some(self.vector_space_id)) {
+            let full = crate::wal_certificate::vector(&cp.covered);
+            let cortical = crate::wal_certificate::vector(&cp.cortical_covered);
+            let entries: std::collections::HashMap<_, _> = cp.segments.iter()
+                .map(|e| (self.data_dir.join(&e.path), e)).collect();
+            let mut writers = std::collections::BTreeMap::<String, bool>::new();
+            for path in &segments {
+                let writer = path.file_name().and_then(|n| n.to_str())
+                    .and_then(|n| n.split_once('_')).map(|(w, _)| w.to_owned()).unwrap_or_default();
+                let eligible = entries.get(path).is_some_and(|e|
+                    crate::wal_certificate::covered_segment(&self.data_dir, e, &full, &cortical, self.writer_path()));
+                *writers.entry(writer).or_insert(true) &= eligible;
+            }
+            for path in &segments {
+                let writer = path.file_name().and_then(|n| n.to_str())
+                    .and_then(|n| n.split_once('_')).map(|(w, _)| w).unwrap_or("");
+                if writers.get(writer) == Some(&true) {
+                    if let Some(entry) = entries.get(path) { skipped.insert(path.clone(), entry.last_seqno); }
+                }
+            }
+        }
+        if !skipped.is_empty() { eprintln!("[chitta-field] WAL certified skip: {} segments", skipped.len()); }
         let mut chain_head = ZERO_HASH;
         let mut current_instance: Option<String> = None;
         let own_prefix = format!("{:08x}", self.instance_id);
@@ -442,6 +478,13 @@ impl OpLog {
         let mut last_ts: std::collections::BTreeMap<InstanceId, i64> = std::collections::BTreeMap::new();
         let mut coverage: std::collections::BTreeMap<InstanceId, u64> = std::collections::BTreeMap::new();
         for seg_path in &segments {
+            if let Some(&last) = skipped.get(seg_path) {
+                if let Some(inst) = seg_path.file_name().and_then(|n| n.to_str())
+                    .and_then(|n| n.split_once('_')).and_then(|(w, _)| u32::from_str_radix(w, 16).ok()) {
+                    coverage.entry(inst).and_modify(|v| *v = (*v).max(last)).or_insert(last);
+                }
+                continue;
+            }
             // Lineage fence: skip segments stamped (V3) with a different vector_space_id —
             // foreign-vector data must not contaminate replay. V1/V2/legacy segments carry
             // no stamp (None) and are treated as same-lineage (always replayed).

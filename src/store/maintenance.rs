@@ -997,6 +997,11 @@ impl ChittaField {
     }
 
     pub fn save_full_snapshot(&self) -> Result<()> {
+        self.save_full_snapshot_certified().map(|_| ())
+    }
+
+    fn save_full_snapshot_certified(&self) -> Result<usize> {
+        let mut pruned = 0;
         use crate::snapshot::FullSnapshot;
         let _touch_drain = self.touch_drain.lock();
         self.drain_pending_touches_locked()?;
@@ -1357,11 +1362,27 @@ impl ChittaField {
                 // Only files that actually exist are recorded (e.g. the .sup
                 // sidecar save is best-effort) — validation checks what the
                 // commit promised, nothing more.
+                let cortical_path = path.with_extension("cortex");
+                self.cortical_idx.persisted_read().save_snapshot(&cortical_path, seqno)?;
+                // Certificates may delete the WAL: cortex data and its rename
+                // must be durable before the manifest makes that promise.
+                std::fs::File::open(&cortical_path)?.sync_all()?;
+                std::fs::File::open(&self.data_dir)?.sync_all()?;
+                let cortical = file_ref(&cortical_path).ok_or_else(||
+                    FieldError::Manifest("missing committed cortical snapshot".into()))?;
+                let writer_path = self.log.read().writer_path().to_path_buf();
+                let lineage = crate::snapshot::StoreHeader::compiled_vector_space_id();
+                let segments = crate::wal_certificate::inventory(&self.data_dir, &writer_path, lineage);
+                manifest.segments = segments.clone();
                 let family = CheckpointSet {
+                    segments,
+                    cortical: Some(cortical),
+                    cortical_covered: covered.clone(),
+                    vector_space_id: Some(lineage),
                     snapshot: snapshot_ref,
                     sidecars: [
                         &emb_path, &hdc_path, &bin_path, &mu_path, &hnsw_path,
-                        &delta_path, &realm_hnsw_path, &pld_path, &sup_path, &shdr_path,
+                        &delta_path, &realm_hnsw_path, &pld_path, &sup_path, &shdr_path, &cortical_path,
                     ]
                     .iter()
                     .filter_map(|p| file_ref(p))
@@ -1377,6 +1398,8 @@ impl ChittaField {
                     eprintln!(
                         "[chitta-field] WARNING: manifest commit failed (snapshot itself is durable): {e}"
                     );
+                } else {
+                    pruned = self.prune_certified_wal()?;
                 }
             }
         }
@@ -1387,7 +1410,7 @@ impl ChittaField {
         // Ghost janitor: dead-instance residue + resurrection accounting
         // (7-day age gate protects live peers' seen_offsets).
         janitor_sweep(&self.data_dir, self.instance_id, 7 * 86_400);
-        Ok(())
+        Ok(pruned)
     }
 
 
@@ -1404,7 +1427,10 @@ impl ChittaField {
                 "refusing compact_wal on near-empty store ({} live memories, minimum 100)", count
             )));
         }
-        self.save_full_snapshot()?;
+        self.save_full_snapshot_certified()
+    }
+
+    fn prune_certified_wal(&self) -> Result<usize> {
         // Safe pruning rule (THEORY.md §4): a segment of instance i may be
         // deleted iff our coverage vector dominates it — i.e. every op in it
         // is provably contained in the snapshot we just committed. The old
@@ -1420,13 +1446,25 @@ impl ChittaField {
                 return Err(FieldError::Manifest("WAL pruning family failed validation".into()));
             }
         }
-        let covered = family.covered.iter().filter_map(|(i, s)|
-            u32::from_str_radix(i, 16).ok().map(|i| (i, *s))).collect();
-        // Hold the writer lock across selection/unlink: rotation cannot change
-        // the descriptor protected by this pass.
+        if family.vector_space_id != Some(crate::snapshot::StoreHeader::compiled_vector_space_id()) {
+            return Ok(0);
+        }
+        let Some(cortical) = &family.cortical else { return Ok(0) };
+        if std::fs::metadata(self.data_dir.join(&cortical.name))?.len() != cortical.size_bytes {
+            return Err(FieldError::Manifest("WAL pruning cortical family failed validation".into()));
+        }
+        let full = crate::wal_certificate::vector(&family.covered);
+        let cortical = crate::wal_certificate::vector(&family.cortical_covered);
         let log = self.log.read();
-        let seg_dir = self.data_dir.join("segments");
-        let deleted = prune_covered_segments(&seg_dir, &covered, self.instance_id, log.writer_path());
+        let mut deleted = 0;
+        for entry in &family.segments {
+            let path = self.data_dir.join(&entry.path);
+            if crate::wal_certificate::sealed_candidate(&path, log.writer_path())
+                && crate::wal_certificate::covered_segment(&self.data_dir, entry, &full, &cortical, log.writer_path())
+                && audited_remove(&path, "wal-family-certified-full-and-cortical-covered").is_ok() {
+                deleted += 1;
+            }
+        }
         Ok(deleted)
     }
 
