@@ -4,7 +4,7 @@ use crate::ops::Op;
 use crc32fast::Hasher as CrcHasher;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -701,7 +701,7 @@ where
 {
     use std::io::Seek;
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file = BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
 
     // Determine version from magic
     let (version, header_len) = if byte_offset == 0 {
@@ -837,8 +837,11 @@ where
     F: FnMut(u64, Op) -> Result<()>,
 {
     use std::io::Seek;
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+    let raw = File::open(path)?;
+    let file_len = raw.metadata()?.len();
+    // NFS must not service a read for every record field. Bound buffering per
+    // reader while retaining CRC, chain checks and exact torn-tail offsets.
+    let mut file = BufReader::with_capacity(64 * 1024, raw);
 
     let mut magic = [0u8; 8];
     if file.read_exact(&mut magic).is_err() {
