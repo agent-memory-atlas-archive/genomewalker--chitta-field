@@ -31,6 +31,36 @@ use std::sync::atomic::Ordering;
 // CfHandle no longer race on a shared error slot; each thread reads its own.
 // Pointer returned by cf_last_error remains valid until the next FFI call
 // on the same thread overwrites it (same contract as errno / strerror).
+// Optional derived-index work owns only its inputs/publication slot, never the
+// field or instance lock. Shutdown may abandon it without waiting for native
+// preparation; a late result can only update the abandoned publication slot.
+enum StartupWork<T> { Complete(T), Stopped, Failed }
+fn startup_work<T: Send + 'static>(
+    stopped: &std::sync::mpsc::Receiver<()>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> StartupWork<T> {
+    let (send, done) = std::sync::mpsc::channel();
+    if let Err(error) = std::thread::Builder::new().name("chitta-startup-index".into())
+        .spawn(move || { let _ = send.send(work()); }) {
+        eprintln!("[field] deferred worker spawn failed: {error}");
+        return StartupWork::Failed;
+    }
+    loop {
+        match stopped.recv_timeout(std::time::Duration::from_millis(25)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+            _ => return StartupWork::Stopped,
+        }
+        match done.try_recv() {
+            Ok(value) => return StartupWork::Complete(value),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {},
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                eprintln!("[field] deferred worker exited without a result");
+                return StartupWork::Failed;
+            }
+        }
+    }
+}
+
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
@@ -131,7 +161,7 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
             Err(_) => return std::ptr::null_mut(),
         }
     };
-    match ChittaField::open(data_dir) {
+    match ChittaField::open_for_serving(data_dir) {
         Ok(field) => {
             let field = std::sync::Arc::new(field);
             let mut maintenance = Vec::new();
@@ -144,6 +174,26 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                 let worker = std::thread::Builder::new()
                     .name(if wal_only { "chitta-wal" } else { "chitta-maint" }.into())
                     .spawn(move || {
+                        if !wal_only {
+                            let begin = std::time::Instant::now();
+                            let snapshot = field.startup_turbo_snapshot.lock().take();
+                            let cache_plan = snapshot.as_deref().and_then(|p| {
+                                field.semantic_idx.read().plan_startup_turbo_cache(p)
+                            });
+                            let cached = match startup_work(&stopped, move || cache_plan.is_some_and(|plan| plan.load())) {
+                                StartupWork::Complete(hit) => hit,
+                                StartupWork::Stopped => return,
+                                StartupWork::Failed => false,
+                            };
+                            if !cached {
+                                let plan = field.semantic_idx.read().plan_turbo_rebuild(0);
+                                if let Some(plan) = plan {
+                                    if matches!(startup_work(&stopped, move || plan.build()), StartupWork::Stopped) { return; }
+                                }
+                            }
+                            field.semantic_idx.write().prune_turbo_changes();
+                            eprintln!("[field] deferred phase=turbo duration_ms={} cache_hit={cached}", begin.elapsed().as_millis());
+                        }
                         let touch_interval = std::time::Duration::from_secs(
                             std::env::var("CHITTA_TOUCH_FLUSH_S").ok().and_then(|s| s.parse().ok()).unwrap_or(5).max(1));
                         let min_mutations = std::env::var("CHITTA_TURBO_REBUILD_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
@@ -3392,5 +3442,32 @@ mod read_maintenance_tests {
         assert_eq!(field.log.read().pending_sync_count(), 0);
         assert_eq!(field.log.read().last_seqno(), seq + 1);
         cf_close(h);
+    }
+}
+
+#[cfg(test)]
+mod deferred_startup_tests {
+    use super::*;
+
+    #[test]
+    fn stop_does_not_join_blocked_optional_work() {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, finish) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = startup_work(&stopped, move || {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            });
+            finished.send(matches!(result, StartupWork::Stopped)).unwrap();
+        });
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        stop.send(()).unwrap();
+        // The optional job remains blocked until after maintenance has stopped.
+        let stopped_promptly = finish.recv_timeout(std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        waiter.join().unwrap();
+        assert_eq!(stopped_promptly.unwrap(), true);
     }
 }

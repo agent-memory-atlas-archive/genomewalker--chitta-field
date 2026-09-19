@@ -279,6 +279,7 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<InstanceLo
 }
 
 pub struct ChittaField {
+    pub(crate) startup_turbo_snapshot: Mutex<Option<PathBuf>>,
     pub(crate) ablations: crate::ablation::Ablations,
     /// Exclusive advisory lock on `<data_dir>/.instance.lock`, held for the life
     /// of this instance. A second instance on the same directory would compact
@@ -538,6 +539,15 @@ impl ChittaField {
     }
 
     pub(crate) fn open_with_ablations(data_dir: PathBuf, lock: bool, ablations: crate::ablation::Ablations) -> Result<Self> {
+        Self::open_impl(data_dir, lock, ablations, false)
+    }
+
+    /// The daemon publishes the replayed store before optional Turbo warmup.
+    pub(crate) fn open_for_serving(data_dir: PathBuf) -> Result<Self> {
+        Self::open_impl(data_dir, true, crate::ablation::Ablations::from_env()?, true)
+    }
+
+    fn open_impl(data_dir: PathBuf, lock: bool, ablations: crate::ablation::Ablations, deferred_turbo: bool) -> Result<Self> {
         #[cfg(feature = "deadlock-detection")]
         {
             static CHECKER: std::sync::Once = std::sync::Once::new();
@@ -723,7 +733,7 @@ impl ChittaField {
 
         let (loaded_lite_encoder, hdc_store) = opening::warm_startup_indexes(
             &mut keyword_idx, &mut semantic_idx, &payloads, &states,
-            &best_full_path, &data_dir,
+            &best_full_path, &data_dir, deferred_turbo,
         );
         let loaded_seen_offsets = Self::load_seen_offsets(&data_dir, instance_id);
         let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
@@ -763,6 +773,7 @@ impl ChittaField {
         crate::replication::rebuild(&payloads, &triplet_store, &mut states);
         let anchors = crate::anchors::AnchorIndex::rebuild(&payloads);
         Ok(Self {
+            startup_turbo_snapshot: Mutex::new(if deferred_turbo { best_full_path.clone() } else { None }),
             ablations: ablations.clone(),
             instance_lock,
             data_dir,

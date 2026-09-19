@@ -2096,6 +2096,20 @@ impl SemanticIndex {
         self.warm_turbo_with_cache(Some(snapshot));
     }
 
+    /// Capture the cache identity under a short semantic read guard. File I/O,
+    /// validation and native preparation happen after releasing the store guard.
+    pub(crate) fn plan_startup_turbo_cache(&self, snapshot: &std::path::Path) -> Option<TurboCacheLoad> {
+        let key = self.startup_key.filter(|_| self.emb_mmap.is_none())?;
+        let query = self.all_ids().find_map(|id| self.get_embedding(id).and_then(normalize));
+        Some(TurboCacheLoad {
+            snapshot: snapshot.to_path_buf(), key, query,
+            mutation: self.turbo_changed.values().min().map_or(self.mutations, |m| m.saturating_sub(1)),
+            replay_delta: self.turbo_changed.len(),
+            published: self.turbo.clone(), epoch: self.turbo_epoch.load(Ordering::Relaxed),
+            current_epoch: self.turbo_epoch.clone(),
+        })
+    }
+
     pub(crate) fn warm_turbo_with_cache(&self, snapshot: Option<&std::path::Path>) {
         let _phase = crate::profile::LoadPhase::new("turbo_startup");
         let key = self.startup_key.filter(|_| self.emb_mmap.is_none());
@@ -3279,6 +3293,48 @@ mod tests {
     }
 }
 
+/// A startup cache is an immutable candidate, never permission to replace a
+/// newer generation or forget mutations accepted while its file was loading.
+pub(crate) struct TurboCacheLoad {
+    snapshot: std::path::PathBuf,
+    key: [u8; 32],
+    query: Option<Vec<f32>>,
+    mutation: u64,
+    replay_delta: usize,
+    published: Arc<RwLock<Option<Arc<TurboState>>>>,
+    epoch: u64,
+    current_epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TurboCacheLoad {
+    pub(crate) fn load(self) -> bool {
+        let meta: Option<(Vec<MemoryId>, [u8; 32])> =
+            crate::startup_cache::load(&self.snapshot.with_extension("turbo.meta"), &self.key);
+        let Some((ids, checksum)) = meta else { return false; };
+        if ids.iter().copied().collect::<HashSet<_>>().len() != ids.len() { return false; }
+        let path = self.snapshot.with_extension("turbo");
+        if !std::fs::read(&path).ok().is_some_and(|b| crate::startup_cache::digest(&b) == checksum) {
+            return false;
+        }
+        let Ok(index) = refresh_pool().install(|| crate::turbo::SearchIndex::load(&path)) else { return false; };
+        if index.dim() != EMBED_DIM || index.bit_width() != 4 || index.len() != ids.len() { return false; }
+        refresh_pool().install(|| index.prepare());
+        if let Some(query) = self.query {
+            refresh_pool().broadcast(|_| { let _ = index.search(&query, 9.min(ids.len())); });
+        }
+        let built = Arc::new(TurboState { index, ids, built_at_mutation: self.mutation,
+            built_at: std::time::Instant::now(), startup_delta: self.replay_delta != 0 });
+        let mut guard = self.published.write();
+        if self.current_epoch.load(Ordering::Relaxed) != self.epoch
+            || guard.as_ref().is_some_and(|t| t.built_at_mutation > self.mutation) {
+            return false;
+        }
+        *guard = Some(built);
+        eprintln!("[chitta-field] Turbo cache hit=true replay_delta={} deferred=true", self.replay_delta);
+        true
+    }
+}
+
 /// Owns all build inputs; no SemanticIndex/store lock is held during quantization.
 pub(crate) struct TurboBuild {
     flat: Vec<f32>,
@@ -3431,6 +3487,33 @@ mod startup_cache_tests {
         let mut loaded = SemanticIndex::new();
         assert!(loaded.load_embeddings_sidecar(&path.with_extension("emb")));
         loaded
+    }
+
+    #[test]
+    fn deferred_cache_preserves_racing_writes_and_rejects_invalidated_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deferred.snapshot");
+        let mut base = load_raw(&raw_index(2001), &path);
+        base.normalize_with_cache(Some(&path.with_extension("lsh")));
+        base.warm_turbo_with_cache(Some(&path));
+        let mut loaded = SemanticIndex::new();
+        assert!(loaded.load_embeddings_sidecar(&path.with_extension("emb")));
+        loaded.normalize_with_cache(Some(&path.with_extension("lsh")));
+        let plan = loaded.plan_startup_turbo_cache(&path).unwrap();
+        let mut query = vec![0.0; EMBED_DIM]; query[31] = 1.0;
+        loaded.upsert_meta(3000, query.clone(), None);
+        loaded.remove(17);
+        assert!(plan.load());
+        loaded.prune_turbo_changes();
+        let hits = loaded.search(&query, 3, None, None);
+        assert_eq!(hits[0].memory_id, 3000);
+        assert!(!hits.iter().any(|hit| hit.memory_id == 17));
+        let stale = loaded.plan_startup_turbo_cache(&path).unwrap();
+        loaded.invalidate_turbo();
+        assert!(!stale.load());
+        assert!(loaded.turbo.read().is_none());
+        std::fs::write(path.with_extension("turbo"), b"broken").unwrap();
+        assert!(!loaded.plan_startup_turbo_cache(&path).unwrap().load());
     }
 
     #[test]

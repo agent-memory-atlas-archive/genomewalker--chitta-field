@@ -935,6 +935,7 @@ pub(super) fn warm_startup_indexes(
     states: &HashMap<MemoryId, MemoryState>,
     best_full_path: &Option<PathBuf>,
     data_dir: &std::path::Path,
+    deferred_turbo: bool,
 ) -> (Option<LiteEncoder>, crate::hdc::HdcStore) {
     // These inputs are immutable after WAL replay + normalization. No store
     // guards exist yet: quantization, HDC and lite I/O can run independently.
@@ -951,7 +952,7 @@ pub(super) fn warm_startup_indexes(
             ChittaField::load_lite_encoder(data_dir)
         });
         let turbo = scope.spawn(|| {
-            semantic_idx.warm_turbo_with_cache(best_full_path.as_deref());
+            if !deferred_turbo { semantic_idx.warm_turbo_with_cache(best_full_path.as_deref()); }
         });
     // Build HDC index — load from sidecar if available (fast path), else rebuild.
     let hdc_phase = crate::profile::LoadPhase::new("hdc");
