@@ -1315,6 +1315,58 @@ struct Section<'a> {
 
 type ApplySection = Box<dyn FnOnce(&mut FullSnapshot) + Send>;
 
+/// Own the immutable mapping and pending results across independently scheduled
+/// decode batches. Publication remains in file order, including errors and
+/// duplicate sections; a later batch must never replace a WAL-updated section.
+struct MappedSnapshot {
+    bytes: memmap2::Mmap,
+    sections: Vec<(String, std::ops::Range<usize>, u64)>,
+    decoded: Vec<Option<Result<ApplySection>>>,
+    table_result: Result<()>,
+    seqno: u64,
+}
+
+impl MappedSnapshot {
+    // The caller has validated the 16-byte V23 header.
+    fn new(bytes: memmap2::Mmap, seqno: u64) -> Self {
+        let (sections, table_result) = section_table(&bytes[16..]);
+        let base = bytes.as_ptr() as usize;
+        let sections: Vec<_> = sections.into_iter().map(|section| {
+            let start = section.body.as_ptr() as usize - base;
+            (section.name, start..start + section.body.len(), section.declared_len)
+        }).collect();
+        let decoded = (0..sections.len()).map(|_| None).collect();
+        Self { bytes, sections, decoded, table_result, seqno }
+    }
+
+    fn decode_selected(&mut self, select: impl Fn(&str) -> bool) {
+        let mut jobs: Vec<_> = self.sections.iter().enumerate()
+            .filter(|(i, (name, _, _))| self.decoded[*i].is_none() && select(name))
+            .collect();
+        jobs.sort_by_key(|(_, (_, range, _))| std::cmp::Reverse(range.len()));
+        let bytes = &self.bytes;
+        let decoded: Vec<_> = decode_pool().install(|| jobs.par_iter()
+            .with_max_len(1).map(|(i, (name, range, declared_len))| {
+                let section = Section {
+                    name: name.clone(), body: &bytes[range.clone()], declared_len: *declared_len,
+                };
+                (*i, decode_section(&section))
+            }).collect());
+        for (i, result) in decoded { self.decoded[i] = Some(result); }
+    }
+
+    fn finish(mut self) -> Result<FullSnapshot> {
+        self.decode_selected(|_| true);
+        let mut snap = FullSnapshot::empty(self.seqno);
+        for result in self.decoded {
+            result.expect("all snapshot sections decoded")?(&mut snap);
+        }
+        self.table_result?;
+        for state in snap.states.values_mut() { state.sanitize(); }
+        Ok(snap)
+    }
+}
+
 fn decode_section(section: &Section<'_>) -> Result<ApplySection> {
     let n = section.name.as_str();
     macro_rules! decode {
@@ -1654,7 +1706,6 @@ impl FullSnapshot {
             let mut seq_buf = [0u8; 8];
             r.read_exact(&mut seq_buf)
                 .map_err(|_| FieldError::Manifest("v23 snapshot too short".to_string()))?;
-            let mut snap = FullSnapshot::empty(u64::from_le_bytes(seq_buf));
             // SAFETY: committed snapshots are immutable. save() writes a fresh
             // temporary file and atomically renames it; pruning/unlinking a file
             // cannot invalidate this open file's mapping. Keep the mapping alive
@@ -1666,19 +1717,9 @@ impl FullSnapshot {
                 // explicit read() timer emitted by SnapshotReader.
                 eprintln!("[chitta-field] snapshot mapped_bytes={}", bytes.len());
             }
-            let (sections, table_result) = section_table(&bytes[16..]);
             let _phase = crate::profile::SnapshotPhase::new("parallel_sections");
-            // Collect every outcome in file order; parallel short-circuiting
-            // would nondeterministically choose between corrupt sections.
-            let mut jobs: Vec<_> = sections.iter().enumerate().collect();
-            jobs.sort_by_key(|(_, section)| std::cmp::Reverse(section.body.len()));
-            let mut decoded: Vec<_> = decode_pool().install(|| jobs.par_iter()
-                .with_max_len(1).map(|(i, section)| (*i, decode_section(section))).collect());
-            decoded.sort_by_key(|(i, _)| *i);
-            for (_, apply) in decoded { apply?(&mut snap); }
-            table_result?;
+            let snap = MappedSnapshot::new(bytes, u64::from_le_bytes(seq_buf)).finish()?;
             *rebuilt = true;
-            for state in snap.states.values_mut() { state.sanitize(); }
             return Ok(snap);
         }
 
@@ -2439,12 +2480,35 @@ mod tests {
     }
 
     fn parallel_v23(bytes: &[u8]) -> Result<FullSnapshot> {
-        let (sections, tail) = section_table(bytes);
-        let mut snap = FullSnapshot::empty(0);
-        let decoded: Vec<_> = decode_pool().install(|| sections.par_iter().map(decode_section).collect());
-        for result in decoded { result?(&mut snap); }
-        tail?;
-        Ok(snap)
+        let mut mapping = memmap2::MmapMut::map_anon(bytes.len() + 16).unwrap();
+        mapping[16..].copy_from_slice(bytes);
+        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0);
+        pending.decode_selected(|name| name == "triplets_clean");
+        let count = pending.decoded.iter().filter(|r| r.is_some()).count();
+        pending.decode_selected(|name| name == "triplets_clean");
+        assert_eq!(count, pending.decoded.iter().filter(|r| r.is_some()).count());
+        pending.finish()
+    }
+
+    #[test]
+    fn staged_sections_retain_mapping_after_snapshot_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot");
+        let mut bytes = vec![0; 16];
+        write_section(&mut bytes, "ack_scores", &HashMap::from([(7u64, 9i32)])).unwrap();
+        write_section(&mut bytes, "triplets_clean", &true).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: this test never modifies the immutable mapped inode.
+        let mapping = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
+        let mut pending = MappedSnapshot::new(mapping, 42);
+        pending.decode_selected(|name| name == "triplets_clean");
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        let snap = pending.finish().unwrap();
+        assert_eq!(snap.snapshot_seqno, 42);
+        assert_eq!(snap.ack_scores, HashMap::from([(7, 9)]));
+        assert!(snap.triplet_store.clean);
     }
 
     #[test]
