@@ -31,6 +31,7 @@ pub mod ids;
 pub mod learner;
 pub mod log;
 pub mod manifest;
+pub(crate) mod wal_certificate;
 pub mod ops;
 pub mod organ;
 pub mod payload;

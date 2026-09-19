@@ -613,7 +613,7 @@ fn is_chained_segment(path: &Path) -> bool {
 
 /// Read a V3 segment's vector_space_id lineage stamp. None for V1/V2/legacy/unreadable
 /// segments — replay treats those as same-lineage (always replayed).
-fn segment_vector_space_id(path: &Path) -> Option<u64> {
+pub(crate) fn segment_vector_space_id(path: &Path) -> Option<u64> {
     let mut f = File::open(path).ok()?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic).ok()?;
