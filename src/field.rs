@@ -237,7 +237,7 @@ fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<Option<InstanceLo
         let holder_host = parts.next().unwrap_or("");
         if holder_pid == Some(std::process::id()) && holder_host == hostname {
             return Err(FieldError::Manifest(format!(
-                "instance lock self-holder bug at {} (recorded holder: {})",
+                "another chitta-field instance holds the store: instance lock self-holder bug at {} (recorded holder: {})",
                 path.display(), holder.trim())));
         }
         let stale = !replaced_stale
