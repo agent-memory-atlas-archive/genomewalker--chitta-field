@@ -316,7 +316,7 @@ pub struct ChittaField {
     pub(crate) keyword_idx: RwLock<KeywordIndex>,
     pub(crate) triplet_store: RwLock<TripletStore>,
     pub(crate) triplet_id_alloc: Arc<TripletIdAllocator>,
-    pub(crate) symbol_idx: RwLock<SymbolIndex>,
+    pub(crate) symbol_idx: crate::ablation::StartupValue<RwLock<SymbolIndex>>,
     pub(crate) call_graph: RwLock<CallGraph>,
     pub(crate) code_files: RwLock<CodeFileIndex>,
     pub(crate) symbol_id_alloc: Arc<TripletIdAllocator>,
@@ -716,7 +716,7 @@ impl ChittaField {
         // snapshots written before the dedup-key fix carry line-keyed dedup
         // entries and by_name buckets with recycled ids.
         let symbols_phase = crate::profile::LoadPhase::new("symbols");
-        let symbol_dups = symbol_idx.rebuild_derived();
+        let symbol_dups = if deferred_turbo { 0 } else { symbol_idx.rebuild_derived() };
         drop(symbols_phase);
         if symbol_dups > 0 {
             eprintln!(
@@ -739,11 +739,18 @@ impl ChittaField {
         let scoring_config = crate::scoring::config::ScoringConfig::load(&data_dir);
         let loaded_repl_sessions = crate::repl_sessions::ReplSessionStore::load(&data_dir);
         let span_phase = crate::profile::LoadPhase::new("span_store");
-        let loaded_span_store = crate::organ::span_store::SpanStore::load(&data_dir);
+        let span_path = data_dir.clone();
+        let loaded_span_store = if deferred_turbo {
+            crate::ablation::Organ::deferred("span_store", move || crate::organ::span_store::SpanStore::load(&span_path),
+                crate::organ::span_store::SpanStore::new, ablations.disabled("span_store"))
+        } else {
+            crate::ablation::Organ::new("span_store", crate::organ::span_store::SpanStore::load(&data_dir),
+                crate::organ::span_store::SpanStore::new, ablations.disabled("span_store"))
+        };
         drop(span_phase);
 
         let (event_tape, cdawg, episode_hdc) = opening::rebuild_event_organs(
-            snap_event_tape, &triplet_store, &payloads, &states, &best_full_path,
+            snap_event_tape, &triplet_store, &payloads, &states, &best_full_path, deferred_turbo, &ablations,
         );
         let refutation_ledger = crate::organ::refutation_ledger::RefutationLedger::new();
         let cec_policy_store  = crate::organ::intervention_store::InterventionStore::new();
@@ -806,7 +813,12 @@ impl ChittaField {
                 triplet_store
             }),
             triplet_id_alloc,
-            symbol_idx: RwLock::new("symbol_idx", symbol_idx),
+            symbol_idx: if deferred_turbo {
+                crate::ablation::StartupValue::deferred(move || {
+                    symbol_idx.rebuild_derived();
+                    RwLock::new("symbol_idx", symbol_idx)
+                })
+            } else { crate::ablation::StartupValue::ready(RwLock::new("symbol_idx", symbol_idx)) },
             call_graph: RwLock::new("call_graph", call_graph),
             code_files: RwLock::new("code_files", code_files),
             symbol_id_alloc,
@@ -865,7 +877,7 @@ impl ChittaField {
             kind_stats:  RwLock::new("kind_stats", HashMap::new()),
             ack_scores:  RwLock::new("ack_scores", snap_ack_scores),
             repl_sessions: crate::ablation::Organ::new("repl_sessions", loaded_repl_sessions, crate::repl_sessions::ReplSessionStore::new, ablations.disabled("repl_sessions")),
-            span_store: crate::ablation::Organ::new("span_store", loaded_span_store, crate::organ::span_store::SpanStore::new, ablations.disabled("span_store")),
+            span_store: loaded_span_store,
             pending_recall: Mutex::new(PendingRecallEffects::default()),
             backfill_plan_stage: Mutex::new(None),
             coactivation_stats: RwLock::new("coactivation_stats", {
@@ -881,10 +893,10 @@ impl ChittaField {
             hopfield: RwLock::new("hopfield", HopfieldNetwork::new()),
             filter_level: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             scoring_pipeline: RwLock::new("scoring_pipeline", crate::scoring::ScoringPipeline::new(scoring_config)),
-            hdc_idx:    crate::ablation::Organ::new("hdc_idx", hdc_store, crate::hdc::HdcStore::new, ablations.disabled("hdc_idx")),
+            hdc_idx:    crate::ablation::Organ::deferred("hdc_idx", move || hdc_store(), crate::hdc::HdcStore::new, ablations.disabled("hdc_idx")),
             event_tape:   crate::ablation::Organ::new("event_tape", event_tape, crate::organ::event_tape::EventTape::new, ablations.disabled("event_tape")),
-            cdawg:        crate::ablation::Organ::new("cdawg", cdawg, crate::organ::cdawg::CdawgOrgan::new, ablations.disabled("cdawg")),
-            episode_hdc:        crate::ablation::Organ::new("episode_hdc", episode_hdc, crate::hdc::EpisodeHdcStore::new, ablations.disabled("episode_hdc")),
+            cdawg:        cdawg,
+            episode_hdc:        episode_hdc,
             refutation_ledger:  crate::ablation::Organ::new("refutation_ledger", refutation_ledger, crate::organ::refutation_ledger::RefutationLedger::new, ablations.disabled("refutation_ledger")),
             cec_policy_store:   crate::ablation::Organ::new("cec_policy_store", cec_policy_store, crate::organ::intervention_store::InterventionStore::new, ablations.disabled("cec_policy_store")),
             decision_tape:      crate::ablation::Organ::new("decision_tape", decision_tape, crate::organ::decision_tape::DecisionTape::new, ablations.disabled("decision_tape")),

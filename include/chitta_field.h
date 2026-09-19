@@ -34,6 +34,9 @@ typedef struct {
 
 /* Lifecycle */
 CfHandle* cf_open(const char* data_dir, const char* lock_dir);
+/* Secondary indexes are published independently of recall readiness. */
+bool cf_startup_indexes_ready(CfHandle *handle);
+
 void      cf_close(CfHandle* h);
 const char* cf_last_error(const CfHandle* h);
 

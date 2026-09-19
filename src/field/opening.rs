@@ -936,7 +936,7 @@ pub(super) fn warm_startup_indexes(
     best_full_path: &Option<PathBuf>,
     data_dir: &std::path::Path,
     deferred_turbo: bool,
-) -> (Option<LiteEncoder>, crate::hdc::HdcStore) {
+) -> (Option<LiteEncoder>, Box<dyn FnOnce() -> crate::hdc::HdcStore + Send>) {
     // These inputs are immutable after WAL replay + normalization. No store
     // guards exist yet: quantization, HDC and lite I/O can run independently.
     let (loaded_lite_encoder, hdc_store) = std::thread::scope(|scope| {
@@ -956,26 +956,25 @@ pub(super) fn warm_startup_indexes(
         let turbo = scope.spawn(|| {
             if !deferred_turbo { semantic_idx.warm_turbo_with_cache(best_full_path.as_deref()); }
         });
-    // Build HDC index — load from sidecar if available (fast path), else rebuild.
-    let hdc_phase = crate::profile::LoadPhase::new("hdc");
-    let mut hdc_store = crate::hdc::HdcStore::new();
-    {
-        let hdc_sidecar = best_full_path.as_ref().map(|p| p.with_extension("hdc"));
-        let loaded = hdc_sidecar.as_ref()
-            .and_then(|p| hdc_store.load_sidecar(p).ok())
-            .unwrap_or(0);
-        if loaded > 0 {
-            eprintln!("[chitta-field] hdc sidecar: loaded {} memories (skipped rebuild)", loaded);
-        } else {
-            eprintln!("[chitta-field] hdc sidecar: not found or stale — rebuilding from payloads");
-            let entries = payloads.iter()
-                .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
-                .map(|(id, p)| (*id, std::str::from_utf8(&p.content).unwrap_or(""), p.realm.as_str()));
-            hdc_store.rebuild(entries);
-        }
-    }
-
-    drop(hdc_phase);
+    // Own the baseline inputs: the first HDC access initializes before any
+    // mutation, and never replaces a live, already-mutated index.
+    let hdc_sidecar = best_full_path.as_ref().map(|p| p.with_extension("hdc"));
+    let entries: Vec<_> = payloads.iter()
+        .filter(|(id, _)| states.get(id).map(|s| !s.deleted).unwrap_or(false))
+        .map(|(id, p)| (*id, String::from_utf8_lossy(&p.content).into_owned(), p.realm.clone())).collect();
+    let build = move || {
+        let mut hdc = crate::hdc::HdcStore::new();
+        let loaded = hdc_sidecar.as_ref().and_then(|p| hdc.load_sidecar(p).ok()).unwrap_or(0);
+        if loaded == 0 { hdc.rebuild(entries.iter().map(|(id, text, realm)| (*id, text.as_str(), realm.as_str()))); }
+        hdc
+    };
+    let hdc_store: Box<dyn FnOnce() -> crate::hdc::HdcStore + Send> = if deferred_turbo {
+        Box::new(build)
+    } else {
+        let _phase = crate::profile::LoadPhase::new("hdc");
+        let hdc = build();
+        Box::new(move || hdc)
+    };
     keyword.join().expect("startup keyword worker panicked");
     turbo.join().expect("startup Turbo worker panicked");
     let loaded_lite_encoder = lite.join().expect("startup lite encoder worker panicked");
@@ -992,7 +991,9 @@ pub(super) fn rebuild_event_organs(
     payloads: &HashMap<MemoryId, MemoryPayload>,
     states: &HashMap<MemoryId, MemoryState>,
     best_full_path: &Option<PathBuf>,
-) -> (crate::organ::event_tape::EventTape, crate::organ::cdawg::CdawgOrgan, crate::hdc::EpisodeHdcStore) {
+    deferred: bool,
+    ablations: &crate::ablation::Ablations,
+) -> (crate::organ::event_tape::EventTape, crate::ablation::Organ<crate::organ::cdawg::CdawgOrgan>, crate::ablation::Organ<crate::hdc::EpisodeHdcStore>) {
     // Build EventTape from snapshot, seed entity interner from triplets, synthesize
     // legacy events for existing memories, then rebuild CDAWG from the tape.
     // Use persisted EventTape from snapshot if available; otherwise synthesize from memories.
@@ -1014,11 +1015,24 @@ pub(super) fn rebuild_event_organs(
         }
         tape
     };
-    let tape_phase = crate::profile::LoadPhase::new("event_tape_organs");
     let organs_path = best_full_path.as_ref().map(|p| p.with_extension("organs"));
-    let (cdawg, episode_hdc) = crate::startup_cache::load_or_rebuild_organs(
-        &event_tape, organs_path.as_deref());
-    drop(tape_phase);
+    let tape = event_tape.clone();
+    let build = move || crate::startup_cache::load_or_rebuild_organs(&tape, organs_path.as_deref());
+    let pending = if deferred {
+        crate::ablation::StartupValue::deferred(move || {
+            let (c, h) = build();
+            parking_lot::Mutex::new((Some(c), Some(h)))
+        })
+    } else {
+        let _phase = crate::profile::LoadPhase::new("event_tape_organs");
+        let (c, h) = build();
+        crate::ablation::StartupValue::ready(parking_lot::Mutex::new((Some(c), Some(h))))
+    };
+    let other = pending.clone();
+    let cdawg = crate::ablation::Organ::deferred("cdawg", move || pending.lock().0.take().unwrap(),
+        crate::organ::cdawg::CdawgOrgan::new, ablations.disabled("cdawg"));
+    let episode_hdc = crate::ablation::Organ::deferred("episode_hdc", move || other.lock().1.take().unwrap(),
+        crate::hdc::EpisodeHdcStore::new, ablations.disabled("episode_hdc"));
     (event_tape, cdawg, episode_hdc)
 }
 

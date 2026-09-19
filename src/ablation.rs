@@ -112,19 +112,70 @@ impl Ablations {
 /// Persistence and foreign WAL replay explicitly use the preserved state.
 /// Keeping those accesses explicit prevents a maintenance save from discarding
 /// a disabled organ's data and makes rollback independent of optional defaults.
+/// One publication for maintenance, readers, mutations, and persistence. The
+/// initializer owns only startup inputs, so cancellation may detach it safely.
+pub(crate) struct StartupValue<T>(std::sync::Arc<StartupInner<T>>);
+struct StartupInner<T> {
+    value: std::sync::OnceLock<T>,
+    loader: parking_lot::Mutex<Option<Box<dyn FnOnce() -> T + Send>>>,
+}
+impl<T> Clone for StartupValue<T> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
+impl<T> StartupValue<T> {
+    pub(crate) fn ready(value: T) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(value);
+        Self(std::sync::Arc::new(StartupInner { value: cell, loader: parking_lot::Mutex::new(None) }))
+    }
+    pub(crate) fn deferred(loader: impl FnOnce() -> T + Send + 'static) -> Self {
+        Self(std::sync::Arc::new(StartupInner { value: std::sync::OnceLock::new(), loader: parking_lot::Mutex::new(Some(Box::new(loader))) }))
+    }
+    pub(crate) fn is_ready(&self) -> bool { self.0.value.get().is_some() }
+}
+impl<T: Send + Sync + 'static> StartupValue<T> {
+    pub(crate) fn startup_job(&self) -> Box<dyn FnOnce() + Send> {
+        let value = self.clone();
+        Box::new(move || { let _ = &*value; })
+    }
+}
+impl<T> Deref for StartupValue<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.value.get_or_init(|| {
+            let loader = self.0.loader.lock().take().expect("startup initializer panicked");
+            loader()
+        })
+    }
+}
+
 pub(crate) struct Organ<T> {
-    runtime: RwLock<T>,
-    preserved: Option<RwLock<T>>,
+    runtime: StartupValue<RwLock<T>>,
+    preserved: Option<StartupValue<RwLock<T>>>,
     empty: fn() -> T,
 }
 
 impl<T> Organ<T> {
     pub(crate) fn new(component: &'static str, value: T, empty: fn() -> T, disabled: bool) -> Self {
         if disabled {
-            Self { runtime: RwLock::new(component, empty()), preserved: Some(RwLock::new(component, value)), empty }
+            Self { runtime: StartupValue::ready(RwLock::new(component, empty())), preserved: Some(StartupValue::ready(RwLock::new(component, value))), empty }
         } else {
-            Self { runtime: RwLock::new(component, value), preserved: None, empty }
+            Self { runtime: StartupValue::ready(RwLock::new(component, value)), preserved: None, empty }
         }
+    }
+
+    pub(crate) fn deferred(component: &'static str, loader: impl FnOnce() -> T + Send + 'static,
+        empty: fn() -> T, disabled: bool) -> Self where T: Send + Sync + 'static {
+        let value = StartupValue::deferred(move || RwLock::new(component, loader()));
+        if disabled {
+            Self { runtime: StartupValue::ready(RwLock::new(component, empty())), preserved: Some(value), empty }
+        } else { Self { runtime: value, preserved: None, empty } }
+    }
+    pub(crate) fn is_ready(&self) -> bool {
+        self.preserved.as_ref().unwrap_or(&self.runtime).is_ready()
+    }
+    pub(crate) fn startup_job(&self) -> Box<dyn FnOnce() + Send> where T: Send + Sync + 'static {
+        self.preserved.as_ref().unwrap_or(&self.runtime).startup_job()
     }
 
     pub(crate) fn read(&self) -> RwLockReadGuard<'_, T> { self.runtime.read() }
@@ -161,6 +212,50 @@ impl<T> DerefMut for OrganWrite<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_initialization_preserves_racing_first_mutations_and_snapshot() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let organ = Arc::new(Organ::deferred("test_deferred", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            vec![99]
+        }, Vec::new, false));
+        assert!(!organ.is_ready());
+        let loader = organ.startup_job();
+        std::thread::scope(|scope| {
+            scope.spawn(loader);
+            for n in 0..16 {
+                let organ = organ.clone();
+                scope.spawn(move || organ.write().push(n));
+            }
+        });
+        let mut persisted = organ.persisted_read().clone();
+        persisted.sort();
+        assert_eq!(persisted, (0..16).chain([99]).collect::<Vec<_>>());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(organ.is_ready());
+    }
+
+    #[test]
+    fn deferred_ablated_state_is_loaded_before_replay_and_preserved() {
+        let organ = Organ::deferred("test_deferred_ablation", || vec![1], Vec::new, true);
+        assert!(organ.read().is_empty());
+        organ.write().push(9);
+        organ.replay_write().push(2);
+        assert_eq!(*organ.persisted_read(), vec![1, 2]);
+        assert!(organ.read().is_empty());
+    }
+
+    #[test]
+    fn cancelled_startup_job_owns_no_store_or_store_lock() {
+        let organ = Organ::deferred("detached", || vec![1], Vec::new, false);
+        let job = organ.startup_job();
+        drop(organ);
+        // The worker can finish after its owning store has been closed.
+        std::thread::spawn(job).join().unwrap();
+    }
 
     #[test]
     fn names_are_validated_and_deduplicated() {

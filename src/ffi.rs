@@ -180,7 +180,11 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
             Err(_) => return std::ptr::null_mut(),
         }
     };
-    match ChittaField::open_for_serving(data_dir) {
+    // Diagnostic eager control for replica parity; production is staged.
+    let opened = if std::env::var("CHITTA_STARTUP_EAGER").as_deref() == Ok("1") {
+        ChittaField::open(data_dir)
+    } else { ChittaField::open_for_serving(data_dir) };
+    match opened {
         Ok(field) => {
             let field = std::sync::Arc::new(field);
             let mut maintenance = Vec::new();
@@ -194,6 +198,17 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                     .name(if wal_only { "chitta-wal" } else { "chitta-maint" }.into())
                     .spawn(move || {
                         if !wal_only {
+                            for (phase, job) in [
+                                ("symbols", field.symbol_idx.startup_job()),
+                                ("span_store", field.span_store.startup_job()),
+                                ("hdc", field.hdc_idx.startup_job()),
+                                ("event_tape_organs", field.cdawg.startup_job()),
+                                ("episode_hdc", field.episode_hdc.startup_job()),
+                            ] {
+                                let begin = std::time::Instant::now();
+                                if !matches!(startup_work(&stopped, job), StartupWork::Complete(())) { return; }
+                                eprintln!("[field] deferred phase={phase} duration_ms={}", begin.elapsed().as_millis());
+                            }
                             let begin = std::time::Instant::now();
                             if !prepare_startup_keywords(&field, &stopped) { return; }
                             eprintln!("[field] deferred phase=keyword_reverse duration_ms={}", begin.elapsed().as_millis());
@@ -3504,4 +3519,13 @@ mod deferred_startup_tests {
         waiter.join().unwrap();
         assert_eq!(stopped_promptly.unwrap(), true);
     }
+}
+
+/// Whether tools depending on secondary startup indexes may run without loading.
+#[no_mangle]
+pub unsafe extern "C" fn cf_startup_indexes_ready(handle: *mut CfHandle) -> bool {
+    let Some(handle) = handle.as_ref() else { return false; };
+    let f = &handle.field;
+    f.symbol_idx.is_ready() && f.span_store.is_ready() && f.hdc_idx.is_ready()
+        && f.cdawg.is_ready() && f.episode_hdc.is_ready()
 }
