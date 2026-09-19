@@ -502,6 +502,12 @@ impl OpLog {
                         "[chitta-field] WAL lineage fence: skipping foreign segment {:?} (vsid={:#018x} != own {:#018x})",
                         seg_path, seg_vsid, self.vector_space_id
                     );
+                    // Keep foreign bytes for audit/recovery, but avoid paying the
+                    // header-open cost on every subsequent load. Never move an
+                    // active/unsealed writer and never overwrite an archive.
+                    if crate::wal_certificate::sealed_candidate(seg_path, self.writer_path()) {
+                        archive_foreign_segment(seg_path)?;
+                    }
                     continue;
                 }
             }
@@ -682,6 +688,26 @@ pub(crate) fn segment_vector_space_id(path: &Path) -> Option<u64> {
     let mut vbuf = [0u8; 8];
     f.read_exact(&mut vbuf).ok()?;
     Some(u64::from_be_bytes(vbuf))
+}
+
+/// Called only after the lineage fence and sealed-writer check.
+fn archive_foreign_segment(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| FieldError::Manifest("segment has no parent".into()))?;
+    let archive = parent.join("foreign");
+    fs::create_dir_all(&archive)?;
+    let destination = archive.join(path.file_name().unwrap());
+    // A single store instance owns this directory. Refuse collisions so the
+    // previous audit copy can never be overwritten by a resurrected NFS name.
+    if destination.symlink_metadata().is_ok() {
+        return Err(FieldError::Manifest(format!("foreign segment archive already exists: {}", destination.display())));
+    }
+    let result = fs::rename(path, &destination);
+    eprintln!("[chitta-field] WAL rename path={} destination={} reason=foreign-lineage-sealed result={:?}",
+        path.display(), destination.display(), result);
+    result?;
+    File::open(&archive)?.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn is_valid_segment_name(name: &str) -> bool {
@@ -1083,9 +1109,11 @@ where
         f(seqno, op)?;
         decoded_end = file.stream_position()?;
     }
-    if start_seqno == 0 && ordered && decoded_end == file_len {
+    if start_seqno == 0 && ordered && first.is_none_or(|seq| seq >= header_first) && decoded_end == file_len {
         if let (Some(last_seqno), Ok(after)) = (last.or_else(|| header_first.checked_sub(1)), std::fs::metadata(path)) {
-            let first_seqno = first.unwrap_or(header_first);
+            // The header/name reserves a lower bound; global sequence allocation
+            // can leave a gap before this writer appends its first record.
+            let first_seqno = header_first;
             if after.len() == file_len && before.modified().ok().zip(after.modified().ok()).is_some_and(|(a,b)| a == b) {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     *certificate = Some(crate::manifest::SegmentInfo {

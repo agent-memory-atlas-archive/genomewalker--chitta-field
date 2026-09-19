@@ -58,7 +58,7 @@ pub(crate) fn scan_sealed_segment(
     let end = crate::log::replay_from_offset(path, 0, |seqno, _| {
         valid &= match last_seqno {
             Some(last) => seqno > last,
-            None => seqno == first_seqno,
+            None => seqno >= first_seqno,
         };
         last_seqno = Some(seqno);
         Ok(())
@@ -178,6 +178,61 @@ mod tests {
             cortical: None, segments: vec![entry],
             vector_space_id: Some(crate::snapshot::StoreHeader::compiled_vector_space_id()),
         }
+    }
+
+    #[test]
+    fn foreign_lineage_is_archived_once_without_losing_bytes() {
+        let (dir, path, _) = fixture();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let foreign = crate::snapshot::StoreHeader::compiled_vector_space_id() ^ 1;
+        bytes[48..56].copy_from_slice(&foreign.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let mut reader = OpLog::open(dir.path(), 0x87654321, 3).unwrap();
+        let active_mtime = std::fs::metadata(reader.writer_path()).unwrap().modified().unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(active_mtime - std::time::Duration::from_secs(2))).unwrap();
+        reader.replay(0, |_, _, _| panic!("foreign record applied")).unwrap();
+        let archive = path.parent().unwrap().join("foreign").join(path.file_name().unwrap());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+        reader.replay(0, |_, _, _| panic!("foreign record revisited")).unwrap();
+        // NFS can resurrect a name: the original audit copy must survive.
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(active_mtime - std::time::Duration::from_secs(2))).unwrap();
+        assert!(reader.replay(0, |_, _, _| Ok(())).is_err());
+        assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn legacy_reserved_start_certifies_a_later_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = OpLog::open(dir.path(), 0x12345678, 1).unwrap();
+        writer.set_next_seqno(100);
+        writer.append(&Op::UpdateMemoryContent(UpdateMemoryContentOp {
+            memory_id: 1, content: b"sequence gap".to_vec(),
+            embedding: Vec::new(), op_ts_ms: 0,
+        })).unwrap();
+        writer.sync().unwrap();
+        let path = writer.writer_path().to_path_buf();
+        drop(writer);
+        let mut reader = OpLog::open(dir.path(), 0x87654321, 101).unwrap();
+        let active_mtime = std::fs::metadata(reader.writer_path()).unwrap().modified().unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(active_mtime - std::time::Duration::from_secs(2))).unwrap();
+        reader.replay(0, |_, _, _| Ok(())).unwrap();
+        let entry = reader.segment_inventory().into_iter().find(|e| e.path.ends_with("12345678_000000000001.seg")).unwrap();
+        assert_eq!((entry.first_seqno, entry.last_seqno), (1, 100));
+        let scanned = scan_sealed_segment(&path, reader.writer_path(),
+            crate::snapshot::StoreHeader::compiled_vector_space_id()).unwrap();
+        assert_eq!((scanned.first_seqno, scanned.last_seqno), (1, 100));
+        let mut cp = family(entry);
+        cp.covered.insert("12345678".into(), 100);
+        cp.cortical_covered = cp.covered.clone();
+        let bytes = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0u8; bytes]).unwrap();
+        reader.replay_certified(Some(&cp), |_, _, _| panic!("certified file decoded")).unwrap();
     }
 
     #[test]
