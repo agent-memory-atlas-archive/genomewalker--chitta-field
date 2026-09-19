@@ -80,6 +80,10 @@ pub struct TripletStore {
     duplicate_ids: std::collections::HashSet<u64>,
     #[serde(skip)]
     source_files: std::collections::HashSet<std::sync::Arc<str>>,
+    /// Lazily built positional postings: legacy imports may reuse fact IDs.
+    /// Runtime only; vector compaction invalidates it, append extends it.
+    #[serde(skip)]
+    by_source_file: Option<HashMap<std::sync::Arc<str>, Vec<usize>>>,
     next_id: u64,
     entries: Vec<TripletEntry>,
 
@@ -112,6 +116,8 @@ impl TripletStore {
                 + e.object.capacity()).sum::<usize>()
             + self.source_files.iter().map(|p| p.len() + 16).sum::<usize>()
             + self.source_files.capacity() * 8 / 7 * (std::mem::size_of::<std::sync::Arc<str>>() + 1)
+            + self.by_source_file.as_ref().map_or(0, |m| map_bytes(m)
+                + m.values().map(|v| v.capacity() * std::mem::size_of::<usize>()).sum::<usize>())
             + map_bytes(&self.id_to_index)
             + [&self.by_subject, &self.by_object, &self.by_predicate].iter().map(|m|
                 map_bytes(m) + m.iter().map(|(k, v)| k.capacity() + v.capacity() * 8).sum::<usize>()).sum::<usize>()
@@ -126,6 +132,7 @@ impl TripletStore {
             dirty_subjects: None,
             duplicate_ids: Default::default(),
             source_files: Default::default(),
+            by_source_file: None,
             next_id: 1,
             entries: Vec::new(),
             id_to_index: HashMap::new(),
@@ -211,6 +218,7 @@ impl TripletStore {
                 }
                 self.ingestion_times.remove(id);
             }
+            self.by_source_file = None;
             self.entries.retain(|e| !removed.contains(&e.id));
             for (pos, entry) in self.entries.iter().enumerate() {
                 *self.id_to_index.get_mut(&entry.id).expect("survivor index") = pos;
@@ -235,6 +243,7 @@ impl TripletStore {
     /// Clear derived indexes before serialization so new snapshots stay small.
     /// Call rebuild_indexes() after any deserialization to restore them.
     pub fn clear_indexes_for_save(&mut self) {
+        self.by_source_file = None;
         self.id_to_index.clear();
         self.id_to_index.shrink_to_fit();
         self.by_subject.clear();
@@ -247,6 +256,7 @@ impl TripletStore {
 
     /// Rebuild all derived indexes from `entries`. Must be called after deserialization.
     pub fn rebuild_indexes(&mut self) {
+        self.by_source_file = None;
         self.source_files.clear();
         for entry in &mut self.entries {
             if let Some(path) = &mut entry.source_file {
@@ -436,6 +446,9 @@ impl TripletStore {
             source_memory_id,
             source_file: self.intern_source_file(source_file),
         };
+        if let (Some(index), Some(path)) = (&mut self.by_source_file, &entry.source_file) {
+            index.entry(path.0.clone()).or_default().push(idx);
+        }
         self.entries.push(entry);
 
         self.by_subject
@@ -584,15 +597,21 @@ impl TripletStore {
     pub fn invalidate_by_source_file(&mut self, source_file: &str, now_ms: i64) -> Vec<u64> {
         let mut invalidated = Vec::new();
         let mut subjects = Vec::new();
-        for entry in self.entries.iter_mut() {
-            if entry.valid_to_ms == 0 {
-                if let Some(ref sf) = entry.source_file {
-                    if sf == source_file {
-                        entry.valid_to_ms = now_ms;
-                        subjects.push(entry.subject.clone());
-                        invalidated.push(entry.id);
-                    }
+        let index = self.by_source_file.get_or_insert_with(|| {
+            let mut index: HashMap<std::sync::Arc<str>, Vec<usize>> = HashMap::new();
+            for (pos, entry) in self.entries.iter().enumerate() {
+                if let Some(path) = &entry.source_file {
+                    index.entry(path.0.clone()).or_default().push(pos);
                 }
+            }
+            index
+        });
+        for &pos in index.get(source_file).into_iter().flatten() {
+            let entry = &mut self.entries[pos];
+            if entry.valid_to_ms == 0 {
+                entry.valid_to_ms = now_ms;
+                subjects.push(entry.subject.clone());
+                invalidated.push(entry.id);
             }
         }
         for subject in subjects { self.mark_dirty(subject); }
@@ -809,6 +828,49 @@ impl TripletStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_invalidation_matches_scan_across_replay_and_compaction() {
+        let mut indexed = super::TripletStore::new();
+        let mut scanned = indexed.clone();
+        for round in 0..8 {
+            for id in 1..=40 {
+                // Reused IDs, duplicate facts, unrelated files, and missing paths.
+                let source = (id % 4 != 0).then(|| format!("file{}", id % 3));
+                for store in [&mut indexed, &mut scanned] {
+                    store.replay_add(id, format!("s{}", id % 17), "p".into(),
+                        format!("o{round}"), 1.0, round, None, source.clone());
+                }
+            }
+            for path in ["file1", "missing", "file2", "file1"] {
+                let now = round * 10; // Include zero, preserving legacy semantics.
+                let actual = indexed.invalidate_by_source_file(path, now);
+                let mut expected = Vec::new();
+                let mut subjects = Vec::new();
+                for entry in &mut scanned.entries {
+                    if entry.valid_to_ms == 0 && entry.source_file.as_ref().is_some_and(|p| p == path) {
+                        entry.valid_to_ms = now;
+                        expected.push(entry.id);
+                        subjects.push(entry.subject.clone());
+                    }
+                }
+                for subject in subjects { scanned.mark_dirty(subject); }
+                assert_eq!(actual, expected);
+            }
+            match round % 4 {
+                0 => { indexed.clean_for_load(); scanned.clean_for_load(); }
+                1 => { indexed.purge_invalidated(); scanned.purge_invalidated(); }
+                2 => { indexed.dedup_entries(); scanned.dedup_entries(); }
+                _ => {
+                    indexed = bincode::deserialize(&bincode::serialize(&indexed).unwrap()).unwrap();
+                    indexed.rebuild_indexes();
+                    scanned.rebuild_indexes();
+                }
+            }
+            assert_eq!(bincode::serialize(&indexed).unwrap().len(), bincode::serialize(&scanned).unwrap().len());
+            assert_eq!(serde_json::to_value(&indexed.entries).unwrap(), serde_json::to_value(&scanned.entries).unwrap());
+        }
+    }
+
     #[test]
     fn source_paths_are_shared_and_keep_string_wire_encoding() {
         let mut store = super::TripletStore::new();
