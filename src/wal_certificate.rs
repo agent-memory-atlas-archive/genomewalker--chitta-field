@@ -187,6 +187,17 @@ mod tests {
         let path = empty.writer_path().to_path_buf();
         drop(empty);
         let mut reader = OpLog::open(dir.path(), 0x87654321, 1).unwrap();
+        // A closed foreign writer is only certifiable when strictly older than
+        // our active writer. Real filesystems may give both creates one mtime;
+        // establish the sealing fence explicitly instead of racing their clock.
+        let active_mtime = std::fs::metadata(reader.writer_path()).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(active_mtime)).unwrap();
+        assert!(!sealed_candidate(&path, reader.writer_path()));
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            active_mtime - std::time::Duration::from_secs(2),
+        )).unwrap();
+        assert!(sealed_candidate(&path, reader.writer_path()));
         let coverage = reader.replay(0, |_, _, _| panic!("empty WAL")).unwrap();
         assert_eq!(coverage.get(&0x12345678), Some(&0));
         let entry = reader.segment_inventory().into_iter()
