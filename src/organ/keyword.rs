@@ -36,6 +36,13 @@ pub struct KeywordIndex {
     total_docs: u32,
 }
 
+/// Prepared from immutable postings; publish while retaining exclusive writer ownership.
+pub(crate) struct KeywordReverseIndex {
+    doc_terms: HashMap<MemoryId, Vec<u32>>,
+    term_names: Vec<Option<std::sync::Arc<str>>>,
+    term_ids: HashMap<std::sync::Arc<str>, u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct KeywordHit {
     pub memory_id: MemoryId,
@@ -113,6 +120,13 @@ impl KeywordIndex {
                         self.free_term_ids.push(term_id);
                     }
                 }
+            } else {
+                // Snapshot bodies omit the reverse map. WAL replay and writes
+                // before maintenance publishes it must still remove old postings.
+                self.postings.retain(|_, postings| {
+                    postings.retain(|p| p.memory_id != memory_id);
+                    !postings.is_empty()
+                });
             }
         }
     }
@@ -174,21 +188,43 @@ impl KeywordIndex {
     }
 
     pub fn rebuild_reverse_index(&mut self) {
-        let mut doc_terms: HashMap<MemoryId, Vec<u32>> = HashMap::with_capacity(self.doc_lengths.len());
-        self.term_names.clear();
-        self.term_ids.clear();
-        self.free_term_ids.clear();
+        let prepared = self.prepare_reverse_index(|| false).expect("uncancelled rebuild");
+        self.publish_reverse_index(prepared);
+    }
+
+    /// Readers keep using forward postings while this cancellable preparation
+    /// runs under an upgradable read guard. The guard prevents intervening writes.
+    pub(crate) fn prepare_reverse_index(
+        &self, mut cancelled: impl FnMut() -> bool,
+    ) -> Option<KeywordReverseIndex> {
+        let mut result = KeywordReverseIndex {
+            doc_terms: HashMap::with_capacity(self.doc_lengths.len()),
+            term_names: Vec::with_capacity(self.postings.len()),
+            term_ids: HashMap::with_capacity(self.postings.len()),
+        };
         for (term, postings) in &self.postings {
-            let id = u32::try_from(self.term_names.len()).expect("keyword vocabulary exceeds u32");
+            if cancelled() { return None; }
+            let id = u32::try_from(result.term_names.len()).expect("keyword vocabulary exceeds u32");
             let name: std::sync::Arc<str> = term.as_str().into();
-            self.term_names.push(Some(name.clone()));
-            self.term_ids.insert(name, id);
-            for posting in postings {
-                doc_terms.entry(posting.memory_id).or_default().push(id);
+            result.term_names.push(Some(name.clone()));
+            result.term_ids.insert(name, id);
+            for (i, posting) in postings.iter().enumerate() {
+                if i % 1024 == 0 && cancelled() { return None; }
+                result.doc_terms.entry(posting.memory_id).or_default().push(id);
             }
         }
-        for terms in doc_terms.values_mut() { terms.shrink_to_fit(); }
-        self.doc_terms = doc_terms;
+        for terms in result.doc_terms.values_mut() {
+            if cancelled() { return None; }
+            terms.shrink_to_fit();
+        }
+        Some(result)
+    }
+
+    pub(crate) fn publish_reverse_index(&mut self, prepared: KeywordReverseIndex) {
+        self.doc_terms = prepared.doc_terms;
+        self.term_names = prepared.term_names;
+        self.term_ids = prepared.term_ids;
+        self.free_term_ids.clear();
     }
 
     pub(crate) fn allocated_bytes(&self) -> (usize, usize, usize) {
@@ -499,6 +535,49 @@ mod tests {
 #[cfg(test)]
 mod compact_reverse_tests {
     use super::*;
+
+    #[test]
+    fn mutations_before_reverse_publication_match_eager_scores() {
+        let mut original = KeywordIndex::new();
+        original.index(1, "shared alpha alpha");
+        original.index(2, "shared beta");
+        original.index(3, "shared gamma");
+        let bytes = bincode::serialize(&original).unwrap();
+        let mut delayed: KeywordIndex = bincode::deserialize(&bytes).unwrap();
+        let mut eager: KeywordIndex = bincode::deserialize(&bytes).unwrap();
+        eager.rebuild_reverse_index();
+        for index in [&mut delayed, &mut eager] {
+            index.index(1, "shared replacement");
+            index.remove(2);
+            index.index(4, "delta shared");
+        }
+        for publish in [false, true] {
+            if publish { delayed.rebuild_reverse_index(); }
+            for query in ["alpha", "beta", "gamma", "replacement", "delta"] {
+                let scores = |index: &KeywordIndex| index.search(query, 10).into_iter()
+                    .map(|hit| (hit.memory_id, hit.bm25_score.to_bits())).collect::<Vec<_>>();
+                assert_eq!(scores(&delayed), scores(&eager), "{query}, published={publish}");
+            }
+        }
+        delayed.remove(1);
+        assert!(delayed.search("replacement", 10).is_empty());
+    }
+
+    #[test]
+    fn cancelled_reverse_preparation_preserves_existing_index() {
+        let mut index = KeywordIndex::new();
+        for id in 1..=2048 { index.index(id, "shared alpha"); }
+        let mut checks = 0;
+        assert!(index.prepare_reverse_index(|| { checks += 1; checks == 3 }).is_none());
+        assert_eq!(index.doc_count(), 2048);
+        index.remove(1);
+        assert_eq!(index.search("alpha", 3000).len(), 2047);
+        assert!(!index.search("alpha", 3000).iter().any(|hit| hit.memory_id == 1));
+        let prepared = index.prepare_reverse_index(|| false).unwrap();
+        index.publish_reverse_index(prepared);
+        index.remove(2);
+        assert_eq!(index.search("alpha", 3000).len(), 2046);
+    }
 
     #[test]
     fn term_ids_preserve_wire_format_and_survive_remove_reindex_and_rebuild() {

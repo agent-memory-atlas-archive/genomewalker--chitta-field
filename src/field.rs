@@ -542,7 +542,7 @@ impl ChittaField {
         Self::open_impl(data_dir, lock, ablations, false)
     }
 
-    /// The daemon publishes the replayed store before optional Turbo warmup.
+    /// Publish replayed state before derived keyword reverse maps and Turbo warmup.
     pub(crate) fn open_for_serving(data_dir: PathBuf) -> Result<Self> {
         Self::open_impl(data_dir, true, crate::ablation::Ablations::from_env()?, true)
     }

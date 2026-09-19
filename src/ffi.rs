@@ -61,6 +61,25 @@ fn startup_work<T: Send + 'static>(
     }
 }
 
+// Keep the field on the maintenance thread: cancellation releases every guard
+// before cf_close joins it, so no detached worker can retain the instance lock.
+fn prepare_startup_keywords(field: &ChittaField, stopped: &std::sync::mpsc::Receiver<()>) -> bool {
+    let cancelled = || !matches!(stopped.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+    let tick = std::time::Duration::from_millis(25);
+    let mut guard = loop {
+        if cancelled() { return false; }
+        if let Some(guard) = field.keyword_idx.try_upgradable_read_for(tick) { break guard; }
+    };
+    let Some(prepared) = guard.prepare_reverse_index(cancelled) else { return false; };
+    loop {
+        if cancelled() { return false; }
+        match parking_lot::RwLockUpgradableReadGuard::try_upgrade_for(guard, tick) {
+            Ok(mut writer) => { writer.publish_reverse_index(prepared); return true; }
+            Err(reader) => guard = reader,
+        }
+    }
+}
+
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
@@ -175,6 +194,9 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                     .name(if wal_only { "chitta-wal" } else { "chitta-maint" }.into())
                     .spawn(move || {
                         if !wal_only {
+                            let begin = std::time::Instant::now();
+                            if !prepare_startup_keywords(&field, &stopped) { return; }
+                            eprintln!("[field] deferred phase=keyword_reverse duration_ms={}", begin.elapsed().as_millis());
                             let begin = std::time::Instant::now();
                             let snapshot = field.startup_turbo_snapshot.lock().take();
                             let cache_plan = snapshot.as_deref().and_then(|p| {
@@ -3448,6 +3470,18 @@ mod read_maintenance_tests {
 #[cfg(test)]
 mod deferred_startup_tests {
     use super::*;
+
+    #[test]
+    fn keyword_startup_stop_releases_field_before_same_process_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let field = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        stop.send(()).unwrap();
+        assert!(!prepare_startup_keywords(&field, &stopped));
+        drop(field);
+        let reopened = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        drop(reopened);
+    }
 
     #[test]
     fn stop_does_not_join_blocked_optional_work() {

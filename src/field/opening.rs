@@ -944,8 +944,10 @@ pub(super) fn warm_startup_indexes(
         // Finish this before publishing the field, so mutation/removal APIs
         // observe the same complete keyword index as the serial loader.
         let keyword = scope.spawn(|| {
-            let _phase = crate::profile::LoadPhase::new("keyword_reverse");
-            keyword_idx.rebuild_reverse_index();
+            if !deferred_turbo {
+                let _phase = crate::profile::LoadPhase::new("keyword_reverse");
+                keyword_idx.rebuild_reverse_index();
+            }
         });
         let lite = scope.spawn(|| {
             let _phase = crate::profile::LoadPhase::new("lite_encoder");

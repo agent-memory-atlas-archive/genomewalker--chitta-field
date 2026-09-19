@@ -79,6 +79,17 @@ impl<T> ProfiledRwLock<T> {
         let started = Instant::now();
         ProfiledGuard::new(self.inner.write(), &self.metrics, "write", started)
     }
+    // Startup builds under shared ownership, then upgrades only for publication.
+    // Return the native guard so timed upgrades preserve that ownership.
+    pub(crate) fn try_upgradable_read_for(&self, timeout: std::time::Duration)
+        -> Option<parking_lot::RwLockUpgradableReadGuard<'_, T>> {
+        let started = Instant::now();
+        let guard = self.inner.try_upgradable_read_for(timeout);
+        self.metrics.record(if guard.is_some() { "upgradable_read" } else { "read_timeout" },
+            started.elapsed().as_micros() as u64, 0);
+        guard
+    }
+
     pub(crate) fn try_read_for(&self, timeout: std::time::Duration)
         -> Option<ProfiledGuard<'_, parking_lot::RwLockReadGuard<'_, T>>> {
         let started = Instant::now();
