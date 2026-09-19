@@ -448,6 +448,7 @@ impl OpLog {
         let seg_dir = self.data_dir.join("segments");
         let segments = collect_all_segments(&seg_dir)?;
         self.replay_inventory.clear();
+        let mut profile = crate::profile::ReplayLoopProfile::new();
         // Conservative ordering rule: skip a writer only when ALL its segments
         // are certified. Otherwise decode its prefix too, retaining timestamp
         // carry-forward and chain continuity for the uncovered tail.
@@ -526,7 +527,7 @@ impl OpLog {
                 .unwrap_or(0);
             coverage.entry(inst_id).or_insert(0);
             let mut certificate = None;
-            chain_head = replay_segment_inventoried(seg_path, 0, chain_head, &mut certificate, &mut |seqno, op| {
+            chain_head = replay_segment_inventoried(seg_path, 0, chain_head, &mut certificate, &mut profile, &mut |seqno, op| {
                 // Carry-forward effective timestamp: monotone per writer.
                 let prev = last_ts.get(&inst_id).copied().unwrap_or(0);
                 let eff = crate::ops::op_timestamp(&op).unwrap_or(prev).max(prev);
@@ -550,7 +551,10 @@ impl OpLog {
         // Apply in merge order.
         buf.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
         for (_, inst, seqno, op) in buf {
+            let started = profile.start();
+            let kind = profile.kind(&op);
             f(inst, seqno, op)?;
+            if let Some(started) = started { profile.applied(kind, started.elapsed().as_nanos()); }
         }
         Ok(coverage)
     }
@@ -921,7 +925,7 @@ fn replay_segment_chained<F>(
 where
     F: FnMut(u64, Op) -> Result<()>,
 {
-    replay_segment_inventoried(path, start_seqno, chain_head, &mut None, f)
+    replay_segment_inventoried(path, start_seqno, chain_head, &mut None, &mut crate::profile::ReplayLoopProfile::new(), f)
 }
 
 fn replay_segment_inventoried<F>(
@@ -929,6 +933,7 @@ fn replay_segment_inventoried<F>(
     start_seqno: u64,
     mut chain_head: ChainHash,
     certificate: &mut Option<crate::manifest::SegmentInfo>,
+    profile: &mut crate::profile::ReplayLoopProfile,
     f: &mut F,
 ) -> Result<ChainHash>
 where
@@ -987,6 +992,7 @@ where
     let mut decoded_end = file.stream_position()?;
     let header_first = u64::from_be_bytes(_first_seqno_buf);
     loop {
+        let record_started = profile.start();
         // Offset of this record's start — the truncation point if the record
         // turns out to be torn. An EOF mid-record can only be the file tail,
         // so every read_exact failure below is a torn-tail condition.
@@ -1042,6 +1048,7 @@ where
         }
         let stored_crc = u32::from_be_bytes(crc_buf);
 
+        let verify_started = profile.start();
         // CRC verification (V2/V3 include prev_hash in CRC)
         let mut hasher = CrcHasher::new();
         hasher.update(&seqno_buf);
@@ -1083,10 +1090,12 @@ where
             chain_head = compute_record_hash(seqno, op_type, &prev_hash, &payload);
         }
 
+        let verify_ns = verify_started.map_or(0, |t| t.elapsed().as_nanos());
         if seqno < start_seqno {
             continue;
         }
 
+        let decode_started = profile.start();
         let op: Op = rmp_serde::from_slice(&payload).map_err(|e| FieldError::CorruptLog {
             seqno,
             reason: format!("msgpack decode failed: {}", e),
@@ -1103,11 +1112,16 @@ where
             });
         }
 
+        let decode_ns = decode_started.map_or(0, |t| t.elapsed().as_nanos());
+        let kind = profile.kind(&op);
         ordered &= last.map(|previous| seqno > previous).unwrap_or(true);
         first.get_or_insert(seqno);
         last = Some(seqno);
         f(seqno, op)?;
         decoded_end = file.stream_position()?;
+        if let Some(started) = record_started {
+            profile.record(kind, started.elapsed().as_nanos(), decode_ns, verify_ns);
+        }
     }
     if start_seqno == 0 && ordered && first.is_none_or(|seq| seq >= header_first) && decoded_end == file_len {
         if let (Some(last_seqno), Ok(after)) = (last.or_else(|| header_first.checked_sub(1)), std::fs::metadata(path)) {

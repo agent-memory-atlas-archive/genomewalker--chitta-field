@@ -1952,6 +1952,7 @@ impl SemanticIndex {
     /// replay delta needs a norm reduction and LSH projection. The raw snapshot
     /// digest is captured while loading .emb, never from post-replay vectors.
     pub(crate) fn normalize_with_cache(&mut self, path: Option<&std::path::Path>) {
+        let mut phase = crate::profile::SnapshotPhase::new("normalize_cache");
         self.mutations += 1;
         self.invalidate_turbo();
         let key = self.startup_key.filter(|_| self.emb_mmap.is_none());
@@ -1968,6 +1969,8 @@ impl SemanticIndex {
             divisors = refresh_pool().install(|| self.embeddings.par_iter()
                 .map(|(&id, v)| (id, l2_norm(v))).collect());
         }
+        drop(phase);
+        phase = crate::profile::SnapshotPhase::new("normalize_vectors");
         let changed = &self.turbo_changed;
         refresh_pool().install(|| self.embeddings.par_iter_mut().for_each(|(id, embedding)| {
             let norm = cached.as_ref().filter(|_| !changed.contains_key(id))
@@ -1976,6 +1979,8 @@ impl SemanticIndex {
                 for x in embedding { *x /= norm; }
             }
         }));
+        drop(phase);
+        phase = crate::profile::SnapshotPhase::new("normalize_signatures");
         if self.lsh_planes.is_empty() { self.lsh_planes = default_lsh_planes(); }
         // Upsert's signatures precede the loader's final normalization. Recompute
         // delta signatures after it, even if the old count happens to match.
@@ -1986,6 +1991,8 @@ impl SemanticIndex {
                     .unwrap_or_else(|| self.assign_lsh(v));
                 (id, sigs)
             })).collect());
+        drop(phase);
+        phase = crate::profile::SnapshotPhase::new("normalize_binary");
         if self.binary_codes.len() != self.total_embedding_count() {
             // Centered binary codes when a centroid is loaded (.mu sidecar); raw otherwise.
             let centroid = self.centroid.clone();
@@ -2015,6 +2022,8 @@ impl SemanticIndex {
         }
         // Coarse, LSH, and HNSW are all snapshot-serialized (or sidecar) and kept in sync
         // by incremental upsert/remove during WAL replay — skip O(N) rebuilds when consistent.
+        drop(phase);
+        phase = crate::profile::SnapshotPhase::new("normalize_ann");
         let total = self.total_embedding_count();
         let coarse_ok = self.mem_coarse.len() == total;
         let lsh_ok    = self.mem_lsh.len()    == total;
@@ -2041,6 +2050,8 @@ impl SemanticIndex {
                 // binary_covers && hnsw.is_empty(): binary Hamming is the active path, skip rebuild.
             }
         }
+        drop(phase);
+        phase = crate::profile::SnapshotPhase::new("normalize_trim_save");
         self.trim_deleted();
         if can_save {
             if let Some((p, k)) = path.zip(key.as_ref()) {
@@ -2051,6 +2062,7 @@ impl SemanticIndex {
                 }
             }
         }
+        drop(phase);
         if path.is_some() { eprintln!("[chitta-field] LSH cache hit={cache_hit}"); }
     }
 

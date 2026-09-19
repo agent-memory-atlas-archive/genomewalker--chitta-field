@@ -263,7 +263,36 @@ impl ReplayApplyProfile {
     }
     pub(crate) fn begin(&mut self, op: &crate::ops::Op) -> Option<ReplayApplyTimer<'_>> {
         self.kinds.as_ref()?;
-        let kind = match op {
+        let kind = replay_kind(op);
+        self.named(kind)
+    }
+    pub(crate) fn named(&mut self, kind: &'static str) -> Option<ReplayApplyTimer<'_>> {
+        let totals = self.kinds.as_mut()?.entry(kind).or_default();
+        Some(ReplayApplyTimer { totals, started: Instant::now() })
+    }
+}
+pub(crate) struct ReplayApplyTimer<'a> {
+    totals: &'a mut (u64, u128),
+    started: Instant,
+}
+impl Drop for ReplayApplyTimer<'_> {
+    fn drop(&mut self) {
+        self.totals.0 += 1;
+        self.totals.1 += self.started.elapsed().as_nanos();
+    }
+}
+impl Drop for ReplayApplyProfile {
+    fn drop(&mut self) {
+        if let Some(kinds) = &self.kinds {
+            for (kind, (records, apply_ns)) in kinds {
+                eprintln!("[chitta-field] replay_apply kind={} records={} apply_ns={}", kind, records, apply_ns);
+            }
+        }
+    }
+}
+
+fn replay_kind(op: &crate::ops::Op) -> &'static str {
+    match op {
             crate::ops::Op::PutPayload(..) => "PutPayload",
             crate::ops::Op::UpdateState(..) => "UpdateState",
             crate::ops::Op::UpdateStateBatch(..) => "UpdateStateBatch",
@@ -335,29 +364,39 @@ impl ReplayApplyProfile {
             crate::ops::Op::SymbolEvent(..) => "SymbolEvent",
             crate::ops::Op::SupersedeTriplet(..) => "SupersedeTriplet",
             crate::ops::Op::RecordOutcome(..) => "RecordOutcome",
-        };
-        self.named(kind)
+        }
+}
+
+/// Full reader/merge costs, including covered records (unlike replay_apply).
+#[derive(Default)]
+struct ReplayCosts { records: u64, decode_ns: u128, verify_ns: u128, apply_ns: u128, other_ns: u128 }
+pub(crate) struct ReplayLoopProfile {
+    kinds: Option<std::collections::BTreeMap<&'static str, ReplayCosts>>,
+}
+impl ReplayLoopProfile {
+    pub(crate) fn new() -> Self {
+        Self { kinds: (std::env::var("CHITTA_PROFILE_REPLAY").as_deref() == Ok("1"))
+            .then(std::collections::BTreeMap::new) }
     }
-    pub(crate) fn named(&mut self, kind: &'static str) -> Option<ReplayApplyTimer<'_>> {
-        let totals = self.kinds.as_mut()?.entry(kind).or_default();
-        Some(ReplayApplyTimer { totals, started: Instant::now() })
+    pub(crate) fn start(&self) -> Option<Instant> { self.kinds.as_ref().map(|_| Instant::now()) }
+    pub(crate) fn kind(&self, op: &crate::ops::Op) -> &'static str { replay_kind(op) }
+    pub(crate) fn record(&mut self, kind: &'static str, total: u128, decode: u128, verify: u128) {
+        if let Some(kinds) = self.kinds.as_mut() {
+            let row = kinds.entry(kind).or_default();
+            row.records += 1; row.decode_ns += decode; row.verify_ns += verify;
+            row.other_ns += total.saturating_sub(decode + verify);
+        }
+    }
+    pub(crate) fn applied(&mut self, kind: &'static str, ns: u128) {
+        if let Some(kinds) = self.kinds.as_mut() { kinds.entry(kind).or_default().apply_ns += ns; }
     }
 }
-pub(crate) struct ReplayApplyTimer<'a> {
-    totals: &'a mut (u64, u128),
-    started: Instant,
-}
-impl Drop for ReplayApplyTimer<'_> {
-    fn drop(&mut self) {
-        self.totals.0 += 1;
-        self.totals.1 += self.started.elapsed().as_nanos();
-    }
-}
-impl Drop for ReplayApplyProfile {
+impl Drop for ReplayLoopProfile {
     fn drop(&mut self) {
         if let Some(kinds) = &self.kinds {
-            for (kind, (records, apply_ns)) in kinds {
-                eprintln!("[chitta-field] replay_apply kind={} records={} apply_ns={}", kind, records, apply_ns);
+            for (kind, r) in kinds {
+                eprintln!("[chitta-field] replay_loop kind={} records={} decode_ns={} verify_ns={} apply_ns={} other_ns={}",
+                    kind, r.records, r.decode_ns, r.verify_ns, r.apply_ns, r.other_ns);
             }
         }
     }
