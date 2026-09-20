@@ -839,6 +839,9 @@ impl ChittaField {
             crate::replication::rebuild(&payloads, &triplet_store, &mut states);
         }
         let anchors = crate::anchors::AnchorIndex::rebuild(&payloads);
+        // Armed before the struct exists, so no request can reach search in the
+        // window where Turbo is owed but nothing says so.
+        if deferred_turbo { semantic_idx.arm_turbo_pending(); }
         Ok(Self {
             startup_turbo_snapshot: Mutex::new(if deferred_turbo { best_full_path.clone() } else { None }),
             ablations: ablations.clone(),
