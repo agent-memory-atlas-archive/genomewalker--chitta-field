@@ -1952,7 +1952,7 @@ impl SemanticIndex {
     /// replay delta needs a norm reduction and LSH projection. The raw snapshot
     /// digest is captured while loading .emb, never from post-replay vectors.
     pub(crate) fn normalize_with_cache(&mut self, path: Option<&std::path::Path>) {
-        let mut phase = crate::profile::SnapshotPhase::new("normalize_cache");
+        let mut phase = crate::profile::SnapshotPhase::always("normalize_cache");
         self.mutations += 1;
         self.invalidate_turbo();
         let key = self.startup_key.filter(|_| self.emb_mmap.is_none());
@@ -1970,7 +1970,7 @@ impl SemanticIndex {
                 .map(|(&id, v)| (id, l2_norm(v))).collect());
         }
         drop(phase);
-        phase = crate::profile::SnapshotPhase::new("normalize_vectors");
+        phase = crate::profile::SnapshotPhase::always("normalize_vectors");
         let changed = &self.turbo_changed;
         refresh_pool().install(|| self.embeddings.par_iter_mut().for_each(|(id, embedding)| {
             let norm = cached.as_ref().filter(|_| !changed.contains_key(id))
@@ -1980,7 +1980,7 @@ impl SemanticIndex {
             }
         }));
         drop(phase);
-        phase = crate::profile::SnapshotPhase::new("normalize_signatures");
+        phase = crate::profile::SnapshotPhase::always("normalize_signatures");
         if self.lsh_planes.is_empty() { self.lsh_planes = default_lsh_planes(); }
         // Upsert's signatures precede the loader's final normalization. Recompute
         // delta signatures after it, even if the old count happens to match.
@@ -1992,7 +1992,7 @@ impl SemanticIndex {
                 (id, sigs)
             })).collect());
         drop(phase);
-        phase = crate::profile::SnapshotPhase::new("normalize_binary");
+        phase = crate::profile::SnapshotPhase::always("normalize_binary");
         if self.binary_codes.len() != self.total_embedding_count() {
             // Centered binary codes when a centroid is loaded (.mu sidecar); raw otherwise.
             let centroid = self.centroid.clone();
@@ -2023,11 +2023,17 @@ impl SemanticIndex {
         // Coarse, LSH, and HNSW are all snapshot-serialized (or sidecar) and kept in sync
         // by incremental upsert/remove during WAL replay — skip O(N) rebuilds when consistent.
         drop(phase);
-        phase = crate::profile::SnapshotPhase::new("normalize_ann");
+        phase = crate::profile::SnapshotPhase::always("normalize_ann");
         let total = self.total_embedding_count();
         let coarse_ok = self.mem_coarse.len() == total;
         let lsh_ok    = self.mem_lsh.len()    == total;
         let hnsw_ok   = self.hnsw_len() > 0 && self.hnsw_len() == total;
+        // The branch taken here is the whole cost of this phase, and nothing
+        // downstream prints it: rebuild_ann and rebuild_lsh are silent, while
+        // the HNSW paths announce themselves.
+        // A `coarse_ok=false` line is the signature of the full rebuild.
+        eprintln!("[hnsw] normalize_ann: total={total} coarse_ok={coarse_ok} mem_coarse={} lsh_ok={lsh_ok} mem_lsh={} hnsw_ok={hnsw_ok} hnsw_len={}",
+                  self.mem_coarse.len(), self.mem_lsh.len(), self.hnsw_len());
         if !coarse_ok {
             self.rebuild_ann();
         } else {
@@ -2051,7 +2057,7 @@ impl SemanticIndex {
             }
         }
         drop(phase);
-        phase = crate::profile::SnapshotPhase::new("normalize_trim_save");
+        phase = crate::profile::SnapshotPhase::always("normalize_trim_save");
         self.trim_deleted();
         if can_save {
             if let Some((p, k)) = path.zip(key.as_ref()) {
@@ -2219,11 +2225,12 @@ impl SemanticIndex {
     fn rebuild_lsh(&mut self) {
         self.lsh_buckets = vec![HashMap::new(); LSH_TABLES];
         self.mem_lsh.clear();
-        let assignments: Vec<(MemoryId, Vec<u16>)> = self
+        let mut assignments: Vec<(MemoryId, Vec<u16>)> = refresh_pool().install(|| self
             .embeddings
-            .iter()
+            .par_iter()
             .map(|(&id, emb)| (id, self.assign_lsh(emb)))
-            .collect();
+            .collect());
+        assignments.sort_unstable_by_key(|(id, _)| *id);
         for (id, sigs) in assignments {
             for (t, sig) in sigs.iter().enumerate() {
                 self.lsh_buckets[t].entry(*sig).or_default().push(id);
@@ -2683,11 +2690,18 @@ impl SemanticIndex {
         self.mem_coarse.clear();
         self.lsh_buckets = vec![HashMap::new(); LSH_TABLES];
         self.mem_lsh.clear();
-        let assignments: Vec<(MemoryId, Vec<u16>)> = self
+        // Parallel and id-ordered. Serial, this pass is one dot product against
+        // each of COARSE_CENTROIDS centroids per embedding, EMBED_DIM wide: at
+        // the 2026-09-20 corpus size that is tens of seconds, and it is the
+        // `load phase=normalize ms=41017` of that day. Sorting by id costs
+        // milliseconds and makes the bucket contents reproducible, which is
+        // what `rebuild_ann_matches_the_serial_pass` compares.
+        let mut assignments: Vec<(MemoryId, Vec<u16>)> = refresh_pool().install(|| self
             .embeddings
-            .iter()
+            .par_iter()
             .map(|(&memory_id, embedding)| (memory_id, self.assign_coarse(embedding)))
-            .collect();
+            .collect());
+        assignments.sort_unstable_by_key(|(id, _)| *id);
         for (memory_id, coarse_ids) in assignments {
             for coarse_id in &coarse_ids {
                 self.coarse_members
@@ -2697,11 +2711,12 @@ impl SemanticIndex {
             }
             self.mem_coarse.insert(memory_id, coarse_ids);
         }
-        let lsh_assignments: Vec<(MemoryId, Vec<u16>)> = self
+        let mut lsh_assignments: Vec<(MemoryId, Vec<u16>)> = refresh_pool().install(|| self
             .embeddings
-            .iter()
+            .par_iter()
             .map(|(&memory_id, embedding)| (memory_id, self.assign_lsh(embedding)))
-            .collect();
+            .collect());
+        lsh_assignments.sort_unstable_by_key(|(id, _)| *id);
         for (memory_id, signatures) in lsh_assignments {
             for (table_idx, signature) in signatures.iter().enumerate() {
                 self.lsh_buckets[table_idx]
@@ -3650,5 +3665,74 @@ mod startup_cache_tests {
         assert_ne!(first.startup_key, changed.startup_key);
         changed.warm_turbo_with_cache(Some(&path));
         assert!(changed.turbo.read().is_some());
+    }
+
+    /// `rebuild_ann` is the branch `normalize_ann` takes when the snapshot's
+    /// `mem_coarse` does not cover every loaded embedding, which is what a
+    /// fallback to an older family after a killed save produces. It was the
+    /// only silent, fully serial O(N x COARSE_CENTROIDS x EMBED_DIM) pass on
+    /// the open path. Parallelising it must not change a single assignment or
+    /// posting, so this recomputes both inverses from the public assign
+    /// functions and demands exact equality, including the id order inside
+    /// each bucket that the sort now guarantees.
+    #[test]
+    fn rebuild_ann_matches_the_assignments_it_indexes() {
+        let mut idx = raw_index(400);
+        idx.normalize_all();
+        idx.mem_coarse.clear();
+        idx.rebuild_ann();
+
+        let mut ids: Vec<MemoryId> = idx.embeddings.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(idx.mem_coarse.len(), ids.len());
+        assert_eq!(idx.mem_lsh.len(), ids.len());
+
+        let mut coarse_members: HashMap<u16, Vec<MemoryId>> = HashMap::new();
+        let mut lsh_buckets: Vec<HashMap<u16, Vec<MemoryId>>> = vec![HashMap::new(); LSH_TABLES];
+        for &id in &ids {
+            let embedding = idx.embeddings[&id].clone();
+            let coarse = idx.assign_coarse(&embedding);
+            assert_eq!(idx.mem_coarse[&id], coarse, "coarse assignment for {id}");
+            for c in &coarse { coarse_members.entry(*c).or_default().push(id); }
+            let sigs = idx.assign_lsh(&embedding);
+            assert_eq!(idx.mem_lsh[&id], sigs, "lsh signature for {id}");
+            for (t, sig) in sigs.iter().enumerate() {
+                lsh_buckets[t].entry(*sig).or_default().push(id);
+            }
+        }
+        assert_eq!(idx.coarse_members, coarse_members,
+            "coarse postings must be the id-ordered inverse of the assignments");
+        assert_eq!(idx.lsh_buckets, lsh_buckets,
+            "lsh postings must be the id-ordered inverse of the signatures");
+    }
+
+    #[test]
+    #[ignore = "measurement, not a gate: run with --release --ignored --nocapture"]
+    fn measure_rebuild_ann_cost() {
+        let n: u64 = std::env::var("MEASURE_N").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(141_476);
+        let mut idx = raw_index(n);
+        idx.normalize_all();
+        let ids: Vec<MemoryId> = idx.embeddings.keys().copied().collect();
+
+        let t = std::time::Instant::now();
+        let serial_coarse: Vec<(MemoryId, Vec<u16>)> = ids.iter()
+            .map(|&id| (id, idx.assign_coarse(&idx.embeddings[&id]))).collect();
+        let coarse_serial_ms = t.elapsed().as_millis();
+        let t = std::time::Instant::now();
+        let serial_lsh: Vec<(MemoryId, Vec<u16>)> = ids.iter()
+            .map(|&id| (id, idx.assign_lsh(&idx.embeddings[&id]))).collect();
+        let lsh_serial_ms = t.elapsed().as_millis();
+
+        idx.mem_coarse.clear();
+        let t = std::time::Instant::now();
+        idx.rebuild_ann();
+        let rebuild_ann_ms = t.elapsed().as_millis();
+
+        eprintln!("MEASURE n={n} dim={EMBED_DIM} centroids={COARSE_CENTROIDS} lsh_planes={} coarse_serial_ms={coarse_serial_ms} lsh_serial_ms={lsh_serial_ms} serial_total_ms={} rebuild_ann_parallel_ms={rebuild_ann_ms} threads={}",
+            LSH_TABLES * LSH_BITS, coarse_serial_ms + lsh_serial_ms,
+            refresh_pool().current_num_threads());
+        assert_eq!(serial_coarse.len(), ids.len());
+        assert_eq!(serial_lsh.len(), ids.len());
     }
 }

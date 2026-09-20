@@ -3559,3 +3559,21 @@ pub unsafe extern "C" fn cf_triplets_ready(handle: *mut CfHandle) -> bool {
     let Some(handle) = handle.as_ref() else { return false; };
     handle.field.triplet_store.is_ready()
 }
+
+/// Whether a full snapshot save is in flight: sections, sidecars, manifest
+/// commit and prune. SIGTERM inside that window abandons the family being
+/// written, so a restart must wait for this to go false rather than grep the
+/// log, which cannot be read without a race.
+#[no_mangle]
+pub unsafe extern "C" fn cf_snapshot_in_flight(handle: *mut CfHandle) -> bool {
+    let Some(handle) = handle.as_ref() else { return false; };
+    handle.field.snapshot_in_flight()
+}
+
+/// Wall clock of this process's last manifest commit, 0 if it has committed
+/// none. Distinguishes "idle since the last save" from "idle, never saved".
+#[no_mangle]
+pub unsafe extern "C" fn cf_last_snapshot_commit_ms(handle: *mut CfHandle) -> i64 {
+    let Some(handle) = handle.as_ref() else { return 0; };
+    handle.field.last_snapshot_commit_ms()
+}

@@ -253,6 +253,12 @@ impl<'a> SnapshotPhase<'a> {
     pub(crate) fn new(name: &'a str) -> Self {
         Self(name, std::env::var_os("CHITTA_PROFILE_SNAPSHOT").is_some().then(Instant::now))
     }
+    /// Time this phase whether or not CHITTA_PROFILE_SNAPSHOT is set. For the
+    /// handful of phases that must be readable from a production log: on
+    /// 2026-09-20 `load phase=normalize ms=41017` had no breakdown under it,
+    /// because every sub-timer in normalize_with_cache was opt-in and the
+    /// daemon does not set that variable.
+    pub(crate) fn always(name: &'a str) -> Self { Self(name, Some(Instant::now())) }
 }
 impl Drop for SnapshotPhase<'_> {
     fn drop(&mut self) {

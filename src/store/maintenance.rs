@@ -2,6 +2,23 @@
 
 use super::*;
 
+/// Raises `snapshot_in_flight` for as long as it lives. A guard rather than a
+/// pair of stores because the save has a dozen `?` exits, and a flag left high
+/// by one of them would make `scripts/restart-chittad.sh` wait out its whole
+/// timeout on a store that is doing nothing.
+struct SaveInFlight<'a>(&'a ChittaField);
+impl<'a> SaveInFlight<'a> {
+    fn raise(field: &'a ChittaField) -> Self {
+        field.snapshot_in_flight.store(true, std::sync::atomic::Ordering::Release);
+        Self(field)
+    }
+}
+impl Drop for SaveInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.snapshot_in_flight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl ChittaField {
 
     /// Invalidate a triplet (marks it as expired at the current time).
@@ -1000,9 +1017,25 @@ impl ChittaField {
         self.save_full_snapshot_certified().map(|_| ())
     }
 
+    /// Whether a full snapshot save is between its first section write and its
+    /// prune. A restart inside that window costs the family being written.
+    pub fn snapshot_in_flight(&self) -> bool {
+        self.snapshot_in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wall clock of this process's last manifest commit, 0 if it has not
+    /// committed one.
+    pub fn last_snapshot_commit_ms(&self) -> i64 {
+        self.last_snapshot_commit_ms.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn save_full_snapshot_certified(&self) -> Result<usize> {
         let mut pruned = 0;
         use crate::snapshot::FullSnapshot;
+        // Raised for the whole save and lowered on every exit, the `?` returns
+        // included, so a reader of `snapshot_in_flight` never sees it stuck
+        // high after a failed save. Exposed through cf_snapshot_in_flight.
+        let _in_flight = SaveInFlight::raise(self);
         let _touch_drain = self.touch_drain.lock();
         self.drain_pending_touches_locked()?;
         self.drain_pending_recall_effects()?;
@@ -1397,6 +1430,10 @@ impl ChittaField {
                     .insert(format!("{:08x}", self.instance_id), family.clone());
                 manifest.checkpoints = Some(family);
                 manifest.save(&self.data_dir)?;
+                // The commit instant, not the end of the save: pruning below is
+                // recovery-safe work after the family is durable.
+                self.last_snapshot_commit_ms
+                    .store(now_ms(), std::sync::atomic::Ordering::Release);
                 self.log.write().mark_checkpoint(checkpoint_position);
                 pruned = self.prune_certified_wal()?;
             }
@@ -1849,3 +1886,49 @@ impl ChittaField {
     }
 
 }
+
+#[cfg(test)]
+mod save_in_flight_tests {
+    use super::*;
+
+    /// The guard is the whole mechanism: `save_full_snapshot_certified` has a
+    /// dozen `?` exits, and a flag left raised by one of them would make
+    /// `scripts/restart-chittad.sh` wait out its entire timeout against a store
+    /// that is doing nothing. Fails if the guard is ever replaced by a pair of
+    /// stores around the happy path.
+    #[test]
+    fn the_guard_lowers_the_flag_on_every_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let field = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        assert!(!field.snapshot_in_flight());
+        {
+            let _raised = SaveInFlight::raise(&field);
+            assert!(field.snapshot_in_flight(), "raised for the duration of the save");
+        }
+        assert!(!field.snapshot_in_flight(), "lowered when the guard leaves scope");
+
+        // The early-return shape: a closure that raises and then fails.
+        let failed: Result<()> = (|| {
+            let _raised = SaveInFlight::raise(&field);
+            Err(FieldError::Other("save failed".into()))
+        })();
+        assert!(failed.is_err());
+        assert!(!field.snapshot_in_flight(), "a failed save must not leave it raised");
+    }
+
+    /// `last_snapshot_commit_ms` is stamped at the manifest commit, so a caller
+    /// can tell "idle since the last save" from "idle, never saved".
+    #[test]
+    fn a_committed_save_stamps_the_commit_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let field = ChittaField::open(dir.path().to_path_buf()).unwrap();
+        assert_eq!(field.last_snapshot_commit_ms(), 0, "nothing committed yet");
+        let before = now_ms();
+        field.save_full_snapshot().unwrap();
+        let stamped = field.last_snapshot_commit_ms();
+        assert!(stamped >= before, "commit clock {stamped} predates the save start {before}");
+        assert!(stamped <= now_ms());
+        assert!(!field.snapshot_in_flight(), "the save has returned");
+    }
+}
+

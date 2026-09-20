@@ -40,6 +40,12 @@ bool cf_startup_indexes_ready(CfHandle *handle);
    hybrid triplet lanes and spreading activation must answer loading until this
    returns true. */
 bool cf_triplets_ready(CfHandle *handle);
+/* True from the first section write of a full snapshot save through its prune.
+   Restarting inside that window abandons the family being written, costing a
+   fallback to the previous family and a full replay of the WAL since it. */
+bool cf_snapshot_in_flight(CfHandle *handle);
+/* Wall clock of this process's last manifest commit, 0 if it made none. */
+int64_t cf_last_snapshot_commit_ms(CfHandle *handle);
 
 void      cf_close(CfHandle* h);
 const char* cf_last_error(const CfHandle* h);

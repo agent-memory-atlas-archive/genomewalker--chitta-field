@@ -346,6 +346,17 @@ pub struct ChittaField {
     /// maintenance thread clears it once the counts are recomputed, and
     /// `cf_startup_indexes_ready` stays closed until then.
     pub(crate) triplet_replication_pending: std::sync::atomic::AtomicBool,
+    /// Set for the whole of `save_full_snapshot_certified`: sections, sidecars,
+    /// manifest commit and prune. SIGTERM inside that window abandons the family
+    /// being written, so the next start logs `manifest family … failed
+    /// validation`, falls back to the previous family and replays the WAL since
+    /// then (2026-09-20: 66 minutes of tail, 41 s of it in normalize alone).
+    /// `scripts/restart-chittad.sh` waits on this instead of grepping the log,
+    /// which cannot be read without a race.
+    pub(crate) snapshot_in_flight: std::sync::atomic::AtomicBool,
+    /// Wall clock of the last manifest commit this process made, 0 if none.
+    /// Lets a caller distinguish "idle, just finished" from "idle, never saved".
+    pub(crate) last_snapshot_commit_ms: std::sync::atomic::AtomicI64,
     pub(crate) triplet_id_alloc: Arc<TripletIdAllocator>,
     pub(crate) symbol_idx: crate::ablation::StartupValue<RwLock<SymbolIndex>>,
     pub(crate) call_graph: RwLock<CallGraph>,
@@ -867,6 +878,8 @@ impl ChittaField {
                 else { crate::ablation::StartupValue::ready(load()) }
             },
             triplet_replication_pending: std::sync::atomic::AtomicBool::new(defer_triplets),
+            snapshot_in_flight: std::sync::atomic::AtomicBool::new(false),
+            last_snapshot_commit_ms: std::sync::atomic::AtomicI64::new(0),
             triplet_id_alloc,
             symbol_idx: if deferred_turbo {
                 crate::ablation::StartupValue::deferred(move || {
