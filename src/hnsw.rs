@@ -644,6 +644,13 @@ pub struct SemanticIndex {
     /// Readers clone the current index under a brief read guard; builds run off-lock.
     #[serde(skip, default)]
     turbo: Arc<RwLock<Option<Arc<TurboState>>>>,
+    /// Armed at open when the Turbo load is deferred, cleared the moment it
+    /// publishes. Without it a search landing in the window between `ready` and
+    /// publication took the scalar arm below and scanned every vector: 14 s on
+    /// 141,613 vectors with three concurrent callers, against ~1 s for the
+    /// Turbo load itself.
+    #[serde(skip, default)]
+    turbo_pending: Arc<TurboPending>,
     /// Embeddings changed after the published build are scored directly.
     #[serde(skip, default)]
     turbo_changed: HashMap<MemoryId, u64>,
@@ -653,6 +660,47 @@ pub struct SemanticIndex {
     #[serde(skip)]
     startup_key: Option<[u8; 32]>,
 
+}
+
+/// Milliseconds a search will wait for a deferred Turbo index before falling
+/// back to the scalar scan. 0 disables waiting entirely.
+pub(crate) fn turbo_wait_ms() -> u64 {
+    static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| std::env::var("CHITTA_TURBO_WAIT_MS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(5_000))
+}
+
+/// One-shot "the Turbo index is on its way" signal. Readers park on it instead
+/// of doing the work the pending job is about to make unnecessary.
+#[derive(Default)]
+pub(crate) struct TurboPending {
+    armed: std::sync::atomic::AtomicBool,
+    /// Budget for this arming, so the bound is fixed when the job is scheduled
+    /// rather than re-read by every waiter.
+    budget_ms: std::sync::atomic::AtomicU64,
+    lock: parking_lot::Mutex<()>,
+    ready: parking_lot::Condvar,
+}
+
+impl TurboPending {
+    fn arm(&self, budget_ms: u64) {
+        self.budget_ms.store(budget_ms, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+    }
+    /// Idempotent, and called from a guard's Drop so a cancelled or failed
+    /// startup releases waiters rather than making them serve out the budget.
+    fn clear(&self) {
+        let _lock = self.lock.lock();
+        self.armed.store(false, Ordering::Release);
+        self.ready.notify_all();
+    }
+    fn armed(&self) -> bool { self.armed.load(Ordering::Acquire) }
+}
+
+/// Clears the pending signal when dropped, however the startup job ended.
+pub(crate) struct TurboPendingGuard(Arc<TurboPending>);
+impl Drop for TurboPendingGuard {
+    fn drop(&mut self) { self.0.clear(); }
 }
 
 impl SemanticIndex {
@@ -699,6 +747,7 @@ impl SemanticIndex {
             emb_mmap: None,
             emb_offsets: HashMap::new(),
             turbo: Arc::new(RwLock::new(None)),
+            turbo_pending: Arc::new(TurboPending::default()),
             turbo_changed: HashMap::new(),
             turbo_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             startup_key: None,
@@ -1275,6 +1324,44 @@ impl SemanticIndex {
         *guard = None;
     }
 
+    /// Arm the pending signal at open, before any request can reach search.
+    pub(crate) fn arm_turbo_pending(&self) { self.arm_turbo_pending_for(turbo_wait_ms()); }
+
+    /// Arm with an explicit budget. Startup uses `CHITTA_TURBO_WAIT_MS`.
+    pub(crate) fn arm_turbo_pending_for(&self, budget_ms: u64) { self.turbo_pending.arm(budget_ms); }
+
+    /// Hand the signal to the startup job, which clears it on publication.
+    pub(crate) fn turbo_pending_guard(&self) -> TurboPendingGuard {
+        TurboPendingGuard(self.turbo_pending.clone())
+    }
+
+    /// Park until the deferred Turbo index publishes, or the budget expires.
+    /// Returns whatever is published at that point, which may still be None.
+    ///
+    /// The caller's `semantic_idx` read guard is held across this wait, exactly
+    /// as it is held across the scalar scan this replaces — and for less time,
+    /// since the budget is below the scan's cost at this corpus size. Nothing
+    /// on the publication path needs that lock: `TurboCacheLoad::load` and
+    /// `TurboBuild::build` write only the inner `turbo` slot, and
+    /// `prune_turbo_changes`, which does need it, runs after the signal clears.
+    fn wait_for_turbo(&self) -> Option<Arc<TurboState>> {
+        if !self.turbo_pending.armed() { return None; }
+        let budget = self.turbo_pending.budget_ms.load(Ordering::Acquire);
+        if budget == 0 { return None; }
+        let began = std::time::Instant::now();
+        let deadline = began + std::time::Duration::from_millis(budget);
+        {
+            let mut lock = self.turbo_pending.lock.lock();
+            while self.turbo_pending.armed() {
+                if self.turbo_pending.ready.wait_until(&mut lock, deadline).timed_out() { break; }
+            }
+        }
+        let published = self.turbo.read().clone();
+        eprintln!("[hnsw] search waited_ms={} for turbo published={}",
+            began.elapsed().as_millis(), published.is_some());
+        published
+    }
+
     pub(crate) fn prune_turbo_changes(&mut self) {
         let watermark = self.turbo.read().as_ref().map(|t| t.built_at_mutation);
         if let Some(watermark) = watermark {
@@ -1658,7 +1745,15 @@ impl SemanticIndex {
             // post-hoc filtering still yields up to k survivors.
             if !center {
                 if let Some(q) = normalize(query) {
-                    let guard = self.turbo.read().clone();
+                    // A miss here used to mean the scalar scan below. When the
+                    // deferred startup load is still in flight, waiting for it
+                    // is cheaper than scanning the whole corpus without it.
+                    // Two statements, not a match: a match scrutinee keeps its
+                    // temporary read guard alive for the whole arm, and the
+                    // recursive read inside the wait then queues behind the
+                    // publisher's pending write. That is a hard deadlock.
+                    let mut guard = self.turbo.read().clone();
+                    if guard.is_none() { guard = self.wait_for_turbo(); }
                     if let Some(ts) = guard.as_ref() {
                         let fetch = (if allowed.is_some() { k.saturating_mul(4).max(k) } else { k })
                             .saturating_add(self.turbo_changed.len());
@@ -3734,5 +3829,68 @@ mod startup_cache_tests {
             refresh_pool().current_num_threads());
         assert_eq!(serial_coarse.len(), ids.len());
         assert_eq!(serial_lsh.len(), ids.len());
+    }
+}
+
+#[cfg(test)]
+mod turbo_pending_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Deterministic unit vectors, enough of them to pass HNSW_THRESHOLD so
+    /// `plan_turbo_rebuild` yields a plan, with graph inserts inhibited.
+    fn corpus() -> (SemanticIndex, Vec<f32>) {
+        let mut idx = SemanticIndex::new();
+        idx.set_inhibit_hnsw(true);
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for id in 1..=2_100u64 {
+            let mut v = vec![0f32; EMBED_DIM];
+            for slot in v.iter_mut() { *slot = (next() % 2_000) as f32 / 1_000.0 - 1.0; }
+            idx.upsert(id, v, None);
+        }
+        let query = idx.get_embedding(7).map(|e| e.to_vec()).expect("query vector");
+        (idx, query)
+    }
+
+    fn ids(hits: &[SemanticHit]) -> Vec<MemoryId> { hits.iter().map(|h| h.memory_id).collect() }
+
+    #[test]
+    fn search_waits_for_a_pending_turbo_and_then_uses_it() {
+        let (idx, query) = corpus();
+        idx.arm_turbo_pending_for(10_000);
+        let plan = idx.plan_turbo_rebuild(0).expect("turbo plan");
+        let guard = idx.turbo_pending_guard();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            plan.build();
+            drop(guard);
+        });
+        let began = Instant::now();
+        let waited_hits = idx.search(&query, 5, None, None);
+        let elapsed = began.elapsed();
+        publisher.join().unwrap();
+        assert!(elapsed >= Duration::from_millis(400), "search did not wait: {elapsed:?}");
+        assert!(idx.turbo.read().is_some(), "turbo was never published");
+        assert!(!waited_hits.is_empty());
+        // Same query once the index is plainly there: the waiting search took
+        // the turbo arm, not the scalar scan.
+        let turbo_hits = idx.search(&query, 5, None, None);
+        assert_eq!(ids(&waited_hits), ids(&turbo_hits));
+        assert_eq!(waited_hits[0].memory_id, 7);
+    }
+
+    #[test]
+    fn search_gives_up_at_the_bound_and_still_answers() {
+        let (idx, query) = corpus();
+        // Armed, and nothing will ever publish.
+        idx.arm_turbo_pending_for(200);
+        let began = Instant::now();
+        let hits = idx.search(&query, 5, None, None);
+        let elapsed = began.elapsed();
+        assert!(elapsed >= Duration::from_millis(200), "wait was not bounded below: {elapsed:?}");
+        assert!(idx.turbo.read().is_none());
+        assert!(!hits.is_empty(), "the scalar arm must still answer");
+        assert_eq!(hits[0].memory_id, 7);
     }
 }
