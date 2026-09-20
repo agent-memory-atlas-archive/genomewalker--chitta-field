@@ -93,6 +93,10 @@ impl ChittaField {
         k: usize,
     ) -> Vec<(String, u8, u32, i64, String, String, u32, f32, Vec<u64>)> {
         if self.ablations.disabled("span_store") { return Vec::new(); }
+        // The deferred span job (load + trigram index, 11.5 s live on
+        // 2026-09-20) must not stall recall: the span lane is an enrichment,
+        // so it is empty until the job publishes rather than a blocked read.
+        if !self.span_store.is_ready() { return Vec::new(); }
         self.span_store
             .write()
             .query(query, realm, k)
