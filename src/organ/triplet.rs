@@ -356,17 +356,36 @@ impl TripletStore {
             }
         }
 
-        self.id_to_index = HashMap::with_capacity(self.entries.len());
-        self.duplicate_ids.clear();
-        self.by_subject   = HashMap::new();
-        self.by_object    = HashMap::new();
-        self.by_predicate = HashMap::new();
-        for (idx, e) in self.entries.iter().enumerate() {
-            if self.id_to_index.insert(e.id, idx).is_some() { self.duplicate_ids.insert(e.id); }
-            self.by_subject.entry(e.subject.clone()).or_default().push(e.id);
-            self.by_object.entry(e.object.clone()).or_default().push(e.id);
-            self.by_predicate.entry(e.predicate.clone()).or_default().push(e.id);
-        }
+        // Four independent passes over the same entries, run concurrently. Each
+        // pass walks in entry order, so every posting list keeps the order the
+        // single loop produced and the result is byte-for-byte the old one.
+        let entries = &self.entries;
+        let posting = |pick: fn(&TripletEntry) -> &String| {
+            let mut map: HashMap<String, Vec<u64>> = HashMap::new();
+            for e in entries { map.entry(pick(e).clone()).or_default().push(e.id); }
+            map
+        };
+        let identity = || {
+            let mut id_to_index = HashMap::with_capacity(entries.len());
+            let mut duplicate_ids = std::collections::HashSet::new();
+            for (idx, e) in entries.iter().enumerate() {
+                if id_to_index.insert(e.id, idx).is_some() { duplicate_ids.insert(e.id); }
+            }
+            (id_to_index, duplicate_ids)
+        };
+        let (by_subject, (by_object, (by_predicate, (id_to_index, duplicate_ids)))) =
+            rayon::join(
+                || posting(|e| &e.subject),
+                || rayon::join(
+                    || posting(|e| &e.object),
+                    || rayon::join(|| posting(|e| &e.predicate), identity),
+                ),
+            );
+        self.id_to_index   = id_to_index;
+        self.duplicate_ids = duplicate_ids;
+        self.by_subject    = by_subject;
+        self.by_object     = by_object;
+        self.by_predicate  = by_predicate;
     }
 
     /// Remove invalidated (valid_to_ms != 0) entries. Returns removed count.
@@ -929,6 +948,10 @@ impl TripletStore {
     }
 
     /// Load supersession + ingestion data from a JSON sidecar. No-op if file absent.
+    /// Sidecar entries never overwrite what is already in memory: an eager open
+    /// runs this after WAL replay, and the replayed value is the newer one.
+    /// Under a deferred open both maps are still empty here (they are
+    /// `#[serde(skip)]`), so the two orders agree.
     pub fn load_supersession_sidecar(&mut self, path: &std::path::Path) {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -944,7 +967,7 @@ impl TripletStore {
                     if arr.len() == 2 {
                         let new_id = arr[0].as_u64().unwrap_or(0);
                         let at_ms  = arr[1].as_i64().unwrap_or(0);
-                        self.supersession_map.insert(old_id, (new_id, at_ms));
+                        self.supersession_map.entry(old_id).or_insert((new_id, at_ms));
                     }
                 }
             }
@@ -952,7 +975,7 @@ impl TripletStore {
         if let Some(obj) = v["ingestion_times"].as_object() {
             for (k, ts) in obj {
                 if let (Ok(id), Some(ms)) = (k.parse::<u64>(), ts.as_i64()) {
-                    self.ingestion_times.insert(id, ms);
+                    self.ingestion_times.entry(id).or_insert(ms);
                 }
             }
         }
@@ -1564,5 +1587,55 @@ mod tests {
         let results = store.query_subject("a", 0);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 42);
+    }
+}
+
+#[cfg(test)]
+mod rebuild_indexes_tests {
+    use super::{TripletEntry, TripletStore};
+    use std::collections::{HashMap, HashSet};
+
+    /// The four derived maps are built on four threads now. Parity against the
+    /// single-loop version this replaced, including duplicate ids (legacy
+    /// imports reuse them) and posting-list order within each key.
+    #[test]
+    fn parallel_rebuild_matches_the_sequential_loop() {
+        let mut seed = 0x243f6a8885a308d3u64;
+        let mut next = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let mut store = TripletStore::new();
+        let mut entries = Vec::new();
+        for i in 0..5_000u64 {
+            // Deliberate id reuse every 97th entry so duplicate_ids is exercised.
+            let id = if i % 97 == 0 && i > 0 { i - 97 } else { i };
+            entries.push(TripletEntry {
+                id,
+                subject:   format!("s{}", next() % 300),
+                predicate: format!("p{}", next() % 17),
+                object:    format!("o{}", next() % 500),
+                weight: 1.0, reverse_weight: -1.0,
+                valid_from_ms: 0, valid_to_ms: 0,
+                source_memory_id: None, source_file: None,
+            });
+        }
+        store.entries = entries;
+
+        let mut id_to_index: HashMap<u64, usize> = HashMap::new();
+        let mut duplicate_ids: HashSet<u64> = HashSet::new();
+        let (mut by_subject, mut by_object, mut by_predicate) =
+            (HashMap::<String, Vec<u64>>::new(), HashMap::<String, Vec<u64>>::new(), HashMap::<String, Vec<u64>>::new());
+        for (idx, e) in store.entries.iter().enumerate() {
+            if id_to_index.insert(e.id, idx).is_some() { duplicate_ids.insert(e.id); }
+            by_subject.entry(e.subject.clone()).or_default().push(e.id);
+            by_object.entry(e.object.clone()).or_default().push(e.id);
+            by_predicate.entry(e.predicate.clone()).or_default().push(e.id);
+        }
+
+        store.rebuild_indexes();
+        assert!(!duplicate_ids.is_empty(), "fixture must exercise duplicate ids");
+        assert_eq!(store.id_to_index, id_to_index);
+        assert_eq!(store.duplicate_ids, duplicate_ids);
+        assert_eq!(store.by_subject, by_subject);
+        assert_eq!(store.by_object, by_object);
+        assert_eq!(store.by_predicate, by_predicate);
     }
 }

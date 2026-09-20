@@ -55,6 +55,9 @@ pub(super) struct LoadedSnapshot {
     pub(super) snapshot_seqno: u64,
     pub(super) full_snapshot_seqno: u64,
     pub(super) best_full_path: Option<PathBuf>,
+    /// `.sup.json` next to the family that actually loaded, which is not always
+    /// `best_full_path` (a manifest-committed or stale family may win).
+    pub(super) sup_sidecar_path: Option<PathBuf>,
     pub(super) loaded_manifest: Option<crate::manifest::Manifest>,
     pub(super) loaded_snapshot_name: Option<String>,
     pub(super) certified_cortical: bool,
@@ -240,6 +243,7 @@ pub(super) fn load_snapshots(data_dir: &std::path::Path, defer_triplet_indexes: 
             None => {}
         }
     }
+    let mut sup_sidecar_path: Option<std::path::PathBuf> = None;
     let mut loaded_header: Option<crate::snapshot::StoreHeader> = None;
     let mut loaded_snapshot_name: Option<String> = None;
     // CHITTA_MIGRATE_REEMBED=1: one-shot embedding-space migration. Bypasses the dim/vsid
@@ -371,7 +375,11 @@ pub(super) fn load_snapshots(data_dir: &std::path::Path, defer_triplet_indexes: 
                         }
                     }
                 }
-                snap.triplet_store.load_supersession_sidecar(&candidate.with_extension("sup.json"));
+                // Parsing 3.4 M ingestion times out of JSON cost 3 s of the open
+                // path on the 2026-09-20 live store. It is triplet state and
+                // nothing before the deferred triplet job reads it, so the path
+                // travels and field.rs loads it inside that job instead.
+                sup_sidecar_path = Some(candidate.with_extension("sup.json"));
                 for ev in snap.ledger_session_events {
                     if ev.domain == "session" {
                         match ev.kind.as_str() {
@@ -560,6 +568,7 @@ pub(super) fn load_snapshots(data_dir: &std::path::Path, defer_triplet_indexes: 
         snapshot_seqno,
         full_snapshot_seqno,
         best_full_path,
+        sup_sidecar_path,
         loaded_manifest,
         loaded_snapshot_name,
         loaded_header,

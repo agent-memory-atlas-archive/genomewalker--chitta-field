@@ -676,6 +676,7 @@ impl ChittaField {
             snapshot_seqno,
             full_snapshot_seqno,
             best_full_path,
+            sup_sidecar_path,
             loaded_manifest,
             loaded_snapshot_name,
             certified_cortical,
@@ -865,6 +866,14 @@ impl ChittaField {
                 let load = move || {
                     let mut triplet_store = triplet_store;
                     let _phase = crate::profile::LoadPhase::new("triplets");
+                    // Ingestion times and supersessions are RAM-only triplet
+                    // state, and the JSON parse is seconds on a large store.
+                    // First here, so a deferred open keeps the historical
+                    // order (sidecar, then replay, then clean_for_load, which
+                    // prunes ingestion times against the surviving entries).
+                    if let Some(path) = &sup_sidecar_path {
+                        triplet_store.load_supersession_sidecar(path);
+                    }
                     triplet_store.apply_deferred_replay();
                     let before = triplet_store.triplet_count();
                     let (purged, deduped) = triplet_store.clean_for_load();

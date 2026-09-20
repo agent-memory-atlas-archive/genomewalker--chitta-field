@@ -61,6 +61,60 @@ fn startup_work<T: Send + 'static>(
     }
 }
 
+type StartupPhases = Vec<(&'static str, Box<dyn FnOnce() + Send>)>;
+
+// One lane's phases, in order. The order inside a lane IS the dependency
+// between its phases; lanes themselves share nothing, so the readiness gate
+// opens on the slowest lane instead of the sum of every phase.
+fn run_startup_lane(cancel: &std::sync::atomic::AtomicBool, phases: StartupPhases) {
+    for (phase, job) in phases {
+        if cancel.load(Ordering::Acquire) { return; }
+        let begin = std::time::Instant::now();
+        job();
+        eprintln!("[field] deferred phase={phase} duration_ms={}", begin.elapsed().as_millis());
+    }
+}
+
+// Same contract as startup_work: the maintenance thread only ever polls, so a
+// phase blocked on a lock cannot delay shutdown. Cancellation detaches the
+// lanes rather than joining them.
+fn run_startup_lanes(
+    stopped: &std::sync::mpsc::Receiver<()>,
+    lanes: Vec<StartupPhases>,
+) -> StartupWork<()> {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done, finished) = std::sync::mpsc::channel();
+    let mut pending = 0usize;
+    for phases in lanes {
+        let lane_cancel = cancel.clone();
+        let done = done.clone();
+        if let Err(error) = std::thread::Builder::new().name("chitta-startup-index".into())
+            .spawn(move || { run_startup_lane(&lane_cancel, phases); let _ = done.send(()); }) {
+            eprintln!("[field] deferred lane spawn failed: {error}");
+            cancel.store(true, Ordering::Release);
+            return StartupWork::Failed;
+        }
+        pending += 1;
+    }
+    drop(done);
+    while pending > 0 {
+        match stopped.recv_timeout(std::time::Duration::from_millis(25)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+            _ => { cancel.store(true, Ordering::Release); return StartupWork::Stopped; }
+        }
+        match finished.try_recv() {
+            Ok(()) => pending -= 1,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {},
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                eprintln!("[field] deferred lane exited without a result");
+                cancel.store(true, Ordering::Release);
+                return StartupWork::Failed;
+            }
+        }
+    }
+    StartupWork::Complete(())
+}
+
 // Keep the field on the maintenance thread: cancellation releases every guard
 // before cf_close joins it, so no detached worker can retain the instance lock.
 fn prepare_startup_keywords(field: &ChittaField, stopped: &std::sync::mpsc::Receiver<()>) -> bool {
@@ -198,32 +252,34 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                     .name(if wal_only { "chitta-wal" } else { "chitta-maint" }.into())
                     .spawn(move || {
                         if !wal_only {
-                            // Triplets first: the largest snapshot section, and
-                            // until 2026-09-20 its 1,899 ms index rebuild sat on
-                            // the open path. cf_startup_indexes_ready covers it,
-                            // so ordering it first keeps that gate's window from
-                            // growing. The replication counts walk the graph and
-                            // therefore follow immediately.
-                            let begin = std::time::Instant::now();
-                            if !matches!(startup_work(&stopped, field.triplet_store.startup_job()), StartupWork::Complete(())) { return; }
-                            eprintln!("[field] deferred phase=triplets duration_ms={}", begin.elapsed().as_millis());
-                            // Timed apart: it is the open path's other graph cost
-                            // and the larger unknown in the pre-ready budget.
-                            let begin = std::time::Instant::now();
+                            // Every phase cf_startup_indexes_ready waits on, in
+                            // three lanes. Lane order within a lane is its only
+                            // dependency: the replication counts walk the graph
+                            // the triplet job rebuilds, and the episode store
+                            // shares the event-tape loader with the organs, so
+                            // forcing either forces both. Nothing crosses lanes,
+                            // so the gate now opens on the slowest lane.
+                            let total = std::time::Instant::now();
                             let replication = field.clone();
-                            if !matches!(startup_work(&stopped, move || replication.rebuild_replications_if_pending()), StartupWork::Complete(())) { return; }
-                            eprintln!("[field] deferred phase=triplet_replication duration_ms={}", begin.elapsed().as_millis());
-                            for (phase, job) in [
-                                ("symbols", field.symbol_idx.startup_job()),
-                                ("span_store", field.span_store.startup_job()),
-                                ("hdc", field.hdc_idx.startup_job()),
-                                ("event_tape_organs", field.cdawg.startup_job()),
-                                ("episode_hdc", field.episode_hdc.startup_job()),
-                            ] {
-                                let begin = std::time::Instant::now();
-                                if !matches!(startup_work(&stopped, job), StartupWork::Complete(())) { return; }
-                                eprintln!("[field] deferred phase={phase} duration_ms={}", begin.elapsed().as_millis());
-                            }
+                            let lanes: Vec<StartupPhases> = vec![
+                                vec![
+                                    ("triplets", field.triplet_store.startup_job()),
+                                    ("triplet_replication", Box::new(move || replication.rebuild_replications_if_pending())),
+                                ],
+                                vec![
+                                    ("event_tape_organs", field.cdawg.startup_job()),
+                                    ("episode_hdc", field.episode_hdc.startup_job()),
+                                ],
+                                vec![
+                                    ("symbols", field.symbol_idx.startup_job()),
+                                    ("span_store", field.span_store.startup_job()),
+                                    ("hdc", field.hdc_idx.startup_job()),
+                                ],
+                            ];
+                            if !matches!(run_startup_lanes(&stopped, lanes), StartupWork::Complete(())) { return; }
+                            eprintln!("[field] deferred phases total_ms={}", total.elapsed().as_millis());
+                            // Neither of the two below is in the readiness gate,
+                            // so they stay on this thread, after it has opened.
                             let begin = std::time::Instant::now();
                             if !prepare_startup_keywords(&field, &stopped) { return; }
                             eprintln!("[field] deferred phase=keyword_reverse duration_ms={}", begin.elapsed().as_millis());
@@ -3533,6 +3589,54 @@ mod deferred_startup_tests {
         release.send(()).unwrap();
         waiter.join().unwrap();
         assert_eq!(stopped_promptly.unwrap(), true);
+    }
+
+    #[test]
+    fn startup_lanes_run_in_parallel_and_keep_intra_lane_order() {
+        use std::sync::{Arc, Mutex};
+        let (_stop, stopped) = std::sync::mpsc::channel();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        const NAMES: [[&str; 2]; 3] = [["a", "b"], ["c", "d"], ["e", "f"]];
+        let lanes: Vec<StartupPhases> = NAMES.iter().map(|lane| {
+            lane.iter().map(|name| {
+                let order = order.clone();
+                let name: &'static str = name;
+                let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    order.lock().unwrap().push(name);
+                });
+                (name, job)
+            }).collect()
+        }).collect();
+        let begin = std::time::Instant::now();
+        assert!(matches!(run_startup_lanes(&stopped, lanes), StartupWork::Complete(())));
+        // Six 150 ms phases: one lane would take 900 ms, three take about 300.
+        assert!(begin.elapsed() < std::time::Duration::from_millis(600), "{:?}", begin.elapsed());
+        let order = order.lock().unwrap().clone();
+        assert_eq!(order.len(), 6);
+        for [first, second] in NAMES {
+            assert!(order.iter().position(|n| *n == first) < order.iter().position(|n| *n == second),
+                "lane order broken for {first}/{second} in {order:?}");
+        }
+    }
+
+    #[test]
+    fn stopping_abandons_running_startup_lanes() {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker: Box<dyn FnOnce() + Send> = Box::new(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        let waiter = std::thread::spawn(move || {
+            matches!(run_startup_lanes(&stopped, vec![vec![("blocked", blocker)]]), StartupWork::Stopped)
+        });
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        stop.send(()).unwrap();
+        let verdict = waiter.join().unwrap();
+        release.send(()).unwrap();
+        assert!(verdict);
     }
 }
 

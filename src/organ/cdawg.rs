@@ -183,8 +183,16 @@ impl CdawgOrgan {
         for ev in &tape.events {
             self.extend(ev.pack(), ev.turn_id);
         }
-        // Seed Q-values from empirical success ratio so variance is non-zero on cold start.
-        // States with no observations stay at 0.5 (maximum uncertainty prior).
+        self.seed_q_values();
+        self.rebuilt = true;
+    }
+
+    /// Seed Q-values from empirical success ratio so variance is non-zero on cold start.
+    /// States with no observations stay at 0.5 (maximum uncertainty prior).
+    /// `extend` reads neither q_value nor credit, so seeding after a batch of
+    /// extensions gives the same result whether they were one rebuild or a
+    /// cached prefix plus a tail.
+    pub(crate) fn seed_q_values(&mut self) {
         for s in &mut self.states {
             let total = s.succ_count + s.fail_count;
             s.q_value = if total == 0 {
@@ -193,7 +201,6 @@ impl CdawgOrgan {
                 s.succ_count as f32 / total as f32
             };
         }
-        self.rebuilt = true;
     }
 
     /// Walk the automaton for the given symbol sequence.
