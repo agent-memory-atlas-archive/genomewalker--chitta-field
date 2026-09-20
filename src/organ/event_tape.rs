@@ -54,6 +54,17 @@ impl TurnEvent {
     }
 }
 
+/// How much of a tape a derived organ was built from. Stored inside the organs
+/// cache so a later open can tell "the same tape plus a tail" from "a different
+/// tape", and apply only the tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TapeCut {
+    pub events: u64,
+    pub tools: u64,
+    pub entities: u64,
+    pub key: [u8; 32],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventTape {
     pub events:      Vec<TurnEvent>,
@@ -66,9 +77,26 @@ pub struct EventTape {
 impl EventTape {
     /// Hash ordered events plus the dictionaries used to interpret them. HashMap
     /// serialization order must not affect identity across process restarts.
-    pub(crate) fn startup_key(&self) -> [u8; 32] {
-        crate::startup_cache::digest(&bincode::serialize(
-            &(1u32, &self.events, &self.tool_names, &self.entity_names)).expect("serialize tape key"))
+    pub(crate) fn startup_key(&self) -> [u8; 32] { self.cut().key }
+
+    /// Identity of the whole tape, as a prefix of itself.
+    pub(crate) fn cut(&self) -> TapeCut {
+        self.cut_at(self.events.len(), self.tool_names.len(), self.entity_names.len())
+            .expect("full-length cut is always in range")
+    }
+
+    /// Identity of the first `events` events read through the first `tools` and
+    /// `entities` dictionary entries. Live appends only ever push onto all three,
+    /// so a cache built at an earlier cut stays reusable; an in-place edit or a
+    /// removal inside the prefix changes this key and forces a full rebuild.
+    pub(crate) fn cut_at(&self, events: usize, tools: usize, entities: usize) -> Option<TapeCut> {
+        let (e, t, n) = (self.events.get(..events)?, self.tool_names.get(..tools)?,
+            self.entity_names.get(..entities)?);
+        Some(TapeCut {
+            events: events as u64, tools: tools as u64, entities: entities as u64,
+            key: crate::startup_cache::digest(
+                &bincode::serialize(&(1u32, e, t, n)).expect("serialize tape key")),
+        })
     }
 
     pub fn new() -> Self {
