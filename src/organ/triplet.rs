@@ -929,6 +929,10 @@ impl TripletStore {
     }
 
     /// Load supersession + ingestion data from a JSON sidecar. No-op if file absent.
+    /// Sidecar entries never overwrite what is already in memory: an eager open
+    /// runs this after WAL replay, and the replayed value is the newer one.
+    /// Under a deferred open both maps are still empty here (they are
+    /// `#[serde(skip)]`), so the two orders agree.
     pub fn load_supersession_sidecar(&mut self, path: &std::path::Path) {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -944,7 +948,7 @@ impl TripletStore {
                     if arr.len() == 2 {
                         let new_id = arr[0].as_u64().unwrap_or(0);
                         let at_ms  = arr[1].as_i64().unwrap_or(0);
-                        self.supersession_map.insert(old_id, (new_id, at_ms));
+                        self.supersession_map.entry(old_id).or_insert((new_id, at_ms));
                     }
                 }
             }
@@ -952,7 +956,7 @@ impl TripletStore {
         if let Some(obj) = v["ingestion_times"].as_object() {
             for (k, ts) in obj {
                 if let (Ok(id), Some(ms)) = (k.parse::<u64>(), ts.as_i64()) {
-                    self.ingestion_times.insert(id, ms);
+                    self.ingestion_times.entry(id).or_insert(ms);
                 }
             }
         }
