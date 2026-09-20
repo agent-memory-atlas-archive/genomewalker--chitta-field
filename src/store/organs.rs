@@ -111,6 +111,9 @@ impl ChittaField {
     /// Returns (text, class, count, realm) tuples, most-distinctive first.
     pub fn span_for_memory(&self, memory_id: u64, k: usize) -> Vec<(String, u8, u32, String)> {
         if self.ablations.disabled("span_store") { return Vec::new(); }
+        // Same rule as span_query: recall reads spans as enrichment and must
+        // not wait for the deferred span job (stacks 2026-09-20 10:55Z).
+        if !self.span_store.is_ready() { return Vec::new(); }
         self.span_store
             .read()
             .spans_for_memory(memory_id, k)
