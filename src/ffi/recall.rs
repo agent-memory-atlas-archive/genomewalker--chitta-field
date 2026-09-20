@@ -1131,6 +1131,12 @@ pub extern "C" fn cf_recall_analogy(h: *const CfHandle, json_in: *const c_char) 
         return error("proportional mode needs a, b and c (a:b :: c:?)");
     }
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 100) as usize;
+    // Ungated by choice, unlike the exact/hybrid recall lanes. Correct either
+    // way (Deref drains first), and unreachable during the deferred window over
+    // RPC: recall_analogy is not on the exempt list in field_handler.hpp, so the
+    // startup-indexes gate -- which covers triplets since 2026-09-20 -- answers
+    // loading before this runs. A direct FFI caller blocks for the rebuild
+    // instead, which is the right trade for a structural query.
     let mut transfer = {
         let store = handle.field.triplet_store.read();
         crate::analogy::proportional(&store, a, b, c, crate::store::now_ms())

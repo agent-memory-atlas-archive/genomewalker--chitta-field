@@ -65,6 +65,32 @@ impl TripletEntry {
     }
 }
 
+/// A replay mutation held back while the derived indexes are still owed. Only
+/// the three index-reading mutations need this; `supersede` writes
+/// `supersession_map`, which no index feeds, and applies immediately.
+#[derive(Debug, Clone)]
+enum DeferredOp {
+    Add {
+        id: u64,
+        subject: String,
+        predicate: String,
+        object: String,
+        weight: f32,
+        valid_from_ms: i64,
+        source_memory_id: Option<MemoryId>,
+        source_file: Option<String>,
+        /// Wall clock when replay reached this op, captured here because
+        /// `AddTripletOp` carries no ingestion timestamp: `insert_with_id`
+        /// stamps `ingestion_times` from the clock it runs under. Stamping at
+        /// drain time instead would date every WAL-tail triplet by however long
+        /// the deferred rebuild took, which is the one observable the eager and
+        /// deferred paths would otherwise disagree on.
+        ingested_ms: i64,
+    },
+    Invalidate { id: u64, now_ms: i64 },
+    InvalidateBySourceFile { source_file: String, now_ms: i64 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripletStore {
     /// Runtime flag persisted as an optional V23 section, never in bincode.
@@ -106,6 +132,26 @@ pub struct TripletStore {
     // Backfilled from valid_from_ms on load if sidecar absent.
     #[serde(skip)]
     ingestion_times: HashMap<u64, i64>,
+    /// Set when a serving open decoded `entries` without rebuilding the derived
+    /// indexes (snapshot.rs `defer_triplet_indexes`). Every `&mut self` mutation
+    /// that consults an index calls `ensure_indexes` first; `&self` reads rely on
+    /// the deferred loader in field.rs having rebuilt before publication.
+    /// Deserializes to false, so any path that does not opt in is unaffected.
+    #[serde(skip)]
+    indexes_dirty: bool,
+    /// WAL replay mutations recorded in order while the indexes are owed, so a
+    /// WAL tail carrying triplet ops does not drag the rebuild back onto the
+    /// open path. `Some` only between `mark_indexes_dirty` and
+    /// `apply_deferred_replay`; `None` everywhere else, including every live
+    /// write path.
+    #[serde(skip)]
+    deferred_replay: Option<Vec<DeferredOp>>,
+    /// Counts `rebuild_indexes` calls. The regression this guards is a rebuild
+    /// firing from inside WAL replay, which is on the open path: it would put
+    /// the 1,899 ms job back where deferring it was meant to remove it, and a
+    /// replica with an empty WAL tail would never show it.
+    #[serde(skip)]
+    rebuilds: u32,
 }
 
 impl TripletStore {
@@ -126,6 +172,45 @@ impl TripletStore {
             + self.duplicate_ids.capacity() * 8 / 7 * (std::mem::size_of::<u64>() + 1)
     }
 
+    /// Mark the derived indexes as owed. Only the deferring snapshot decode sets
+    /// this; the entries are already complete.
+    pub(crate) fn mark_indexes_dirty(&mut self) {
+        self.indexes_dirty = true;
+        self.deferred_replay = Some(Vec::new());
+    }
+
+    pub(crate) fn indexes_dirty(&self) -> bool { self.indexes_dirty }
+
+    /// How many times the derived indexes have been rebuilt on this instance.
+    pub(crate) fn rebuild_count(&self) -> u32 { self.rebuilds }
+
+    /// Rebuild the derived indexes if a deferring decode left them owed, then
+    /// apply the replay mutations recorded since, in their original order. The
+    /// result is identical to running them against an eagerly indexed store:
+    /// see `deferred_replay_matches_the_eager_path`.
+    pub(crate) fn apply_deferred_replay(&mut self) {
+        let buffered = self.deferred_replay.take();
+        if self.indexes_dirty { self.rebuild_indexes(); }
+        for op in buffered.into_iter().flatten() {
+            match op {
+                DeferredOp::Add { id, subject, predicate, object, weight, valid_from_ms,
+                                  source_memory_id, source_file, ingested_ms } => self.replay_add_at(
+                    id, subject, predicate, object, weight, valid_from_ms, source_memory_id,
+                    source_file, ingested_ms),
+                DeferredOp::Invalidate { id, now_ms } => self.invalidate(id, now_ms),
+                DeferredOp::InvalidateBySourceFile { source_file, now_ms } => {
+                    self.invalidate_by_source_file(&source_file, now_ms);
+                }
+            }
+        }
+    }
+
+    /// Backstop for any index-reading mutation that is not recorded: rebuild
+    /// rather than resolve through an empty `id_to_index` and silently no-op.
+    fn ensure_indexes(&mut self) {
+        if self.indexes_dirty { self.apply_deferred_replay(); }
+    }
+
     pub fn new() -> Self {
         Self {
             clean: true,
@@ -142,6 +227,9 @@ impl TripletStore {
             correction_states: HashMap::new(),
             supersession_map: HashMap::new(),
             ingestion_times: HashMap::new(),
+            indexes_dirty: false,
+            deferred_replay: None,
+            rebuilds: 0,
         }
     }
 
@@ -156,6 +244,7 @@ impl TripletStore {
 
     /// Legacy families migrate once. WAL duplicates or invalidation clear the flag.
     pub(crate) fn clean_for_load(&mut self) -> (usize, usize) {
+        self.ensure_indexes();
         if self.clean { return (0, 0); }
         if self.dirty_subjects.as_ref().is_some_and(|subjects| subjects.iter().any(|subject|
             self.by_subject.get(subject).into_iter().flatten().any(|id| self.duplicate_ids.contains(id)))) {
@@ -256,6 +345,8 @@ impl TripletStore {
 
     /// Rebuild all derived indexes from `entries`. Must be called after deserialization.
     pub fn rebuild_indexes(&mut self) {
+        self.rebuilds = self.rebuilds.saturating_add(1);
+        self.indexes_dirty = false;
         self.by_source_file = None;
         self.source_files.clear();
         for entry in &mut self.entries {
@@ -359,7 +450,7 @@ impl TripletStore {
         let id = self.next_id;
         self.next_id += 1;
         self.insert_with_id(id, subject, predicate, object, weight, valid_from_ms,
-            source_memory_id, source_file);
+            source_memory_id, source_file, crate::store::now_ms());
         id
     }
 
@@ -390,8 +481,40 @@ impl TripletStore {
         source_memory_id: Option<MemoryId>,
         source_file: Option<String>,
     ) {
+        let ingested_ms = crate::store::now_ms();
+        self.replay_add_at(id, subject, predicate, object, weight, valid_from_ms,
+            source_memory_id, source_file, ingested_ms);
+    }
+
+    /// `replay_add` with the ingestion clock supplied, so a buffered add is
+    /// stamped with the time replay reached it rather than the time the drain
+    /// applied it.
+    fn replay_add_at(
+        &mut self,
+        id: u64,
+        subject: String,
+        predicate: String,
+        object: String,
+        weight: f32,
+        valid_from_ms: i64,
+        source_memory_id: Option<MemoryId>,
+        source_file: Option<String>,
+        ingested_ms: i64,
+    ) {
+        // Advance the high-water mark even while buffering. field.rs seeds
+        // TripletIdAllocator from next_id *between* replay and the drain, so a
+        // buffered add whose id is at or above the snapshot's next_id would
+        // otherwise leave the allocator issuing ids that replayed records
+        // already own: duplicate entries, id_to_index pointing at one of them,
+        // and invalidate/supersede resolving to the wrong one. The eager path
+        // never had this because insert advances as it goes.
         if id >= self.next_id {
             self.next_id = id + 1;
+        }
+        if let Some(buffer) = &mut self.deferred_replay {
+            buffer.push(DeferredOp::Add { id, subject, predicate, object, weight,
+                valid_from_ms, source_memory_id, source_file, ingested_ms });
+            return;
         }
         self.insert_with_id(
             id,
@@ -402,6 +525,7 @@ impl TripletStore {
             valid_from_ms,
             source_memory_id,
             source_file,
+            ingested_ms,
         );
     }
 
@@ -415,6 +539,7 @@ impl TripletStore {
         valid_from_ms: i64,
         source_memory_id: Option<MemoryId>,
         source_file: Option<String>,
+        ingested_ms: i64,
     ) {
         // Legacy repeated explicit IDs cannot be represented by id_to_index's
         // single position; retain the full-scan behavior for this malformed case.
@@ -426,11 +551,7 @@ impl TripletStore {
         if !self.clean || self.find_exact_live(&subject, &predicate, &object).is_some() {
             self.mark_dirty(subject.clone());
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        self.ingestion_times.insert(id, now_ms);
+        self.ingestion_times.insert(id, ingested_ms);
         let idx = self.entries.len();
         self.id_to_index.insert(id, idx);
 
@@ -467,6 +588,10 @@ impl TripletStore {
 
     /// Invalidate a triplet (set valid_to_ms = now_ms).
     pub fn invalidate(&mut self, triplet_id: u64, now_ms: i64) {
+        if let Some(buffer) = &mut self.deferred_replay {
+            buffer.push(DeferredOp::Invalidate { id: triplet_id, now_ms });
+            return;
+        }
         if let Some(&idx) = self.id_to_index.get(&triplet_id) {
             if let Some(entry) = self.entries.get_mut(idx) {
                 entry.valid_to_ms = now_ms;
@@ -594,7 +719,15 @@ impl TripletStore {
             .collect()
     }
 
+    /// While replay is buffered the returned ids are not yet known, so this
+    /// answers empty. Only WAL replay calls it in that state, and replay ignores
+    /// the result; every live caller runs against a drained store.
     pub fn invalidate_by_source_file(&mut self, source_file: &str, now_ms: i64) -> Vec<u64> {
+        if let Some(buffer) = &mut self.deferred_replay {
+            buffer.push(DeferredOp::InvalidateBySourceFile {
+                source_file: source_file.to_string(), now_ms });
+            return Vec::new();
+        }
         let mut invalidated = Vec::new();
         let mut subjects = Vec::new();
         let index = self.by_source_file.get_or_insert_with(|| {
@@ -728,6 +861,8 @@ impl TripletStore {
     /// Mark `old_id` as superseded by `new_id` at ingestion-time `at_ms`.
     /// `query_as_of` and `query_believed_at` will exclude superseded entries.
     pub fn supersede(&mut self, old_id: u64, new_id: u64, at_ms: i64) {
+        // No index feeds supersession_map, so this is correct even while the
+        // derived indexes are still owed and needs no buffering.
         self.supersession_map.insert(old_id, (new_id, at_ms));
     }
 
@@ -828,6 +963,183 @@ impl TripletStore {
 
 #[cfg(test)]
 mod tests {
+    /// field.rs seeds `TripletIdAllocator` from `next_id` in the window between
+    /// WAL replay and the deferred drain. A buffered add whose id is at or above
+    /// the snapshot's `next_id` must still move the high-water mark, or the
+    /// allocator issues ids that replayed records already own. That is silent
+    /// corruption -- duplicate entries with `id_to_index` pointing at one of
+    /// them -- and it only appears with deferral on and a tail carrying adds.
+    #[test]
+    fn buffered_adds_advance_next_id_before_the_allocator_is_seeded() {
+        let mut store = super::TripletStore::new();
+        store.replay_add(1, "s".into(), "p".into(), "o1".into(), 1.0, 0, None, None);
+        store.replay_add(2, "s".into(), "p".into(), "o2".into(), 1.0, 0, None, None);
+        let snapshot_next_id = store.next_id();
+        assert_eq!(snapshot_next_id, 3);
+
+        store.clear_indexes_for_save();
+        store.mark_indexes_dirty();
+        // A WAL tail add at and above the snapshot's high-water mark.
+        store.replay_add(3, "s".into(), "p".into(), "o3".into(), 1.0, 0, None, None);
+        store.replay_add(9, "s".into(), "p".into(), "o9".into(), 1.0, 0, None, None);
+
+        // Seeded here, before the drain, exactly as field.rs does.
+        let alloc = crate::ids::TripletIdAllocator::new(store.next_id());
+        store.apply_deferred_replay();
+
+        let highest = store.entries.iter().map(|e| e.id).max().unwrap();
+        assert_eq!(highest, 9);
+        let issued = alloc.next_id();
+        assert!(issued > highest,
+            "allocator issued {issued}, which collides with replayed id {highest}");
+        assert_eq!(store.next_id(), 10);
+    }
+
+    /// Every `ChittaField` reader reaches the triplet store through
+    /// `StartupValue`, whose `Deref` runs the loader. This asserts what the
+    /// ungated callers depend on: `store/organs.rs`'s dedup check and
+    /// `ffi/sessions_ledger.rs`'s tag lookup both call `query_subject` with no
+    /// readiness gate, and `query_subject` reads `by_subject` alone, so an owed
+    /// index answers empty. Empty there means duplicate triplets and missing
+    /// tags, not a slow answer. Fails if the field goes back to a plain lock or
+    /// the drain leaves the loader.
+    #[test]
+    fn reads_through_the_startup_value_are_always_drained() {
+        let mut store = super::TripletStore::new();
+        store.replay_add(1, "subject".into(), "p".into(), "o1".into(), 1.0, 0, None, None);
+        // Exactly the state a deferring decode hands over: entries complete,
+        // derived indexes empty because the writer cleared them before saving.
+        store.clear_indexes_for_save();
+        store.mark_indexes_dirty();
+        // A WAL op arriving before the drain is recorded, not applied.
+        store.replay_add(2, "subject".into(), "p".into(), "o2".into(), 1.0, 0, None, None);
+        assert!(store.indexes_dirty());
+        assert_eq!(store.rebuild_count(), 0, "replay must not rebuild");
+        assert!(store.query_subject("subject", 1).is_empty(),
+            "owed indexes answer empty, which is why no reader may see this state");
+
+        let deferred = crate::ablation::StartupValue::deferred(move || {
+            let mut store = store;
+            store.apply_deferred_replay();
+            crate::profile::ProfiledRwLock::new("triplet_store", store)
+        });
+        assert!(!deferred.is_ready(), "not loaded until a reader forces it");
+
+        // The read every ungated caller makes; Deref runs the loader first.
+        let guard = deferred.read();
+        assert!(!guard.indexes_dirty(), "a reader must never see owed indexes");
+        let mut ids: Vec<u64> = guard.query_subject("subject", 1).iter().map(|e| e.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2], "buffered replay is visible to the first reader");
+        drop(guard);
+        assert!(deferred.is_ready());
+    }
+
+    /// The deferred path must be indistinguishable from the eager one. The
+    /// fixture interleaves all four replay op kinds, including an invalidate of
+    /// a triplet created earlier in the same replay and a supersede chain, which
+    /// is exactly what silently no-ops when a mutation resolves through an empty
+    /// `id_to_index`.
+    #[test]
+    fn deferred_replay_matches_the_eager_path() {
+        fn replay(store: &mut super::TripletStore) {
+            store.replay_add(10, "alice".into(), "wrote".into(), "paper".into(),
+                0.9, 100, Some(1), Some("a.rs".into()));
+            store.replay_add(11, "bob".into(), "wrote".into(), "thesis".into(),
+                0.7, 110, Some(2), Some("b.rs".into()));
+            // Invalidate a triplet created earlier in this same replay.
+            store.invalidate(10, 200);
+            store.replay_add(12, "alice".into(), "cites".into(), "thesis".into(),
+                0.5, 120, Some(3), Some("a.rs".into()));
+            // Supersede chain over both a snapshot id and a replay id.
+            store.supersede(1, 11, 210);
+            store.supersede(11, 12, 220);
+            // Source-file invalidation reaches the remaining a.rs entries.
+            store.invalidate_by_source_file("a.rs", 300);
+            store.replay_add(13, "carol".into(), "reviews".into(), "paper".into(),
+                0.4, 130, Some(4), None);
+            // Above the seed's high-water mark, so next_id has to move in both
+            // paths; without that the fingerprint's next_id line diverges.
+            store.replay_add(97, "dave".into(), "edits".into(), "paper".into(),
+                0.3, 140, Some(5), None);
+        }
+        // `ingested` is the presence of an ingestion stamp, not its value: the
+        // two replays run microseconds apart on a millisecond clock, so the
+        // values are legitimately allowed to differ by one. That the deferred
+        // path stamps *replay* time rather than *drain* time is asserted below,
+        // against a window the drain is deliberately pushed outside of.
+        fn fingerprint(store: &super::TripletStore) -> Vec<String> {
+            let mut rows: Vec<String> = store.entries.iter().map(|e| format!(
+                "{} {} {} {} {:.3} {} {} {:?} {:?} ingested={}",
+                e.id, e.subject, e.predicate, e.object, e.weight,
+                e.valid_from_ms, e.valid_to_ms, e.source_memory_id,
+                e.source_file.as_ref().map(|p| p.0.to_string()),
+                store.ingestion_times.contains_key(&e.id))).collect();
+            rows.sort();
+            let mut sup: Vec<String> = store.supersession_map.iter()
+                .map(|(old, (new, at))| format!("sup {old}->{new}@{at}")).collect();
+            sup.sort();
+            rows.extend(sup);
+            rows.push(format!("next_id {}", store.next_id()));
+            rows
+        }
+
+        // A snapshot body as the decoder hands it over: entries present, derived
+        // indexes empty. Both stores start from byte-identical entries.
+        let mut seed = super::TripletStore::new();
+        seed.replay_add(1, "alice".into(), "knows".into(), "bob".into(),
+            1.0, 10, Some(9), Some("seed.rs".into()));
+        seed.replay_add(2, "bob".into(), "knows".into(), "carol".into(),
+            1.0, 20, Some(9), None);
+
+        let mut eager = seed.clone();
+        replay(&mut eager);
+
+        let mut deferred = seed;
+        deferred.mark_indexes_dirty();
+        assert!(deferred.indexes_dirty());
+        let before_replay = deferred.rebuild_count();
+        let replay_started_ms = crate::store::now_ms();
+        replay(&mut deferred);
+        let replay_ended_ms = crate::store::now_ms();
+        // Nothing has been applied yet: the buffer still holds the mutations.
+        assert_eq!(deferred.entries.len(), 2, "buffered replay must not touch entries");
+        // The regression guard: replay runs on the open path, so a rebuild here
+        // would undo the whole point of deferring it.
+        assert_eq!(deferred.rebuild_count(), before_replay,
+            "WAL replay must not rebuild the triplet indexes");
+        // Stand the drain clearly outside the replay window. On the live store
+        // the gap is the rebuild itself, about 1.6 s.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        deferred.apply_deferred_replay();
+        assert!(!deferred.indexes_dirty());
+        assert_eq!(deferred.rebuild_count(), before_replay + 1,
+            "the deferred job rebuilds exactly once");
+
+        assert_eq!(fingerprint(&deferred), fingerprint(&eager));
+        // `AddTripletOp` carries no ingestion timestamp, so the stamp is
+        // whatever clock the insert runs under. Buffering moves the insert past
+        // the rebuild, so without capturing the clock at buffer time every
+        // WAL-tail triplet would be dated by the length of the rebuild.
+        for id in [10u64, 11, 12, 13, 97] {
+            let stamped = deferred.ingestion_times[&id];
+            assert!((replay_started_ms..=replay_ended_ms).contains(&stamped),
+                "triplet {id} stamped {stamped}, outside the replay window \
+                 {replay_started_ms}..={replay_ended_ms}: the deferred path dated it by the drain");
+        }
+        // The invalidations must have landed, or the fixture proves nothing.
+        assert!(eager.entries.iter().any(|e| e.id == 10 && e.valid_to_ms == 200),
+            "replay invalidate of an earlier id must set valid_to_ms");
+        assert!(eager.entries.iter().any(|e| e.id == 12 && e.valid_to_ms == 300),
+            "source-file invalidation must reach the later a.rs entry");
+        for at in [150i64, 250, 350] {
+            assert_eq!(
+                deferred.query_as_of("alice", at).iter().map(|e| e.id).collect::<Vec<_>>(),
+                eager.query_as_of("alice", at).iter().map(|e| e.id).collect::<Vec<_>>(),
+                "as-of views must agree at {at}");
+        }
+    }
+
     #[test]
     fn source_invalidation_matches_scan_across_replay_and_compaction() {
         let mut indexed = super::TripletStore::new();

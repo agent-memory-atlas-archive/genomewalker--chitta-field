@@ -198,6 +198,21 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                     .name(if wal_only { "chitta-wal" } else { "chitta-maint" }.into())
                     .spawn(move || {
                         if !wal_only {
+                            // Triplets first: the largest snapshot section, and
+                            // until 2026-09-20 its 1,899 ms index rebuild sat on
+                            // the open path. cf_startup_indexes_ready covers it,
+                            // so ordering it first keeps that gate's window from
+                            // growing. The replication counts walk the graph and
+                            // therefore follow immediately.
+                            let begin = std::time::Instant::now();
+                            if !matches!(startup_work(&stopped, field.triplet_store.startup_job()), StartupWork::Complete(())) { return; }
+                            eprintln!("[field] deferred phase=triplets duration_ms={}", begin.elapsed().as_millis());
+                            // Timed apart: it is the open path's other graph cost
+                            // and the larger unknown in the pre-ready budget.
+                            let begin = std::time::Instant::now();
+                            let replication = field.clone();
+                            if !matches!(startup_work(&stopped, move || replication.rebuild_replications_if_pending()), StartupWork::Complete(())) { return; }
+                            eprintln!("[field] deferred phase=triplet_replication duration_ms={}", begin.elapsed().as_millis());
                             for (phase, job) in [
                                 ("symbols", field.symbol_idx.startup_job()),
                                 ("span_store", field.span_store.startup_job()),
@@ -3527,5 +3542,20 @@ pub unsafe extern "C" fn cf_startup_indexes_ready(handle: *mut CfHandle) -> bool
     let Some(handle) = handle.as_ref() else { return false; };
     let f = &handle.field;
     f.symbol_idx.is_ready() && f.span_store.is_ready() && f.hdc_idx.is_ready()
-        && f.cdawg.is_ready() && f.episode_hdc.is_ready()
+        && f.cdawg.is_ready() && f.episode_hdc.is_ready() && f.triplet_store.is_ready()
+        // The graph being queryable is not the same as the counts derived from
+        // it being current: a deferring open skips replication::rebuild, so
+        // until the maintenance thread has redone it every state still carries
+        // the snapshot's replication_count. Holding the gate keeps that stale
+        // count out of every tool routed through it.
+        && !f.triplet_replication_pending.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the triplet graph is queryable without blocking on its index
+/// rebuild. The exact/hybrid triplet lanes and spreading activation answer
+/// `loading` until this is true, the way the code-intel tools already do.
+#[no_mangle]
+pub unsafe extern "C" fn cf_triplets_ready(handle: *mut CfHandle) -> bool {
+    let Some(handle) = handle.as_ref() else { return false; };
+    handle.field.triplet_store.is_ready()
 }

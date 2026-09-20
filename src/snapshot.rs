@@ -1326,11 +1326,16 @@ struct MappedSnapshot {
     failed: bool,
     table_result: Result<()>,
     seqno: u64,
+    /// Leave `TripletStore::rebuild_indexes` to the caller. The rebuild is the
+    /// single longest job in the decode pool (1,899 ms of a 2,778 ms wall on
+    /// the 2026-09-20 frozen replica), so serving opens run it off the open
+    /// path. The decoded `entries` are complete either way.
+    defer_triplet_indexes: bool,
 }
 
 impl MappedSnapshot {
     // The caller has validated the 16-byte V23 header.
-    fn new(bytes: memmap2::Mmap, seqno: u64) -> Self {
+    fn new(bytes: memmap2::Mmap, seqno: u64, defer_triplet_indexes: bool) -> Self {
         let (sections, table_result) = section_table(&bytes[16..]);
         let base = bytes.as_ptr() as usize;
         let sections: Vec<_> = sections.into_iter().map(|section| {
@@ -1339,7 +1344,7 @@ impl MappedSnapshot {
         }).collect();
         let decoded = (0..sections.len()).map(|_| None).collect();
         let published = vec![false; sections.len()];
-        Self { bytes, sections, decoded, published, failed: false, table_result, seqno }
+        Self { bytes, sections, decoded, published, failed: false, table_result, seqno, defer_triplet_indexes }
     }
 
     fn decode_selected(&mut self, select: impl Fn(&str) -> bool) {
@@ -1348,12 +1353,13 @@ impl MappedSnapshot {
             .collect();
         jobs.sort_by_key(|(_, (_, range, _))| std::cmp::Reverse(range.len()));
         let bytes = &self.bytes;
+        let defer_triplet_indexes = self.defer_triplet_indexes;
         let decoded: Vec<_> = decode_pool().install(|| jobs.par_iter()
             .with_max_len(1).map(|(i, (name, range, declared_len))| {
                 let section = Section {
                     name: name.clone(), body: &bytes[range.clone()], declared_len: *declared_len,
                 };
-                (*i, decode_section(&section))
+                (*i, decode_section(&section, defer_triplet_indexes))
             }).collect());
         for (i, result) in decoded { self.decoded[i] = Some(result); }
     }
@@ -1409,7 +1415,7 @@ impl MappedSnapshot {
 
 }
 
-fn decode_section(section: &Section<'_>) -> Result<ApplySection> {
+fn decode_section(section: &Section<'_>, defer_triplet_indexes: bool) -> Result<ApplySection> {
     let n = section.name.as_str();
     macro_rules! decode {
         ($field:ident) => {{
@@ -1434,8 +1440,12 @@ fn decode_section(section: &Section<'_>) -> Result<ApplySection> {
         "artifact_idx" => decode!(artifact_idx),
         "triplet_store" => {
             let mut value: TripletStore = decode_body(section.body, n)?;
-            let _phase = crate::profile::SnapshotPhase::new("triplet_indexes");
-            value.rebuild_indexes();
+            if defer_triplet_indexes {
+                value.mark_indexes_dirty();
+            } else {
+                let _phase = crate::profile::SnapshotPhase::new("triplet_indexes");
+                value.rebuild_indexes();
+            }
             Ok(Box::new(move |snap: &mut FullSnapshot| snap.triplet_store = value))
         }
         "triplets_clean" => {
@@ -1705,7 +1715,23 @@ impl FullSnapshot {
     /// Load a full snapshot from disk. Transparently migrates all legacy formats.
     /// V23 bodies decode concurrently from an immutable mapping; legacy layouts stream.
     pub fn load(path: &Path) -> Result<Self> {
-        let (mut snap, rebuilt) = Self::load_inner(path)?;
+        Self::load_with(path, false).map(|(snap, _)| snap)
+    }
+
+    /// Load for serving, leaving `TripletStore::rebuild_indexes` to the caller.
+    /// Returns whether the triplet indexes are already usable: legacy formats
+    /// rebuild during migration and so come back ready regardless of the flag.
+    /// A `false` return means the caller MUST rebuild before any index-backed
+    /// read (`query_subject`, `invalidate`, `supersede`, spreading activation)
+    /// and before `replication::rebuild`, which walks the graph.
+    pub fn load_deferring_triplet_indexes(path: &Path) -> Result<(Self, bool)> {
+        Self::load_with(path, true)
+    }
+
+    fn load_with(path: &Path, defer_triplet_indexes: bool) -> Result<(Self, bool)> {
+        let (mut snap, rebuilt) = Self::load_inner(path, defer_triplet_indexes)?;
+        // `rebuilt` marks the V23 sectioned path, the only one that can defer.
+        let triplet_indexes_ready = !defer_triplet_indexes || !rebuilt;
         if !rebuilt { snap.triplet_store.rebuild_indexes(); }
         // V22: hydrate per-state refresh timestamps from the persisted map so a
         // restart does not trigger a full competitive-weight refresh sweep.
@@ -1723,16 +1749,16 @@ impl FullSnapshot {
                 st.sanitize();
             }
         }
-        Ok(snap)
+        Ok((snap, triplet_indexes_ready))
     }
 
-    fn load_inner(path: &Path) -> Result<(Self, bool)> {
+    fn load_inner(path: &Path, defer_triplet_indexes: bool) -> Result<(Self, bool)> {
         let mut rebuilt = false;
-        let snap = Self::load_raw(path, &mut rebuilt)?;
+        let snap = Self::load_raw(path, &mut rebuilt, defer_triplet_indexes)?;
         Ok((snap, rebuilt))
     }
 
-    fn load_raw(path: &Path, rebuilt: &mut bool) -> Result<Self> {
+    fn load_raw(path: &Path, rebuilt: &mut bool, defer_triplet_indexes: bool) -> Result<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| FieldError::Manifest(e.to_string()))?;
         let mut r = BufReader::with_capacity(1 << 20, SnapshotReader::new(file));
@@ -1760,7 +1786,7 @@ impl FullSnapshot {
                 eprintln!("[chitta-field] snapshot mapped_bytes={}", bytes.len());
             }
             let _phase = crate::profile::SnapshotPhase::new("parallel_sections");
-            let snap = MappedSnapshot::new(bytes, u64::from_le_bytes(seq_buf)).finish()?;
+            let snap = MappedSnapshot::new(bytes, u64::from_le_bytes(seq_buf), defer_triplet_indexes).finish()?;
             *rebuilt = true;
             return Ok(snap);
         }
@@ -2524,7 +2550,7 @@ mod tests {
     fn parallel_v23(bytes: &[u8]) -> Result<FullSnapshot> {
         let mut mapping = memmap2::MmapMut::map_anon(bytes.len() + 16).unwrap();
         mapping[16..].copy_from_slice(bytes);
-        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0);
+        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0, false);
         pending.decode_selected(|name| name == "triplets_clean");
         let count = pending.decoded.iter().filter(|r| r.is_some()).count();
         pending.decode_selected(|name| name == "triplets_clean");
@@ -2543,7 +2569,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         // SAFETY: this test never modifies the immutable mapped inode.
         let mapping = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
-        let mut pending = MappedSnapshot::new(mapping, 42);
+        let mut pending = MappedSnapshot::new(mapping, 42, false);
         pending.decode_selected(|name| name == "triplets_clean");
         drop(file);
         std::fs::remove_file(path).unwrap();
@@ -2561,7 +2587,7 @@ mod tests {
         write_section(&mut bytes, "ack_scores", &HashMap::from([(7u64, 9i32)])).unwrap();
         let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
         mapping.copy_from_slice(&bytes);
-        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 42);
+        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 42, false);
         let mut snap = FullSnapshot::empty(42);
         pending.publish_selected(&mut snap, |name| name == "ack_scores").unwrap();
         assert_eq!(snap.ack_scores.get(&7), Some(&9));
@@ -2585,7 +2611,7 @@ mod tests {
             if clean_last { write_section(&mut bytes, "triplets_clean", &true).unwrap(); }
             let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
             mapping.copy_from_slice(&bytes);
-            let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0);
+            let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0, false);
             let mut snap = FullSnapshot::empty(0);
             pending.publish_selected(&mut snap, |name| name == "triplets_clean").unwrap();
             assert_eq!(snap.triplet_store.clean, clean_last);
@@ -2600,7 +2626,7 @@ mod tests {
         write_section(&mut bytes, "ack_scores", &0u8).unwrap();
         let mut mapping = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
         mapping.copy_from_slice(&bytes);
-        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0);
+        let mut pending = MappedSnapshot::new(mapping.make_read_only().unwrap(), 0, false);
         let mut snap = FullSnapshot::empty(0);
         snap.ack_scores.insert(7, 11);
         assert!(pending.publish_selected(&mut snap, |_| true).is_err());
@@ -2751,6 +2777,55 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// Deferring the rebuild must change only *when* the indexes exist, never
+    /// what they contain. Op-level equivalence across the buffered replay is
+    /// covered by `organ::triplet::tests::deferred_replay_matches_the_eager_path`;
+    /// this asserts the container hands over the same entries either way.
+    #[test]
+    fn deferred_triplet_indexes_match_the_eager_load() {
+        let path = scratch_path("triplets-deferred");
+        let mut snap = FullSnapshot::empty(7);
+        for id in 1..=6u64 {
+            snap.triplet_store.replay_add(
+                id, format!("s{}", id % 2), "p".into(), format!("o{id}"), 0.5, 0, None, None);
+        }
+        // A snapshot fixture must build state the way the writer does. The
+        // daemon clears the derived indexes before serializing
+        // (store/maintenance.rs:1312); `FullSnapshot::save` does not. Without
+        // this line the fixture shipped populated `by_subject`, so a deferring
+        // load looked ready and this test passed for the wrong reason -- it
+        // differed from production in the one field it exists to check.
+        snap.triplet_store.clear_indexes_for_save();
+        snap.save(&path).unwrap();
+
+        let eager = FullSnapshot::load(&path).unwrap();
+        assert!(!eager.triplet_store.indexes_dirty());
+        let eager_hits: Vec<u64> =
+            eager.triplet_store.query_subject("s1", 1).iter().map(|e| e.id).collect();
+        assert!(!eager_hits.is_empty(), "fixture must produce index hits");
+
+        let (mut deferred, ready) = FullSnapshot::load_deferring_triplet_indexes(&path).unwrap();
+        assert!(!ready, "a V23 family defers");
+        assert!(deferred.triplet_store.indexes_dirty());
+        assert_eq!(deferred.triplet_store.triplet_count(), eager.triplet_store.triplet_count());
+        // Owed indexes answer nothing yet; that is why every index-backed read
+        // waits on the deferred job rather than racing it.
+        assert!(deferred.triplet_store.query_subject("s1", 1).is_empty());
+
+        deferred.triplet_store.apply_deferred_replay();
+        assert!(!deferred.triplet_store.indexes_dirty());
+        assert_eq!(deferred.triplet_store.rebuild_count(), 1, "exactly one rebuild");
+        let deferred_hits: Vec<u64> =
+            deferred.triplet_store.query_subject("s1", 1).iter().map(|e| e.id).collect();
+        assert_eq!(deferred_hits, eager_hits);
+
+        // The eager load must not have paid for a second rebuild either.
+        assert_eq!(eager.triplet_store.rebuild_count(), 1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("pld"));
     }
 
     #[test]

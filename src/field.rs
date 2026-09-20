@@ -314,7 +314,38 @@ pub struct ChittaField {
     pub(crate) time_idx: RwLock<TemporalIndex>,
     pub(crate) artifact_idx: RwLock<ArtifactIndex>,
     pub(crate) keyword_idx: RwLock<KeywordIndex>,
-    pub(crate) triplet_store: RwLock<TripletStore>,
+    /// Reads go through `StartupValue`, whose `Deref` runs the loader built in
+    /// `open_impl`, so the rebuild and the buffered-replay drain always finish
+    /// before any caller sees the store. That is why `store/organs.rs`'s dedup
+    /// check and `ffi/sessions_ledger.rs`'s tag lookup need no readiness gate:
+    /// they block once, then read the truth, instead of mistaking an empty
+    /// `query_subject` for "no such triplet". The recall-lane `is_ready` gates
+    /// avoid that block on a latency-sensitive path; they are not what makes
+    /// those callers correct, so the drain must never leave the loader. Locked
+    /// down by `organ::triplet::tests::reads_through_the_startup_value_are_always_drained`.
+    ///
+    /// Audited 2026-09-20: no function in this crate returns `&TripletStore`,
+    /// `&mut TripletStore` or the inner lock, and this field is `pub(crate)`, so
+    /// `Deref` is the only door. Two deliberate exceptions, both internal:
+    /// `FullSnapshot::triplet_store` after `load_deferring_triplet_indexes`,
+    /// whose only caller is `opening::load_snapshots` and which feeds the store
+    /// straight into the loader; and `ApplyCtx::triplet_store` during WAL
+    /// replay, the one place that mutates an owed store, where every mutation
+    /// records into the buffer instead of touching an index.
+    ///
+    /// Documented behaviour, not a safety net: `StartupValue::deref` takes the
+    /// loader out of its slot before running it, so an unwinding panic inside
+    /// the rebuild leaves the cell empty and the slot taken, and every later
+    /// reader panics on `expect("startup initializer panicked")`. The store is
+    /// unreadable from that point, which is the intended outcome -- the
+    /// alternative is serving an empty graph as if it were the truth. Turning
+    /// it into an immediate daemon abort is a follow-up.
+    pub(crate) triplet_store: crate::ablation::StartupValue<RwLock<TripletStore>>,
+    /// True when the open deferred the triplet rebuild and therefore skipped
+    /// `replication::rebuild`, which walks the graph for every state. The
+    /// maintenance thread clears it once the counts are recomputed, and
+    /// `cf_startup_indexes_ready` stays closed until then.
+    pub(crate) triplet_replication_pending: std::sync::atomic::AtomicBool,
     pub(crate) triplet_id_alloc: Arc<TripletIdAllocator>,
     pub(crate) symbol_idx: crate::ablation::StartupValue<RwLock<SymbolIndex>>,
     pub(crate) call_graph: RwLock<CallGraph>,
@@ -640,7 +671,13 @@ impl ChittaField {
             loaded_header,
             migrate_reembed,
             reindex_mode,
-        } = opening::load_snapshots(&data_dir)?;
+        } = opening::load_snapshots(&data_dir, {
+            // Serving opens defer the triplet index rebuild. CHITTA_DEFER_TRIPLETS=0
+            // is the same-binary eager control for replica comparisons and the
+            // rollback switch; CHITTA_STARTUP_EAGER=1 defers nothing at all, so it
+            // is not a triplet-only control.
+            deferred_turbo && std::env::var("CHITTA_DEFER_TRIPLETS").as_deref() != Ok("0")
+        })?;
 
         // Replay ALL segment files to rebuild in-memory state.
         // Skip ops already covered by the full snapshot or cortical snapshot.
@@ -749,6 +786,9 @@ impl ChittaField {
         };
         drop(span_phase);
 
+        // Only the migration branch (empty persisted tape) reads by_subject via
+        // all_subjects(); a deferred index would silently seed nothing.
+        if snap_event_tape.events.is_empty() { triplet_store.apply_deferred_replay(); }
         let (event_tape, cdawg, episode_hdc) = opening::rebuild_event_organs(
             snap_event_tape, &triplet_store, &payloads, &states, &best_full_path, deferred_turbo, &ablations,
         );
@@ -777,7 +817,15 @@ impl ChittaField {
         let opening::KeyedIndexes {
             content_prov_idx, prov_key_idx, correction_key_idx, task_key_idx,
         } = opening::rebuild_keyed_indexes(&payloads, &states);
-        crate::replication::rebuild(&payloads, &triplet_store, &mut states);
+        // WAL replay does not force the rebuild: under buffering every triplet op
+        // records into `deferred_replay` instead of consulting an index. The store
+        // is therefore still dirty here unless this open never deferred, or the
+        // empty-event-tape migration branch above drained it.
+        let defer_triplets = triplet_store.indexes_dirty();
+        if !defer_triplets {
+            let _phase = crate::profile::LoadPhase::new("replication");
+            crate::replication::rebuild(&payloads, &triplet_store, &mut states);
+        }
         let anchors = crate::anchors::AnchorIndex::rebuild(&payloads);
         Ok(Self {
             startup_turbo_snapshot: Mutex::new(if deferred_turbo { best_full_path.clone() } else { None }),
@@ -802,16 +850,23 @@ impl ChittaField {
             time_idx: RwLock::new("time_idx", time_idx),
             artifact_idx: RwLock::new("artifact_idx", artifact_idx),
             keyword_idx: RwLock::new("keyword_idx", keyword_idx),
-            triplet_store: RwLock::new("triplet_store", {
-                let _phase = crate::profile::LoadPhase::new("triplets");
-                let before = triplet_store.triplet_count();
-                let (purged, deduped) = triplet_store.clean_for_load();
-                if purged > 0 || deduped > 0 {
-                    eprintln!("[chitta-field] triplet migration on load: purged {} invalidated, deduped {} duplicates ({} → {})",
-                        purged, deduped, before, triplet_store.triplet_count());
-                }
-                triplet_store
-            }),
+            triplet_store: {
+                let load = move || {
+                    let mut triplet_store = triplet_store;
+                    let _phase = crate::profile::LoadPhase::new("triplets");
+                    triplet_store.apply_deferred_replay();
+                    let before = triplet_store.triplet_count();
+                    let (purged, deduped) = triplet_store.clean_for_load();
+                    if purged > 0 || deduped > 0 {
+                        eprintln!("[chitta-field] triplet migration on load: purged {} invalidated, deduped {} duplicates ({} → {})",
+                            purged, deduped, before, triplet_store.triplet_count());
+                    }
+                    RwLock::new("triplet_store", triplet_store)
+                };
+                if defer_triplets { crate::ablation::StartupValue::deferred(load) }
+                else { crate::ablation::StartupValue::ready(load()) }
+            },
+            triplet_replication_pending: std::sync::atomic::AtomicBool::new(defer_triplets),
             triplet_id_alloc,
             symbol_idx: if deferred_turbo {
                 crate::ablation::StartupValue::deferred(move || {
@@ -2047,5 +2102,60 @@ mod chaos_tests {
             }
             assert_eq!(field.payloads.read().len(), ids.len());
         }
+    }
+
+    /// The whole of finding 1, end to end: a serving reopen that defers the
+    /// triplet rebuild, over a WAL tail whose ids run past the snapshot's
+    /// `next_id`. `open_impl` seeds `TripletIdAllocator` from `next_id` in the
+    /// window between replay and the drain, so a live insert here hands back an
+    /// id a replayed record already owns unless buffered adds still advance the
+    /// high-water mark. The failure is silent: two entries share an id,
+    /// `id_to_index` resolves to one of them, and invalidate and supersede act
+    /// on the wrong row. `organ::triplet` covers the allocator arithmetic; this
+    /// covers the real open, which is where the ordering lives.
+    #[test]
+    fn a_live_insert_after_a_deferred_reopen_never_reuses_a_replayed_id() {
+        use std::sync::atomic::Ordering;
+        let tmp = Scratch::new("deferred-triplet-ids");
+        let mut replayed = Vec::new();
+        {
+            let field = ChittaField::open(tmp.0.clone()).unwrap();
+            // A non-empty persisted event tape: open_impl drains the buffer
+            // immediately when the tape is empty (the migration branch), and a
+            // drained store would not exercise the window at all.
+            field.event_tape.write().log("seed", "triplets", 1, 7, 1000);
+            field.add_triplet("alice".into(), "knows".into(), "bob".into(),
+                1.0, None, None).unwrap();
+            field.flush().unwrap();
+            field.save_full_snapshot().unwrap();
+            // The tail: adds the snapshot does not cover, with ids at and above
+            // the next_id it recorded.
+            for n in 0..3 {
+                replayed.push(field.add_triplet("alice".into(), "wrote".into(),
+                    format!("paper{n}"), 1.0, None, None).unwrap());
+            }
+            field.flush().unwrap();
+        }
+
+        let field = ChittaField::open_for_serving(tmp.0.clone()).unwrap();
+        assert!(field.triplet_replication_pending.load(Ordering::Acquire),
+            "the reopen must have deferred, or this test proves nothing");
+        let live = field.add_triplet("carol".into(), "reviews".into(), "paper0".into(),
+            1.0, None, None).unwrap();
+
+        let store = field.triplet_store.read();
+        let at_ms = crate::store::now_ms() + 1000;
+        let mut ids: Vec<u64> = store.all_subjects().iter()
+            .flat_map(|s| store.query_subject(s, at_ms).into_iter().map(|e| e.id))
+            .collect();
+        ids.sort_unstable();
+        let distinct = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), distinct, "a replayed id was issued twice: {ids:?}");
+        assert_eq!(store.triplet_count(), 5);
+        for id in &replayed {
+            assert!(live > *id, "live insert got {live}, colliding with replayed {id}");
+        }
+        assert_eq!(*ids.last().unwrap(), live);
     }
 }

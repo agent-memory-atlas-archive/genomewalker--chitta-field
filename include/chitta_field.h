@@ -36,6 +36,10 @@ typedef struct {
 CfHandle* cf_open(const char* data_dir, const char* lock_dir);
 /* Secondary indexes are published independently of recall readiness. */
 bool cf_startup_indexes_ready(CfHandle *handle);
+/* The triplet graph's derived indexes rebuild off the open path; the exact and
+   hybrid triplet lanes and spreading activation must answer loading until this
+   returns true. */
+bool cf_triplets_ready(CfHandle *handle);
 
 void      cf_close(CfHandle* h);
 const char* cf_last_error(const CfHandle* h);

@@ -63,7 +63,10 @@ pub(super) struct LoadedSnapshot {
     pub(super) reindex_mode: bool,
 }
 
-pub(super) fn load_snapshots(data_dir: &std::path::Path) -> Result<LoadedSnapshot> {
+/// `defer_triplet_indexes` leaves `TripletStore::rebuild_indexes` to the caller
+/// (the 1,899 ms job that dominated the 2026-09-20 decode); the returned store
+/// reports it through `indexes_dirty()`.
+pub(super) fn load_snapshots(data_dir: &std::path::Path, defer_triplet_indexes: bool) -> Result<LoadedSnapshot> {
     let mut payloads: HashMap<MemoryId, MemoryPayload> = HashMap::new();
     let mut retrieval_surfaces: HashMap<MemoryId, Vec<u8>> = HashMap::new();
     let mut recall_provenance: HashMap<MemoryId, std::collections::BTreeSet<crate::ids::InstanceId>> = HashMap::new();
@@ -249,7 +252,11 @@ pub(super) fn load_snapshots(data_dir: &std::path::Path) -> Result<LoadedSnapsho
     let reindex_mode = std::env::var_os("CHITTA_REINDEX_MODE").is_some();
     for candidate in &candidates {
         let snapshot_phase = crate::profile::LoadPhase::new("snapshot");
-        let loaded = FullSnapshot::load(candidate);
+        let loaded = if defer_triplet_indexes {
+            FullSnapshot::load_deferring_triplet_indexes(candidate).map(|(snap, _)| snap)
+        } else {
+            FullSnapshot::load(candidate)
+        };
         drop(snapshot_phase);
         match loaded {
             Ok(mut snap) => {

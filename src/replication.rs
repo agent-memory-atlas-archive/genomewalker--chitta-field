@@ -79,6 +79,32 @@ pub(crate) fn rebuild(payloads: &HashMap<MemoryId, MemoryPayload>, graph: &Tripl
 }
 
 impl ChittaField {
+    /// Recompute every state's replication count. Walks the triplet graph, so a
+    /// serving open that deferred the triplet rebuild skips it and the
+    /// maintenance thread calls this once the graph is ready. No-op when the
+    /// open already did it. Lock order matches field.rs: payloads -> states ->
+    /// triplet_store.
+    ///
+    /// The flag clears only after the counts are in `states`, because
+    /// `cf_startup_indexes_ready` reads it: clearing on entry would open that
+    /// gate while every state still carried the snapshot's stale count. The
+    /// maintenance thread is the only caller and calls it once.
+    pub(crate) fn rebuild_replications_if_pending(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.triplet_replication_pending.load(Ordering::Acquire) { return; }
+        // Force the deferred triplet load while holding nothing, so the
+        // payloads -> states -> triplet_store order below is a plain lock
+        // acquisition and never a multi-second rebuild under states.write().
+        drop(self.triplet_store.read());
+        {
+            let payloads = self.payloads.read();
+            let mut states = self.states.write();
+            let graph = self.triplet_store.read();
+            rebuild(&payloads, &graph, &mut states);
+        }
+        self.triplet_replication_pending.store(false, Ordering::Release);
+    }
+
     /// Recompute only the mutation's provenance dependents, outside recall. Lock
     /// order matches field.rs: payloads -> states -> triplet_store.
     pub(crate) fn refresh_replications(&self, seeds: &[MemoryId]) {

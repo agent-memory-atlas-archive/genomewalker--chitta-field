@@ -1597,6 +1597,16 @@ impl ChittaField {
         let dispatch = router.route(&req);
         let label = dispatch.label();
         let k = req.k.max(1);
+        // The exact and hybrid lanes read the triplet indexes, which a serving
+        // open rebuilds off the open path. Answer `loading` rather than block.
+        // The semantic and keyword lanes do not touch the graph and are served
+        // normally while it is still building.
+        if matches!(dispatch, DispatchKind::Exact | DispatchKind::Hybrid)
+            && !self.triplet_store.is_ready() {
+            return format!(
+                r#"{{"dispatch_label":"{label}","loading":true,"phase":"triplets","retry_after_s":1,"hits":[]}}"#
+            );
+        }
 
         let hits: Vec<String> = match dispatch {
             DispatchKind::Exact => {
