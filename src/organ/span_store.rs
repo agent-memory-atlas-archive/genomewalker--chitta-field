@@ -672,7 +672,7 @@ impl SpanStore {
     /// Rebuild the trigram accelerator iff the mutation counter advanced since
     /// the last build (the ensure_turbo pattern). Only used above TRIGRAM_MIN;
     /// below that a full scan is already sub-10ms and needs no index.
-    fn ensure_trigram(&mut self) {
+    pub(crate) fn ensure_trigram(&mut self) {
         if self.spans.len() < TRIGRAM_MIN {
             return;
         }

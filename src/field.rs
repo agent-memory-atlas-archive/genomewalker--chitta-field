@@ -790,7 +790,14 @@ impl ChittaField {
         let span_phase = crate::profile::LoadPhase::new("span_store");
         let span_path = data_dir.clone();
         let loaded_span_store = if deferred_turbo {
-            crate::ablation::Organ::deferred("span_store", move || crate::organ::span_store::SpanStore::load(&span_path),
+            // Build the trigram accelerator inside the job: the first query
+            // otherwise builds it under span_store.write(), 10 s live on
+            // 2026-09-20, and every recall's format step waited behind it.
+            crate::ablation::Organ::deferred("span_store", move || {
+                    let mut store = crate::organ::span_store::SpanStore::load(&span_path);
+                    store.ensure_trigram();
+                    store
+                },
                 crate::organ::span_store::SpanStore::new, ablations.disabled("span_store"))
         } else {
             crate::ablation::Organ::new("span_store", crate::organ::span_store::SpanStore::load(&data_dir),
