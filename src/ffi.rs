@@ -261,7 +261,32 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                             // so the gate now opens on the slowest lane.
                             let total = std::time::Instant::now();
                             let replication = field.clone();
+                            // Turbo is not in the readiness gate, but until it
+                            // publishes every recall takes the scalar arm and
+                            // scans the whole corpus: 14 s on 141,613 vectors
+                            // against ~1 s for a cached load. Running it last
+                            // made `ready` the start of that window, so it goes
+                            // first, in a lane of its own.
+                            let turbo_field = field.clone();
+                            let turbo_guard = field.semantic_idx.read().turbo_pending_guard();
                             let lanes: Vec<StartupPhases> = vec![
+                                vec![("turbo", Box::new(move || {
+                                    let pending = turbo_guard;
+                                    let snapshot = turbo_field.startup_turbo_snapshot.lock().take();
+                                    let cache_plan = snapshot.as_deref().and_then(|p| {
+                                        turbo_field.semantic_idx.read().plan_startup_turbo_cache(p)
+                                    });
+                                    let cached = cache_plan.is_some_and(|plan| plan.load());
+                                    if !cached {
+                                        let plan = turbo_field.semantic_idx.read().plan_turbo_rebuild(0);
+                                        if let Some(plan) = plan { plan.build(); }
+                                    }
+                                    // Release waiting searches before taking the
+                                    // write lock they are parked under.
+                                    drop(pending);
+                                    turbo_field.semantic_idx.write().prune_turbo_changes();
+                                    eprintln!("[field] turbo cache_hit={cached}");
+                                }))],
                                 vec![
                                     ("triplets", field.triplet_store.startup_job()),
                                     ("triplet_replication", Box::new(move || replication.rebuild_replications_if_pending())),
@@ -278,29 +303,13 @@ pub extern "C" fn cf_open(data_dir: *const c_char, _lock_dir: *const c_char) -> 
                             ];
                             if !matches!(run_startup_lanes(&stopped, lanes), StartupWork::Complete(())) { return; }
                             eprintln!("[field] deferred phases total_ms={}", total.elapsed().as_millis());
-                            // Neither of the two below is in the readiness gate,
-                            // so they stay on this thread, after it has opened.
+                            // The keyword reverse index is in no gate and has
+                            // no dependency on any lane, so it stays on this
+                            // thread: it owns the stop receiver the lanes cannot
+                            // share, and nothing waits on it.
                             let begin = std::time::Instant::now();
                             if !prepare_startup_keywords(&field, &stopped) { return; }
                             eprintln!("[field] deferred phase=keyword_reverse duration_ms={}", begin.elapsed().as_millis());
-                            let begin = std::time::Instant::now();
-                            let snapshot = field.startup_turbo_snapshot.lock().take();
-                            let cache_plan = snapshot.as_deref().and_then(|p| {
-                                field.semantic_idx.read().plan_startup_turbo_cache(p)
-                            });
-                            let cached = match startup_work(&stopped, move || cache_plan.is_some_and(|plan| plan.load())) {
-                                StartupWork::Complete(hit) => hit,
-                                StartupWork::Stopped => return,
-                                StartupWork::Failed => false,
-                            };
-                            if !cached {
-                                let plan = field.semantic_idx.read().plan_turbo_rebuild(0);
-                                if let Some(plan) = plan {
-                                    if matches!(startup_work(&stopped, move || plan.build()), StartupWork::Stopped) { return; }
-                                }
-                            }
-                            field.semantic_idx.write().prune_turbo_changes();
-                            eprintln!("[field] deferred phase=turbo duration_ms={} cache_hit={cached}", begin.elapsed().as_millis());
                         }
                         let touch_interval = std::time::Duration::from_secs(
                             std::env::var("CHITTA_TOUCH_FLUSH_S").ok().and_then(|s| s.parse().ok()).unwrap_or(5).max(1));
